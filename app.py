@@ -127,7 +127,11 @@ def callback():
 
 @app.route("/api/auth-status")
 def auth_status():
-    return jsonify({"ok": True, "authenticated": bool(session.get("spotify_token_info"))})
+    try:
+        get_session_token_info()
+        return jsonify({"ok": True, "authenticated": True})
+    except Exception:
+        return jsonify({"ok": True, "authenticated": False})
 
 
 sampler_process: subprocess.Popen[str] | None = None
@@ -241,6 +245,12 @@ def start_sampler():
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "Invalid numeric input."}), 400
 
+        source_mode = str(data.get("sourceMode", "file")).strip().lower()
+        if source_mode not in {"file", "playlist"}:
+            return jsonify({"ok": False, "error": "Invalid source mode."}), 400
+
+        playlist_link = str(data.get("playlistLink", "")).strip()
+
         clip_mode = str(data.get("clipMode", "defined")).strip().lower()
 
         try:
@@ -271,31 +281,38 @@ def start_sampler():
         if local_seek_delay_seconds < 0:
             return jsonify({"ok": False, "error": "Local-file seek delay cannot be negative."}), 400
 
-        try:
-            uploaded_albums_file = save_uploaded_albums_file()
-        except ValueError as error:
-            return jsonify({"ok": False, "error": str(error)}), 400
-        except Exception as error:
-            return jsonify({"ok": False, "error": f"Could not save uploaded text file: {error}"}), 500
+        albums_file: Path | None = None
 
-        if uploaded_albums_file is None:
-            if is_form_request:
-                return jsonify({"ok": False, "error": "Upload a .txt file containing album or playlist links."}), 400
-
-            # Backward-compatible fallback for direct JSON/API calls.
-            if not DEFAULT_ALBUMS_FILE.exists():
-                return jsonify({"ok": False, "error": "No uploaded text file was provided and albums.txt was not found."}), 400
-            albums_file = DEFAULT_ALBUMS_FILE
+        if source_mode == "playlist":
+            if not playlist_link:
+                return jsonify({"ok": False, "error": "Enter a Spotify playlist link first."}), 400
+            if "open.spotify.com/playlist/" not in playlist_link and not playlist_link.startswith("spotify:playlist:"):
+                return jsonify({"ok": False, "error": "The playlist link must be a Spotify playlist URL or URI."}), 400
         else:
-            albums_file = uploaded_albums_file
+            try:
+                uploaded_albums_file = save_uploaded_albums_file()
+            except ValueError as error:
+                return jsonify({"ok": False, "error": str(error)}), 400
+            except Exception as error:
+                return jsonify({"ok": False, "error": f"Could not save uploaded text file: {error}"}), 500
 
-        device_name = str(data.get("deviceName", "")).strip()
+            if uploaded_albums_file is None:
+                if is_form_request:
+                    return jsonify({"ok": False, "error": "Upload a .txt file containing album or playlist links."}), 400
+
+                # Backward-compatible fallback for direct JSON/API calls.
+                if not DEFAULT_ALBUMS_FILE.exists():
+                    return jsonify({"ok": False, "error": "No uploaded text file was provided and albums.txt was not found."}), 400
+                albums_file = DEFAULT_ALBUMS_FILE
+            else:
+                albums_file = uploaded_albums_file
+
         random_start = form_bool(data.get("randomStart"), True)
 
         try:
             spotify_token_cache = write_sampler_token_cache()
-        except RuntimeError as error:
-            return jsonify({"ok": False, "error": str(error)}), 401
+        except RuntimeError:
+            return jsonify({"ok": False, "error": "Press Login with Spotify before starting the sampler."}), 401
         except Exception as error:
             return jsonify({"ok": False, "error": f"Could not prepare Spotify token cache: {error}"}), 500
 
@@ -303,12 +320,8 @@ def start_sampler():
             sys.executable,
             "-u",
             str(SAMPLER_PATH),
-            "--albums-file",
-            str(albums_file),
             "--delay-seconds",
             "0",
-            "--start-index",
-            str(start_index),
             "--assumed-duration-seconds",
             str(assumed_duration_seconds),
             "--local-seek-delay-seconds",
@@ -316,6 +329,18 @@ def start_sampler():
             "--spotify-token-cache",
             str(spotify_token_cache),
         ]
+
+        if source_mode == "playlist":
+            cmd.extend(["--playlist-link", playlist_link])
+        else:
+            cmd.extend(
+                [
+                    "--albums-file",
+                    str(albums_file),
+                    "--start-index",
+                    str(start_index),
+                ]
+            )
 
         if clip_mode == "random":
             cmd.extend(
@@ -331,9 +356,6 @@ def start_sampler():
 
         if random_start:
             cmd.append("--random-start")
-
-        if device_name:
-            cmd.extend(["--device-name", device_name])
 
         log_lines.clear()
         append_log("[starting sampler.py]")
