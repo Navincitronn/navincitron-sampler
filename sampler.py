@@ -1597,12 +1597,211 @@ def prepare_playlist_item_clip(
     }
 
 
+
+def track_dedupe_key(track: dict) -> str:
+    uri = track.get("uri")
+    if uri:
+        return f"uri::{uri}"
+
+    name = format_track_name(track).strip().lower()
+    artist = format_track_artist(track).strip().lower()
+    duration_ms = get_track_duration_ms(track)
+
+    return f"text::{artist}|{name}|{duration_ms}"
+
+
+def get_unique_playable_album_tracks(
+    tracks: list[dict],
+    required_clip_seconds: int,
+) -> list[dict]:
+    playable_tracks = []
+    seen_keys = set()
+
+    for track in tracks:
+        duration_ms = get_track_duration_ms(track)
+
+        if not track.get("uri"):
+            continue
+
+        if duration_ms is not None and duration_ms < required_clip_seconds * 1000:
+            continue
+
+        key = track_dedupe_key(track)
+        if key in seen_keys:
+            continue
+
+        seen_keys.add(key)
+        playable_tracks.append(track)
+
+    return playable_tracks
+
+
+def prepare_album_track_clip(
+    album: dict,
+    track: dict,
+    clip_seconds: int,
+    random_start: bool,
+    assumed_duration_seconds: int,
+) -> dict:
+    duration_ms = assumed_duration_ms(
+        actual_duration_ms=get_track_duration_ms(track),
+        assumed_duration_seconds=assumed_duration_seconds,
+    )
+
+    position_ms = calculate_position_ms(
+        duration_ms=duration_ms,
+        clip_seconds=clip_seconds,
+        random_start=random_start,
+    )
+
+    album_artist = ", ".join(album.get("artists") or ["Unknown artist"])
+    track_artist = format_track_artist(track)
+
+    return {
+        "kind": "track_uri",
+        "source_text": f"Album: {album.get('name', 'Unknown album')} - {album_artist}",
+        "track_text": f"{format_track_name(track)} - {track_artist}",
+        "track": track,
+        "position_ms": position_ms,
+        "clip_seconds": clip_seconds,
+        "cover_url": album.get("cover_url"),
+        "album_name": album.get("name"),
+        "is_local": False,
+    }
+
+
+def play_prepared_items_no_repeat(
+    args: argparse.Namespace,
+    sp: spotipy.Spotify,
+    device_id: str,
+    prepared_items: list[dict],
+    completion_label: str,
+) -> None:
+    stopped_by_user = False
+
+    for index, prepared in enumerate(prepared_items, start=1):
+        try:
+            position_ms = start_prepared_clip(
+                sp=sp,
+                device_id=device_id,
+                prepared=prepared,
+                local_seek_delay_seconds=args.local_seek_delay_seconds,
+            )
+
+            position_seconds = position_ms // 1000
+
+            print(
+                f"[{index}/{len(prepared_items)}] "
+                f"{prepared['source_text']} | "
+                f"Track: {prepared['track_text']} | "
+                f"Start: {position_seconds}s"
+            )
+
+            wait_for_clip_or_stop(int(prepared.get("clip_seconds") or args.clip_seconds))
+
+            if args.delay_seconds > 0:
+                time.sleep(args.delay_seconds)
+
+        except KeyboardInterrupt:
+            stopped_by_user = True
+            print("\nStopped by user.")
+
+            try:
+                sp.pause_playback(device_id=device_id)
+            except Exception:
+                pass
+
+            break
+
+        except Exception as error:
+            print(f"[{index}/{len(prepared_items)}] ERROR: {error}")
+
+            if args.delay_seconds > 0:
+                time.sleep(args.delay_seconds)
+
+    if not stopped_by_user:
+        print(f"{completion_label}: played all {len(prepared_items)} possible songs without repeats.")
+        try:
+            sp.pause_playback(device_id=device_id)
+        except Exception:
+            pass
+
+
+def run_single_album_mode(
+    args: argparse.Namespace,
+    sp: spotipy.Spotify,
+    cache: dict,
+    album_link: str,
+) -> None:
+    album = resolve_album(sp, album_link, cache)
+    tracks = get_album_tracks_cached(sp, album, cache)
+    required_clip_seconds = max_required_clip_seconds(args)
+    playable_tracks = get_unique_playable_album_tracks(
+        tracks=tracks,
+        required_clip_seconds=required_clip_seconds,
+    )
+
+    if not playable_tracks:
+        raise RuntimeError(
+            "No playable album songs were long enough for the selected clip length."
+        )
+
+    if args.single_link_order == "random":
+        random.shuffle(playable_tracks)
+
+    device_id = get_device_id(sp, args.device_name)
+    album_artist = ", ".join(album.get("artists") or ["Unknown artist"])
+
+    print(f"Loaded album: {album.get('name', 'Unknown album')} - {album_artist}")
+    print(f"Usable unique songs: {len(playable_tracks)}")
+    print(describe_clip_mode(args))
+    print(f"Single-link mode: {'random' if args.single_link_order == 'random' else 'ordered'} no-repeat album playback.")
+    print("Press Ctrl+C to stop.\n")
+
+    prepared_items = [
+        prepare_album_track_clip(
+            album=album,
+            track=track,
+            clip_seconds=choose_effective_clip_seconds(args),
+            random_start=args.random_start,
+            assumed_duration_seconds=args.assumed_duration_seconds,
+        )
+        for track in playable_tracks
+    ]
+
+    play_prepared_items_no_repeat(
+        args=args,
+        sp=sp,
+        device_id=device_id,
+        prepared_items=prepared_items,
+        completion_label="Album complete",
+    )
+
+
+def run_single_link_mode(
+    args: argparse.Namespace,
+    sp: spotipy.Spotify,
+    cache: dict,
+) -> None:
+    single_link = args.single_link or args.playlist_link or ""
+
+    if extract_spotify_album_id(single_link):
+        run_single_album_mode(args=args, sp=sp, cache=cache, album_link=single_link)
+        return
+
+    if extract_spotify_playlist_id(single_link):
+        run_single_playlist_mode(args=args, sp=sp, cache=cache)
+        return
+
+    raise RuntimeError("Invalid Spotify album or playlist link/URI.")
+
+
 def run_single_playlist_mode(
     args: argparse.Namespace,
     sp: spotipy.Spotify,
     cache: dict,
 ) -> None:
-    playlist_id = extract_spotify_playlist_id(args.playlist_link or "")
+    playlist_id = extract_spotify_playlist_id(args.single_link or args.playlist_link or "")
 
     if not playlist_id:
         raise RuntimeError("Invalid Spotify playlist link or URI.")
@@ -1627,7 +1826,9 @@ def run_single_playlist_mode(
             "No playable playlist songs were long enough for the selected clip length."
         )
 
-    random.shuffle(playable_items)
+    if args.single_link_order == "random":
+        random.shuffle(playable_items)
+
     device_id = get_device_id(sp, args.device_name)
 
     playlist_name = playlist_bundle.get("name", "Unknown playlist")
@@ -1636,69 +1837,27 @@ def run_single_playlist_mode(
     print(f"Loaded playlist: {playlist_name} - {owner_name}")
     print(f"Usable unique songs: {len(playable_items)}")
     print(describe_clip_mode(args))
-    print("Playlist mode: random no-repeat playback.")
+    print(f"Playlist mode: {'random' if args.single_link_order == 'random' else 'ordered'} no-repeat playback.")
     print("Press Ctrl+C to stop.\n")
 
-    stopped_by_user = False
+    prepared_items = [
+        prepare_playlist_item_clip(
+            playlist_bundle=playlist_bundle,
+            item=item,
+            clip_seconds=choose_effective_clip_seconds(args),
+            random_start=args.random_start,
+            assumed_duration_seconds=args.assumed_duration_seconds,
+        )
+        for item in playable_items
+    ]
 
-    for index, item in enumerate(playable_items, start=1):
-        try:
-            clip_seconds = choose_effective_clip_seconds(args)
-            prepared = prepare_playlist_item_clip(
-                playlist_bundle=playlist_bundle,
-                item=item,
-                clip_seconds=clip_seconds,
-                random_start=args.random_start,
-                assumed_duration_seconds=args.assumed_duration_seconds,
-            )
-
-            position_ms = start_prepared_clip(
-                sp=sp,
-                device_id=device_id,
-                prepared=prepared,
-                local_seek_delay_seconds=args.local_seek_delay_seconds,
-            )
-
-            position_seconds = position_ms // 1000
-
-            print(
-                f"[{index}/{len(playable_items)}] "
-                f"{prepared['source_text']} | "
-                f"Track: {prepared['track_text']} | "
-                f"Start: {position_seconds}s"
-            )
-
-            wait_for_clip_or_stop(int(prepared.get("clip_seconds") or args.clip_seconds))
-
-            if args.delay_seconds > 0:
-                time.sleep(args.delay_seconds)
-
-        except KeyboardInterrupt:
-            stopped_by_user = True
-            print("\nStopped by user.")
-
-            try:
-                sp.pause_playback(device_id=device_id)
-            except Exception:
-                pass
-
-            break
-
-        except Exception as error:
-            print(
-                f"[{index}/{len(playable_items)}] ERROR for playlist position "
-                f"{item.get('playlist_position')}: {error}"
-            )
-
-            if args.delay_seconds > 0:
-                time.sleep(args.delay_seconds)
-
-    if not stopped_by_user:
-        print(f"Playlist complete: played all {len(playable_items)} possible songs without repeats.")
-        try:
-            sp.pause_playback(device_id=device_id)
-        except Exception:
-            pass
+    play_prepared_items_no_repeat(
+        args=args,
+        sp=sp,
+        device_id=device_id,
+        prepared_items=prepared_items,
+        completion_label="Playlist complete",
+    )
 
 
 def main() -> None:
@@ -1734,8 +1893,29 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "Play one Spotify playlist in randomized no-repeat mode. "
-            "The sampler plays each usable playlist item once, then stops."
+            "Backward-compatible alias for --single-link when the link is a "
+            "Spotify playlist."
+        ),
+    )
+
+    parser.add_argument(
+        "--single-link",
+        type=str,
+        default=None,
+        help=(
+            "Play one Spotify album or playlist in no-repeat mode. "
+            "The sampler plays each usable item once, then stops."
+        ),
+    )
+
+    parser.add_argument(
+        "--single-link-order",
+        choices=["random", "ordered"],
+        default="random",
+        help=(
+            "Song order for --single-link / --playlist-link. "
+            "Use random for randomized no-repeat playback, or ordered to follow "
+            "the album/playlist order. Default: random."
         ),
     )
 
@@ -1893,8 +2073,8 @@ def main() -> None:
     )
     cache = load_cache()
 
-    if args.playlist_link:
-        run_single_playlist_mode(args=args, sp=sp, cache=cache)
+    if args.single_link or args.playlist_link:
+        run_single_link_mode(args=args, sp=sp, cache=cache)
         return
 
     all_lines = load_album_lines(args.albums_file)

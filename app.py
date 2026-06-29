@@ -250,13 +250,14 @@ def start_sampler():
             return jsonify({"ok": False, "error": "Invalid source mode."}), 400
 
         playlist_link = str(data.get("playlistLink", "")).strip()
+        single_link_random_order = form_bool(data.get("singleLinkRandomOrder"), True)
 
         clip_mode = str(data.get("clipMode", "defined")).strip().lower()
 
         try:
             if clip_mode == "random":
-                clip_min_seconds = int(data.get("clipMinSeconds", 15))
-                clip_max_seconds = int(data.get("clipMaxSeconds", 30))
+                clip_min_seconds = int(data.get("clipMinSeconds", 18))
+                clip_max_seconds = int(data.get("clipMaxSeconds", 25))
                 clip_seconds = None
             else:
                 clip_seconds = int(data.get("clipSeconds", 15))
@@ -285,9 +286,15 @@ def start_sampler():
 
         if source_mode == "playlist":
             if not playlist_link:
-                return jsonify({"ok": False, "error": "Enter a Spotify playlist link first."}), 400
-            if "open.spotify.com/playlist/" not in playlist_link and not playlist_link.startswith("spotify:playlist:"):
-                return jsonify({"ok": False, "error": "The playlist link must be a Spotify playlist URL or URI."}), 400
+                return jsonify({"ok": False, "error": "Enter a Spotify album or playlist link first."}), 400
+            valid_single_link = (
+                "open.spotify.com/playlist/" in playlist_link
+                or "open.spotify.com/album/" in playlist_link
+                or playlist_link.startswith("spotify:playlist:")
+                or playlist_link.startswith("spotify:album:")
+            )
+            if not valid_single_link:
+                return jsonify({"ok": False, "error": "The link must be a Spotify album or playlist URL/URI."}), 400
         else:
             try:
                 uploaded_albums_file = save_uploaded_albums_file()
@@ -331,7 +338,8 @@ def start_sampler():
         ]
 
         if source_mode == "playlist":
-            cmd.extend(["--playlist-link", playlist_link])
+            cmd.extend(["--single-link", playlist_link])
+            cmd.extend(["--single-link-order", "random" if single_link_random_order else "ordered"])
         else:
             cmd.extend(
                 [
