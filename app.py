@@ -37,6 +37,9 @@ RANKED_SHEET_ID = "1JiZwXGPANDlhkobNPo0Xdw_5MrNpG1fWTbEbL-I1dcA"
 RANKED_SHEET_GID = "0"
 UPLOAD_DIR = BASE_DIR / ".sampler_uploads"
 STATE_FILE = BASE_DIR / "sampler_state.json"
+TOPSTER_COVER_CACHE_FILE = BASE_DIR / "topster_cover_cache.json"
+TOPSTER_SETTINGS_FILE = BASE_DIR / "topster_settings.json"
+TOPSTER_ADMIN_PASSWORD = os.getenv("TOPSTER_ADMIN_PASSWORD", "").strip()
 
 SCOPE = (
     "user-read-playback-state "
@@ -64,6 +67,205 @@ CORS(
     origins=[FRONTEND_ORIGIN],
     supports_credentials=True,
 )
+
+
+
+def is_local_request() -> bool:
+    """
+    Allows the host computer to use grid.html/ranked_grid.html as the editor
+    without exposing those editor pages to other computers on the network.
+
+    If you deploy behind a reverse proxy, prefer setting TOPSTER_ADMIN_PASSWORD
+    and logging in through /topster-admin-login.
+    """
+
+    remote_addr = request.headers.get("X-Forwarded-For", request.remote_addr or "")
+    remote_addr = remote_addr.split(",")[0].strip()
+    return remote_addr in {"127.0.0.1", "::1", "localhost"}
+
+
+def is_topster_admin() -> bool:
+    return bool(session.get("topster_admin")) or is_local_request()
+
+
+def require_topster_admin_response():
+    if is_topster_admin():
+        return None
+    return jsonify({"ok": False, "error": "Topster editor access is restricted to the host/admin computer."}), 403
+
+
+def read_json_file(path: Path, fallback: Any) -> Any:
+    if not path.exists():
+        return fallback
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+        if not raw.strip():
+            return fallback
+        parsed = json.loads(raw)
+        return parsed if parsed is not None else fallback
+    except Exception:
+        return fallback
+
+
+def write_json_file(path: Path, data: Any) -> None:
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    temp_path.replace(path)
+
+
+def get_topster_settings() -> dict[str, Any]:
+    settings = read_json_file(TOPSTER_SETTINGS_FILE, {})
+    return settings if isinstance(settings, dict) else {}
+
+
+def get_topster_cover_cache() -> dict[str, Any]:
+    cover_cache = read_json_file(TOPSTER_COVER_CACHE_FILE, {})
+    return cover_cache if isinstance(cover_cache, dict) else {}
+
+
+def normalize_topster_cover_cache(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+
+    normalized: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not isinstance(item, dict):
+            continue
+        image_src = item.get("imageSrc")
+        if not isinstance(image_src, str) or not image_src.startswith(("http://", "https://")):
+            continue
+        normalized[key] = {
+            "title": str(item.get("title") or ""),
+            "artist": str(item.get("artist") or ""),
+            "imageSrc": image_src,
+            "href": str(item.get("href") or ""),
+            "source": str(item.get("source") or ""),
+            "selectedManually": bool(item.get("selectedManually")),
+            "savedAt": str(item.get("savedAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+        }
+    return normalized
+
+
+def normalize_topster_settings(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+
+    allowed_fonts = {
+        "Arial", "Verdana", "Helvetica Neue", "Sans-serif", "Monospace",
+        "Open Sans", "Helvetica", "Georgia", "Tahoma", "Calibri",
+    }
+    allowed_sidebar_modes = {"artist-title", "title-only", "hidden"}
+
+    def clamp_int(raw: Any, minimum: int, maximum: int, fallback: int) -> int:
+        try:
+            number = int(round(float(raw)))
+        except Exception:
+            return fallback
+        return min(maximum, max(minimum, number))
+
+    return {
+        "width": clamp_int(value.get("width"), 1, 25, 10),
+        "height": clamp_int(value.get("height"), 1, 10, 10),
+        "sidebarMode": value.get("sidebarMode") if value.get("sidebarMode") in allowed_sidebar_modes else "artist-title",
+        "roundCorners": clamp_int(value.get("roundCorners"), 0, 24, 0),
+        "albumGap": clamp_int(value.get("albumGap"), 0, 100, 4),
+        "font": value.get("font") if value.get("font") in allowed_fonts else "Arial",
+    }
+
+
+@app.route("/topster-admin-login", methods=["GET", "POST"])
+def topster_admin_login():
+    if request.method == "POST":
+        submitted_password = request.form.get("password", "")
+        if TOPSTER_ADMIN_PASSWORD and submitted_password == TOPSTER_ADMIN_PASSWORD:
+            session["topster_admin"] = True
+            return redirect("/grid.html")
+        return "Invalid Topster admin password.", 403
+
+    if is_topster_admin():
+        return redirect("/grid.html")
+
+    return """
+    <!doctype html>
+    <html lang=\"en\">
+    <head>
+        <meta charset=\"utf-8\">
+        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+        <title>Topster Admin Login</title>
+        <style>
+            body { background:#333; color:#fff; font-family:Arial,sans-serif; display:grid; place-items:center; min-height:100vh; margin:0; }
+            form { background:#444; border-radius:10px; padding:24px; width:min(420px, calc(100vw - 32px)); }
+            input { box-sizing:border-box; width:100%; padding:10px; margin:10px 0 16px; }
+            button { background:#1974D2; border:0; border-radius:5px; color:white; cursor:pointer; padding:10px 18px; }
+        </style>
+    </head>
+    <body>
+        <form method=\"post\">
+            <h1>Topster Admin Login</h1>
+            <p>Only the host/admin computer can edit Grid and Ranked Grid.</p>
+            <label for=\"password\">Password</label>
+            <input id=\"password\" name=\"password\" type=\"password\" autofocus required>
+            <button type=\"submit\">Log in</button>
+        </form>
+    </body>
+    </html>
+    """
+
+
+@app.route("/api/topster-admin-logout", methods=["POST"])
+def topster_admin_logout():
+    session.pop("topster_admin", None)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/topster-shared-store", methods=["GET", "PUT", "DELETE"])
+def topster_shared_store():
+    if request.method == "GET":
+        return jsonify(
+            {
+                "ok": True,
+                "writable": is_topster_admin(),
+                "settings": get_topster_settings(),
+                "coverCache": get_topster_cover_cache(),
+            }
+        )
+
+    admin_error = require_topster_admin_response()
+    if admin_error is not None:
+        return admin_error
+
+    if request.method == "DELETE":
+        write_json_file(TOPSTER_COVER_CACHE_FILE, {})
+        return jsonify(
+            {
+                "ok": True,
+                "writable": True,
+                "settings": get_topster_settings(),
+                "coverCache": {},
+            }
+        )
+
+    payload = request.get_json(silent=True) or {}
+
+    settings = get_topster_settings()
+    if isinstance(payload.get("settings"), dict):
+        settings = normalize_topster_settings(payload["settings"])
+        write_json_file(TOPSTER_SETTINGS_FILE, settings)
+
+    cover_cache = get_topster_cover_cache()
+    if isinstance(payload.get("coverCache"), dict):
+        cover_cache = normalize_topster_cover_cache(payload["coverCache"])
+        write_json_file(TOPSTER_COVER_CACHE_FILE, cover_cache)
+
+    return jsonify(
+        {
+            "ok": True,
+            "writable": True,
+            "settings": settings,
+            "coverCache": cover_cache,
+        }
+    )
 
 
 def require_env_vars(*names: str) -> None:
@@ -582,6 +784,13 @@ def root():
 
 @app.route("/<path:filename>")
 def static_files(filename: str):
+    protected_topster_pages = {"grid.html", "ranked_grid.html"}
+
+    if filename in protected_topster_pages and not is_topster_admin():
+        if TOPSTER_ADMIN_PASSWORD:
+            return redirect("/topster-admin-login")
+        return "Topster editor access is restricted to the host computer.", 403
+
     target = BASE_DIR / filename
     if target.is_file():
         return send_from_directory(BASE_DIR, filename)
