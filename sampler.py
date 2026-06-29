@@ -937,16 +937,16 @@ def calculate_position_ms(
     return random.randint(0, max_start_ms) if max_start_ms > 0 else 0
 
 
-def sleep_then_pause(sp: spotipy.Spotify, device_id: str, clip_seconds: int, crossfade_seconds: int = 0) -> None:
+def sleep_then_pause(sp: spotipy.Spotify, device_id: str, clip_seconds: int) -> None:
     """
     Waits for the requested clip length but does NOT pause playback.
 
-    If crossfade_seconds is set, the next transition can be triggered early by
-    using wait_for_clip_or_stop(..., crossfade_seconds).
+    This avoids a silent gap between clips. The next call to start_playback()
+    interrupts the currently playing song. The script pauses only after the last
+    album/playlist line has finished, or when the user presses Ctrl+C.
     """
 
-    sleep_seconds = max(0, clip_seconds - max(0, crossfade_seconds))
-    time.sleep(sleep_seconds)
+    time.sleep(clip_seconds)
 
 
 def play_track_uri_clip(
@@ -1452,17 +1452,13 @@ def start_prepared_clip(
     raise RuntimeError(f"Unknown prepared clip kind: {prepared.get('kind')!r}")
 
 
-def wait_for_clip_or_stop(clip_seconds: int, crossfade_seconds: int = 0) -> None:
+def wait_for_clip_or_stop(clip_seconds: int) -> None:
     """
-    Waits for the selected clip length.
-
-    If crossfade_seconds is set, this starts the next clip early by that many
-    seconds. Spotify's Web API cannot create a true two-track audio crossfade on
-    Spotify Connect; this is a transition lead-in/cutover.
+    Keeps timing simple. The previous clip is not paused; the next call to
+    start_playback() interrupts it.
     """
 
-    sleep_seconds = max(0, clip_seconds - max(0, crossfade_seconds))
-    time.sleep(sleep_seconds)
+    time.sleep(clip_seconds)
 
 
 
@@ -1701,7 +1697,7 @@ def play_prepared_items_no_repeat(
                 f"Start: {position_seconds}s"
             )
 
-            wait_for_clip_or_stop(int(prepared.get("clip_seconds") or args.clip_seconds), args.crossfade_seconds)
+            wait_for_clip_or_stop(int(prepared.get("clip_seconds") or args.clip_seconds))
 
             if args.delay_seconds > 0:
                 time.sleep(args.delay_seconds)
@@ -1759,10 +1755,6 @@ def run_single_album_mode(
     print(f"Loaded album: {album.get('name', 'Unknown album')} - {album_artist}")
     print(f"Usable unique songs: {len(playable_tracks)}")
     print(describe_clip_mode(args))
-    if args.crossfade_seconds > 0:
-        print(f"Crossfade lead-in: {args.crossfade_seconds} seconds.")
-    if args.automix:
-        print("Automix requested: enable Automix in the Spotify app; the Web API cannot toggle it.")
     print(f"Single-link mode: {'random' if args.single_link_order == 'random' else 'ordered'} no-repeat album playback.")
     print("Press Ctrl+C to stop.\n")
 
@@ -1845,10 +1837,6 @@ def run_single_playlist_mode(
     print(f"Loaded playlist: {playlist_name} - {owner_name}")
     print(f"Usable unique songs: {len(playable_items)}")
     print(describe_clip_mode(args))
-    if args.crossfade_seconds > 0:
-        print(f"Crossfade lead-in: {args.crossfade_seconds} seconds.")
-    if args.automix:
-        print("Automix requested: enable Automix in the Spotify app; the Web API cannot toggle it.")
     print(f"Playlist mode: {'random' if args.single_link_order == 'random' else 'ordered'} no-repeat playback.")
     print("Press Ctrl+C to stop.\n")
 
@@ -2002,26 +1990,6 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--crossfade-seconds",
-        type=int,
-        default=0,
-        help=(
-            "Crossfade-style transition lead-in, seconds. Valid range: 0-10. "
-            "This starts the next clip early; Spotify Web API cannot toggle the "
-            "client's true crossfade setting."
-        ),
-    )
-
-    parser.add_argument(
-        "--automix",
-        action="store_true",
-        help=(
-            "Log that Automix was requested. Automix itself is a Spotify client "
-            "setting and cannot be toggled through the Web API."
-        ),
-    )
-
-    parser.add_argument(
         "--debug-playlist",
         action="store_true",
         help="Print parsed playlist item data.",
@@ -2099,12 +2067,6 @@ def main() -> None:
     if args.local_seek_delay_seconds < 0:
         raise RuntimeError("--local-seek-delay-seconds cannot be negative.")
 
-    if args.crossfade_seconds < 0:
-        raise RuntimeError("--crossfade-seconds cannot be negative.")
-
-    if args.crossfade_seconds > 10:
-        raise RuntimeError("--crossfade-seconds cannot be greater than 10.")
-
     sp = load_spotify_client(
         token_cache_path=args.spotify_token_cache,
         open_browser=args.spotify_token_cache == ".spotify_token_cache",
@@ -2138,10 +2100,6 @@ def main() -> None:
     print(f"Starting at usable line index: {args.start_index}")
     print(f"Remaining lines to process: {len(lines)}")
     print(describe_clip_mode(args))
-    if args.crossfade_seconds > 0:
-        print(f"Crossfade lead-in: {args.crossfade_seconds} seconds.")
-    if args.automix:
-        print("Automix requested: enable Automix in the Spotify app; the Web API cannot toggle it.")
     print("Transition mode: prefetch next item while current clip plays.")
     print("Press Ctrl+C to stop.\n")
 
@@ -2200,7 +2158,7 @@ def main() -> None:
                     f"Start: {position_seconds}s"
                 )
 
-                wait_for_clip_or_stop(int(prepared.get("clip_seconds") or args.clip_seconds), args.crossfade_seconds)
+                wait_for_clip_or_stop(int(prepared.get("clip_seconds") or args.clip_seconds))
 
                 if args.delay_seconds > 0:
                     time.sleep(args.delay_seconds)

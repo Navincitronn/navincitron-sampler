@@ -315,16 +315,6 @@ def start_sampler():
                 albums_file = uploaded_albums_file
 
         random_start = form_bool(data.get("randomStart"), True)
-        crossfade_enabled = form_bool(data.get("crossfadeEnabled"), False)
-        automix_enabled = form_bool(data.get("automixEnabled"), False)
-
-        try:
-            crossfade_seconds = int(data.get("crossfadeSeconds", 5))
-        except (TypeError, ValueError):
-            return jsonify({"ok": False, "error": "Invalid crossfade seconds input."}), 400
-
-        if crossfade_enabled and (crossfade_seconds < 1 or crossfade_seconds > 10):
-            return jsonify({"ok": False, "error": "Crossfade seconds must be between 1 and 10."}), 400
 
         try:
             spotify_token_cache = write_sampler_token_cache()
@@ -346,12 +336,6 @@ def start_sampler():
             "--spotify-token-cache",
             str(spotify_token_cache),
         ]
-
-        if crossfade_enabled:
-            cmd.extend(["--crossfade-seconds", str(crossfade_seconds)])
-
-        if automix_enabled:
-            cmd.append("--automix")
 
         if source_mode == "playlist":
             cmd.extend(["--single-link", playlist_link])
