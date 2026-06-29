@@ -5,7 +5,6 @@ import hashlib
 import io
 import json
 import os
-from flask_cors import CORS
 import signal
 import subprocess
 import sys
@@ -13,14 +12,31 @@ import time
 import threading
 from collections import deque
 from pathlib import Path
-from urllib.request import Request, urlopen
 from typing import Any
+from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, send_from_directory, redirect, session
-from spotipy.oauth2 import SpotifyOAuth
+from flask import Flask, jsonify, redirect, request, send_from_directory, session
+from flask_cors import CORS
 
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-only-change-this")
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyOAuth
+except ImportError:
+    spotipy = None
+    SpotifyOAuth = None
+
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+SAMPLER_PATH = BASE_DIR / "sampler.py"
+DEFAULT_ALBUMS_FILE = BASE_DIR / "albums.txt"
+GRID_FILE = BASE_DIR / "grid.txt"
+RANKED_SHEET_ID = "1JiZwXGPANDlhkobNPo0Xdw_5MrNpG1fWTbEbL-I1dcA"
+RANKED_SHEET_GID = "0"
+UPLOAD_DIR = BASE_DIR / ".sampler_uploads"
+STATE_FILE = BASE_DIR / "sampler_state.json"
 
 SCOPE = (
     "user-read-playback-state "
@@ -30,7 +46,42 @@ SCOPE = (
     "playlist-read-collaborative"
 )
 
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://www.navincitron.com")
+
+app = Flask(__name__, static_folder=str(BASE_DIR), static_url_path="")
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-only-change-this")
+
+# Cookies must be usable from www.navincitron.com -> api.navincitron.com fetch(..., credentials:"include").
+# For local http testing, set FRONTEND_ORIGIN=http://127.0.0.1:5000 to avoid Secure-cookie requirements.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=FRONTEND_ORIGIN.startswith("https://"),
+    SESSION_COOKIE_SAMESITE="None" if FRONTEND_ORIGIN.startswith("https://") else "Lax",
+)
+
+CORS(
+    app,
+    origins=[FRONTEND_ORIGIN],
+    supports_credentials=True,
+)
+
+
+def require_env_vars(*names: str) -> None:
+    missing = [name for name in names if not os.getenv(name)]
+    if missing:
+        raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
+
+
 def make_oauth() -> SpotifyOAuth:
+    if SpotifyOAuth is None:
+        raise RuntimeError("spotipy is not installed. Run: pip install -r requirements.txt")
+
+    require_env_vars(
+        "SPOTIPY_CLIENT_ID",
+        "SPOTIPY_CLIENT_SECRET",
+        "SPOTIPY_REDIRECT_URI",
+    )
+
     return SpotifyOAuth(
         client_id=os.getenv("SPOTIPY_CLIENT_ID"),
         client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
@@ -40,10 +91,26 @@ def make_oauth() -> SpotifyOAuth:
         open_browser=False,
     )
 
+
+def get_session_token_info() -> dict[str, Any]:
+    token_info = session.get("spotify_token_info")
+
+    if not token_info:
+        raise RuntimeError("Not logged in with Spotify.")
+
+    oauth = make_oauth()
+
+    if oauth.is_token_expired(token_info):
+        token_info = oauth.refresh_access_token(token_info["refresh_token"])
+        session["spotify_token_info"] = token_info
+
+    return token_info
+
+
 @app.route("/login")
 def login():
-    auth_url = make_oauth().get_authorize_url()
-    return redirect(auth_url)
+    return redirect(make_oauth().get_authorize_url())
+
 
 @app.route("/callback")
 def callback():
@@ -55,48 +122,13 @@ def callback():
     token_info = make_oauth().get_access_token(code, as_dict=True)
     session["spotify_token_info"] = token_info
 
-    return redirect(os.getenv("FRONTEND_ORIGIN", "https://www.navincitron.com") + "/shuffle.html")
+    return redirect(FRONTEND_ORIGIN.rstrip("/") + "/shuffle.html")
+
 
 @app.route("/api/auth-status")
 def auth_status():
-    token_info = session.get("spotify_token_info")
-    return jsonify({"ok": True, "authenticated": bool(token_info)})
+    return jsonify({"ok": True, "authenticated": bool(session.get("spotify_token_info"))})
 
-try:
-    import spotipy
-    from spotipy.oauth2 import SpotifyOAuth
-
-    
-except ImportError:  # Allows Flask to show a useful error if requirements were not installed.
-    spotipy = None
-    SpotifyOAuth = None
-
-
-BASE_DIR = Path(__file__).resolve().parent
-SAMPLER_PATH = BASE_DIR / "sampler.py"
-DEFAULT_ALBUMS_FILE = BASE_DIR / "albums.txt"
-GRID_FILE = BASE_DIR / "grid.txt"
-RANKED_SHEET_ID = "1JiZwXGPANDlhkobNPo0Xdw_5MrNpG1fWTbEbL-I1dcA"
-RANKED_SHEET_GID = "0"
-UPLOAD_DIR = BASE_DIR / ".sampler_uploads"
-STATE_FILE = BASE_DIR / "sampler_state.json"
-SCOPE = (
-    "user-read-playback-state "
-    "user-modify-playback-state "
-    "user-read-private "
-    "playlist-read-private "
-    "playlist-read-collaborative"
-)
-
-app = Flask(__name__, static_folder=str(BASE_DIR), static_url_path="")
-
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://www.navincitron.com")
-
-CORS(
-    app,
-    origins=[FRONTEND_ORIGIN],
-    supports_credentials=True,
-)
 
 sampler_process: subprocess.Popen[str] | None = None
 sampler_lock = threading.Lock()
@@ -123,20 +155,10 @@ def stream_process_output(process: subprocess.Popen[str]) -> None:
 
 
 def get_spotify_client():
-    if spotipy is None or SpotifyOAuth is None:
+    if spotipy is None:
         raise RuntimeError("spotipy is not installed. Run: pip install -r requirements.txt")
 
-    token_info = session.get("spotify_token_info")
-
-    if not token_info:
-        raise RuntimeError("Not logged in with Spotify.")
-
-    oauth = make_oauth()
-
-    if oauth.is_token_expired(token_info):
-        token_info = oauth.refresh_access_token(token_info["refresh_token"])
-        session["spotify_token_info"] = token_info
-
+    token_info = get_session_token_info()
     return spotipy.Spotify(auth=token_info["access_token"])
 
 
@@ -179,6 +201,22 @@ def save_uploaded_albums_file() -> Path | None:
         raise ValueError("Uploaded text file is empty.")
 
     return upload_path
+
+
+
+def write_sampler_token_cache() -> Path:
+    """
+    Writes the logged-in user's Spotify token info to a temporary Spotipy cache
+    file so the sampler subprocess can authenticate without opening a browser.
+    """
+
+    token_info = get_session_token_info()
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    token_cache_path = UPLOAD_DIR / f"spotify_token_{int(time.time())}_{os.getpid()}.json"
+    token_cache_path.write_text(json.dumps(token_info), encoding="utf-8")
+
+    return token_cache_path
 
 
 @app.route("/api/start", methods=["POST"])
@@ -254,6 +292,13 @@ def start_sampler():
         device_name = str(data.get("deviceName", "")).strip()
         random_start = form_bool(data.get("randomStart"), True)
 
+        try:
+            spotify_token_cache = write_sampler_token_cache()
+        except RuntimeError as error:
+            return jsonify({"ok": False, "error": str(error)}), 401
+        except Exception as error:
+            return jsonify({"ok": False, "error": f"Could not prepare Spotify token cache: {error}"}), 500
+
         cmd = [
             sys.executable,
             "-u",
@@ -268,6 +313,8 @@ def start_sampler():
             str(assumed_duration_seconds),
             "--local-seek-delay-seconds",
             str(local_seek_delay_seconds),
+            "--spotify-token-cache",
+            str(spotify_token_cache),
         ]
 
         if clip_mode == "random":

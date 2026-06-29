@@ -28,7 +28,10 @@ SCOPE = (
 )
 
 
-def load_spotify_client() -> spotipy.Spotify:
+def load_spotify_client(
+    token_cache_path: str = ".spotify_token_cache",
+    open_browser: bool = True,
+) -> spotipy.Spotify:
     load_dotenv()
 
     required = [
@@ -47,8 +50,8 @@ def load_spotify_client() -> spotipy.Spotify:
             client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
             redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
             scope=SCOPE,
-            cache_path=".spotify_token_cache",
-            open_browser=True,
+            cache_path=token_cache_path,
+            open_browser=open_browser,
         )
     )
 
@@ -1496,6 +1499,16 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--spotify-token-cache",
+        type=str,
+        default=".spotify_token_cache",
+        help=(
+            "Spotipy token cache path. The hosted Flask backend passes a "
+            "temporary cache file here so sampler.py does not try to open a browser."
+        ),
+    )
+
+    parser.add_argument(
         "--albums-file",
         type=str,
         default=ALBUMS_FILE,
@@ -1653,7 +1666,10 @@ def main() -> None:
     if args.local_seek_delay_seconds < 0:
         raise RuntimeError("--local-seek-delay-seconds cannot be negative.")
 
-    sp = load_spotify_client()
+    sp = load_spotify_client(
+        token_cache_path=args.spotify_token_cache,
+        open_browser=args.spotify_token_cache == ".spotify_token_cache",
+    )
     cache = load_cache()
 
     all_lines = load_album_lines(args.albums_file)

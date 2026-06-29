@@ -1,0 +1,21 @@
+# Python / local development
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Environment/secrets
+.env
+.env.*
+.spotify_token_cache
+
+# Runtime/cache/upload files
+album_cache.json
+sampler_state.json
+sampler_state.json.tmp
+.sampler_uploads/
+
+# Editor/system
+.vscode/
+.DS_Store
+Thumbs.db
