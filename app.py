@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -40,7 +41,6 @@ UPLOAD_DIR = BASE_DIR / ".sampler_uploads"
 STATE_FILE = BASE_DIR / "sampler_state.json"
 TOPSTER_COVER_CACHE_FILE = BASE_DIR / "topster_cover_cache.json"
 TOPSTER_SETTINGS_FILE = BASE_DIR / "topster_settings.json"
-TOPSTER_ADMIN_PASSWORD = os.getenv("TOPSTER_ADMIN_PASSWORD", "").strip()
 
 SCOPE = (
     "user-read-playback-state "
@@ -53,16 +53,78 @@ SCOPE = (
 def parse_csv_env(name: str, fallback: str) -> list[str]:
     raw = os.getenv(name) or os.getenv("FRONTEND_ORIGIN") or fallback
     values = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
-    return values or [fallback.rstrip("/")]
+
+    # navincitron.com and www.navincitron.com both serve the static frontend.
+    # Include both unless the deployment explicitly provides FRONTEND_ORIGINS.
+    if name == "FRONTEND_ORIGINS" and not os.getenv(name):
+        expanded = []
+        for value in values:
+            expanded.append(value)
+            if value == "https://www.navincitron.com":
+                expanded.append("https://navincitron.com")
+            elif value == "https://navincitron.com":
+                expanded.append("https://www.navincitron.com")
+        values = expanded
+
+    return list(dict.fromkeys(values)) or [fallback.rstrip("/")]
 
 
-FRONTEND_ORIGINS = parse_csv_env("FRONTEND_ORIGINS", "https://www.navincitron.com")
+FRONTEND_ORIGINS = parse_csv_env("FRONTEND_ORIGINS", "https://www.navincitron.com,https://navincitron.com")
 FRONTEND_ORIGIN = FRONTEND_ORIGINS[0]
 TOPSTER_ADMIN_ALLOWED_IPS = {
     item.strip()
     for item in os.getenv("TOPSTER_ADMIN_ALLOWED_IPS", "").split(",")
     if item.strip()
 }
+
+
+def normalize_secret_text(value: Any) -> str:
+    text = str(value or "").replace("\ufeff", "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    return text
+
+
+def read_env_file_value(name: str) -> str:
+    """
+    Fallback reader for deployments where the process was not restarted after
+    editing .env. Environment variables from the hosting platform still take
+    precedence, but this lets the admin password be read directly from the local
+    backend .env file when it exists.
+    """
+
+    env_path = BASE_DIR / ".env"
+    if not env_path.exists():
+        return ""
+
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, raw_value = line.split("=", 1)
+            if key.strip() == name:
+                return normalize_secret_text(raw_value)
+    except Exception:
+        return ""
+
+    return ""
+
+
+def get_topster_admin_password() -> str:
+    return normalize_secret_text(os.getenv("TOPSTER_ADMIN_PASSWORD") or read_env_file_value("TOPSTER_ADMIN_PASSWORD"))
+
+
+def topster_admin_password_is_configured() -> bool:
+    return bool(get_topster_admin_password())
+
+
+def submitted_topster_password_is_valid(submitted_password: str) -> bool:
+    configured_password = get_topster_admin_password()
+    if not configured_password:
+        return False
+    return hmac.compare_digest(normalize_secret_text(submitted_password), configured_password)
+
 
 app = Flask(__name__, static_folder=str(BASE_DIR), static_url_path="")
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-only-change-this")
@@ -224,7 +286,12 @@ def topster_admin_login():
         submitted_password = request.form.get("password", "")
         if not is_admin_ip_allowed():
             return "Topster admin login is not allowed from this IP address.", 403
-        if TOPSTER_ADMIN_PASSWORD and submitted_password == TOPSTER_ADMIN_PASSWORD:
+        if not topster_admin_password_is_configured():
+            return (
+                "Topster admin password is not configured on the live backend. "
+                "Set TOPSTER_ADMIN_PASSWORD in the backend hosting environment and restart/redeploy the service."
+            ), 500
+        if submitted_topster_password_is_valid(submitted_password):
             session["topster_admin"] = True
             return redirect(next_url)
         return "Invalid Topster admin password.", 403
@@ -252,6 +319,7 @@ def topster_admin_login():
         <form method=\"post\">
             <h1>Topster Admin Login</h1>
             <p>Only the host/admin computer can edit Grid and Ranked Grid.</p>
+            {"<p style='color:#ffcf85;font-weight:bold;'>Admin password is not configured on this backend.</p>" if not topster_admin_password_is_configured() else ""}
             <input type=\"hidden\" name=\"next\" value=\"{escaped_next}\">
             <label for=\"password\">Password</label>
             <input id=\"password\" name=\"password\" type=\"password\" autofocus required>
@@ -266,6 +334,20 @@ def topster_admin_login():
 def topster_admin_logout():
     session.pop("topster_admin", None)
     return jsonify({"ok": True})
+
+
+@app.route("/api/topster-admin-status", methods=["GET"])
+def topster_admin_status():
+    return jsonify(
+        {
+            "ok": True,
+            "authenticated": is_topster_admin(),
+            "writable": is_topster_admin(),
+            "passwordConfigured": topster_admin_password_is_configured(),
+            "ipAllowed": is_admin_ip_allowed(),
+            "frontendOrigins": FRONTEND_ORIGINS,
+        }
+    )
 
 
 @app.route("/api/topster-shared-store", methods=["GET", "PUT", "DELETE"])
