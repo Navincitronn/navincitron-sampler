@@ -13,6 +13,7 @@ import threading
 from collections import deque
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
@@ -49,43 +50,84 @@ SCOPE = (
     "playlist-read-collaborative"
 )
 
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://www.navincitron.com")
+def parse_csv_env(name: str, fallback: str) -> list[str]:
+    raw = os.getenv(name) or os.getenv("FRONTEND_ORIGIN") or fallback
+    values = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+    return values or [fallback.rstrip("/")]
+
+
+FRONTEND_ORIGINS = parse_csv_env("FRONTEND_ORIGINS", "https://www.navincitron.com")
+FRONTEND_ORIGIN = FRONTEND_ORIGINS[0]
+TOPSTER_ADMIN_ALLOWED_IPS = {
+    item.strip()
+    for item in os.getenv("TOPSTER_ADMIN_ALLOWED_IPS", "").split(",")
+    if item.strip()
+}
 
 app = Flask(__name__, static_folder=str(BASE_DIR), static_url_path="")
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-only-change-this")
 
 # Cookies must be usable from www.navincitron.com -> api.navincitron.com fetch(..., credentials:"include").
-# For local http testing, set FRONTEND_ORIGIN=http://127.0.0.1:5000 to avoid Secure-cookie requirements.
+# For local http testing, set FRONTEND_ORIGINS=http://127.0.0.1:5000 to avoid Secure-cookie requirements.
+USES_HTTPS_FRONTEND = any(origin.startswith("https://") for origin in FRONTEND_ORIGINS)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=FRONTEND_ORIGIN.startswith("https://"),
-    SESSION_COOKIE_SAMESITE="None" if FRONTEND_ORIGIN.startswith("https://") else "Lax",
+    SESSION_COOKIE_SECURE=USES_HTTPS_FRONTEND,
+    SESSION_COOKIE_SAMESITE="None" if USES_HTTPS_FRONTEND else "Lax",
 )
 
 CORS(
     app,
-    origins=[FRONTEND_ORIGIN],
+    origins=FRONTEND_ORIGINS,
     supports_credentials=True,
 )
 
 
 
+def request_ip_address() -> str:
+    remote_addr = request.headers.get("X-Forwarded-For", request.remote_addr or "")
+    return remote_addr.split(",")[0].strip()
+
+
 def is_local_request() -> bool:
     """
-    Allows the host computer to use grid.html/ranked_grid.html as the editor
-    without exposing those editor pages to other computers on the network.
-
-    If you deploy behind a reverse proxy, prefer setting TOPSTER_ADMIN_PASSWORD
-    and logging in through /topster-admin-login.
+    Allows local development on the host computer to use grid.html/ranked_grid.html
+    without a password when the browser is hitting this Flask app directly.
     """
 
-    remote_addr = request.headers.get("X-Forwarded-For", request.remote_addr or "")
-    remote_addr = remote_addr.split(",")[0].strip()
-    return remote_addr in {"127.0.0.1", "::1", "localhost"}
+    return request_ip_address() in {"127.0.0.1", "::1", "localhost"}
+
+
+def is_admin_ip_allowed() -> bool:
+    # Leave TOPSTER_ADMIN_ALLOWED_IPS unset to allow password login from any IP.
+    # Set it to a comma-separated list to restrict admin login/session use to those IPs.
+    return not TOPSTER_ADMIN_ALLOWED_IPS or request_ip_address() in TOPSTER_ADMIN_ALLOWED_IPS
 
 
 def is_topster_admin() -> bool:
-    return bool(session.get("topster_admin")) or is_local_request()
+    if is_local_request():
+        return True
+    return bool(session.get("topster_admin")) and is_admin_ip_allowed()
+
+
+def is_allowed_frontend_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    if not parsed.scheme and not parsed.netloc and url.startswith("/"):
+        return True
+
+    origin = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    return origin in FRONTEND_ORIGINS
+
+
+def safe_frontend_redirect_url(raw_next: str | None, fallback_path: str = "/grid.html") -> str:
+    candidate = (raw_next or "").strip()
+    if candidate and is_allowed_frontend_url(candidate):
+        return candidate
+    return FRONTEND_ORIGIN.rstrip("/") + fallback_path
 
 
 def require_topster_admin_response():
@@ -176,17 +218,23 @@ def normalize_topster_settings(value: Any) -> dict[str, Any]:
 
 @app.route("/topster-admin-login", methods=["GET", "POST"])
 def topster_admin_login():
+    next_url = safe_frontend_redirect_url(request.values.get("next"))
+
     if request.method == "POST":
         submitted_password = request.form.get("password", "")
+        if not is_admin_ip_allowed():
+            return "Topster admin login is not allowed from this IP address.", 403
         if TOPSTER_ADMIN_PASSWORD and submitted_password == TOPSTER_ADMIN_PASSWORD:
             session["topster_admin"] = True
-            return redirect("/grid.html")
+            return redirect(next_url)
         return "Invalid Topster admin password.", 403
 
     if is_topster_admin():
-        return redirect("/grid.html")
+        return redirect(next_url)
 
-    return """
+    escaped_next = next_url.replace('&', '&amp;').replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
+
+    return f"""
     <!doctype html>
     <html lang=\"en\">
     <head>
@@ -194,16 +242,17 @@ def topster_admin_login():
         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
         <title>Topster Admin Login</title>
         <style>
-            body { background:#333; color:#fff; font-family:Arial,sans-serif; display:grid; place-items:center; min-height:100vh; margin:0; }
-            form { background:#444; border-radius:10px; padding:24px; width:min(420px, calc(100vw - 32px)); }
-            input { box-sizing:border-box; width:100%; padding:10px; margin:10px 0 16px; }
-            button { background:#1974D2; border:0; border-radius:5px; color:white; cursor:pointer; padding:10px 18px; }
+            body {{ background:#333; color:#fff; font-family:Arial,sans-serif; display:grid; place-items:center; min-height:100vh; margin:0; }}
+            form {{ background:#444; border-radius:10px; padding:24px; width:min(420px, calc(100vw - 32px)); }}
+            input {{ box-sizing:border-box; width:100%; padding:10px; margin:10px 0 16px; }}
+            button {{ background:#1974D2; border:0; border-radius:5px; color:white; cursor:pointer; padding:10px 18px; }}
         </style>
     </head>
     <body>
         <form method=\"post\">
             <h1>Topster Admin Login</h1>
             <p>Only the host/admin computer can edit Grid and Ranked Grid.</p>
+            <input type=\"hidden\" name=\"next\" value=\"{escaped_next}\">
             <label for=\"password\">Password</label>
             <input id=\"password\" name=\"password\" type=\"password\" autofocus required>
             <button type=\"submit\">Log in</button>
