@@ -228,6 +228,42 @@ def is_topster_admin() -> bool:
     return bool(session.get("topster_admin")) and is_admin_ip_allowed()
 
 
+def redirect_topster_frontend_page(filename: str):
+    """
+    Prevent the backend/API domain from serving stale copies of the static Topster
+    pages. The canonical Topster UI lives in navincitron-website.
+    Local Flask development can still serve a local copy if it exists.
+    """
+
+    if is_local_request() and (BASE_DIR / filename).exists():
+        return send_from_directory(BASE_DIR, filename)
+
+    target = FRONTEND_ORIGIN.rstrip("/") + "/" + filename
+    if request.query_string:
+        target += "?" + request.query_string.decode("utf-8", errors="ignore")
+    return redirect(target, code=302)
+
+
+@app.route("/grid.html")
+def redirect_grid_html():
+    return redirect_topster_frontend_page("grid.html")
+
+
+@app.route("/ranked_grid.html")
+def redirect_ranked_grid_html():
+    return redirect_topster_frontend_page("ranked_grid.html")
+
+
+@app.route("/album_list.html")
+def redirect_album_list_html():
+    return redirect_topster_frontend_page("album_list.html")
+
+
+@app.route("/ranked_album_list.html")
+def redirect_ranked_album_list_html():
+    return redirect_topster_frontend_page("ranked_album_list.html")
+
+
 def is_allowed_frontend_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
