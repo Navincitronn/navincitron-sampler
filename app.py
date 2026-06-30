@@ -260,6 +260,7 @@ def normalize_topster_settings(value: Any) -> dict[str, Any]:
         "Open Sans", "Helvetica", "Georgia", "Tahoma", "Calibri",
     }
     allowed_sidebar_modes = {"artist-title", "title-only", "hidden"}
+    allowed_cover_overlays = {"none", "index", "year"}
 
     def clamp_int(raw: Any, minimum: int, maximum: int, fallback: int) -> int:
         try:
@@ -275,6 +276,7 @@ def normalize_topster_settings(value: Any) -> dict[str, Any]:
         "roundCorners": clamp_int(value.get("roundCorners"), 0, 24, 0),
         "albumGap": clamp_int(value.get("albumGap"), 0, 100, 4),
         "font": value.get("font") if value.get("font") in allowed_fonts else "Arial",
+        "coverOverlay": value.get("coverOverlay") if value.get("coverOverlay") in allowed_cover_overlays else "none",
     }
 
 
