@@ -699,6 +699,137 @@ def songguesser_candidate_from_playlist_item(playlist_bundle: dict[str, Any], it
     return {"prepared": prepared, "answer": songguesser_track_answer(prepared)}
 
 
+
+def songguesser_answer_has_unknown_album(answer: dict[str, Any]) -> bool:
+    album = str(answer.get("album") or "").strip().lower()
+    return not album or album in {"unknown album", "none", "null"}
+
+
+def songguesser_should_lookup_answer(answer: dict[str, Any], hints_enabled: dict[str, Any]) -> bool:
+    if not any(hints_enabled.get(key) for key in ("releaseYear", "releaseDecade", "album")):
+        return False
+
+    if songguesser_answer_has_unknown_album(answer):
+        return True
+
+    if (hints_enabled.get("releaseYear") or hints_enabled.get("releaseDecade")) and not answer.get("releaseYear"):
+        return True
+
+    return False
+
+
+def songguesser_search_track_metadata(sp: Any, answer: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Uses Spotify Search as the music metadata source for local-file entries or
+    entries with missing album/release metadata.
+
+    This avoids adding another third-party API key and is only used when the user
+    enabled a hint that needs album/year/decade data.
+    """
+
+    artist = str(answer.get("artist") or "").strip()
+    song = str(answer.get("song") or "").strip()
+
+    if not song or song.lower() == "unknown track":
+        return None
+
+    queries = []
+    if artist and artist.lower() != "unknown artist":
+        queries.extend(
+            [
+                f'track:"{song}" artist:"{artist}"',
+                f'{song} {artist}',
+            ]
+        )
+    queries.append(song)
+
+    for query in queries:
+        try:
+            results = sp.search(q=query, type="track", limit=5)
+        except Exception as error:
+            append_log(f"[songguesser warning: metadata lookup failed for {song!r}: {error}]")
+            return None
+
+        tracks = (results.get("tracks") or {}).get("items") or []
+        if not tracks:
+            continue
+
+        # Prefer a track whose artist token appears in the requested local artist
+        # when that information exists.
+        selected = tracks[0]
+        if artist and artist.lower() != "unknown artist":
+            artist_norm = artist.lower()
+            for track in tracks:
+                spotify_artists = " ".join(
+                    item.get("name", "") for item in track.get("artists", []) if isinstance(item, dict)
+                ).lower()
+                if any(token and token in spotify_artists for token in re.split(r"[\s,&+]+", artist_norm)):
+                    selected = track
+                    break
+
+        album = selected.get("album") if isinstance(selected.get("album"), dict) else {}
+        if not album:
+            continue
+
+        images = album.get("images") or []
+        release_year = songguesser_release_year_from_text(album.get("release_date"))
+        release_decade = songguesser_release_decade_from_year(release_year)
+
+        return {
+            "artist": ", ".join(
+                item.get("name", "")
+                for item in selected.get("artists", [])
+                if isinstance(item, dict) and item.get("name")
+            ) or answer.get("artist"),
+            "album": album.get("name") or answer.get("album"),
+            "song": selected.get("name") or answer.get("song"),
+            "releaseYear": release_year or answer.get("releaseYear") or "",
+            "releaseDecade": release_decade or answer.get("releaseDecade") or "",
+            "coverUrl": (sampler_tools.best_image_url(images) if sampler_tools is not None else None)
+                or answer.get("coverUrl"),
+        }
+
+    return None
+
+
+def songguesser_enrich_queue_answers(sp: Any, queue: list[dict[str, Any]], hints_enabled: dict[str, Any]) -> None:
+    for candidate in queue:
+        answer = candidate.get("answer")
+        if not isinstance(answer, dict):
+            continue
+
+        if not songguesser_should_lookup_answer(answer, hints_enabled):
+            continue
+
+        looked_up = songguesser_search_track_metadata(sp, answer)
+        if not looked_up:
+            continue
+
+        for key in ("artist", "album", "song", "releaseYear", "releaseDecade", "coverUrl"):
+            value = looked_up.get(key)
+            if value and (key not in answer or not answer.get(key) or (key == "album" and songguesser_answer_has_unknown_album(answer))):
+                answer[key] = value
+
+
+def songguesser_summary_payload(game: dict[str, Any]) -> list[dict[str, Any]]:
+    summary = []
+
+    for index, candidate in enumerate(game.get("queue") or [], start=1):
+        answer = candidate.get("answer") or {}
+        summary.append(
+            {
+                "index": index,
+                "artist": answer.get("artist") or "Unknown artist",
+                "song": answer.get("song") or "Unknown song",
+                "album": answer.get("album") or "Unknown album",
+                "coverUrl": answer.get("coverUrl"),
+            }
+        )
+
+    return summary
+
+
+
 def songguesser_build_album_candidates(
     sp: Any,
     cache: dict[str, Any],
@@ -878,7 +1009,12 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
     current_index = int(game.get("current_index", 0))
 
     if current_index >= len(queue):
-        return {"ok": True, "complete": True, "message": "Songguesser complete."}
+        return {
+            "ok": True,
+            "complete": True,
+            "message": "Songguesser complete.",
+            "summary": songguesser_summary_payload(game),
+        }
 
     sp = get_spotify_client()
     device_id = sampler_tools.get_device_id(sp, None)
@@ -945,6 +1081,8 @@ def songguesser_start():
         except Exception as error:
             return jsonify({"ok": False, "error": str(error)}), 400
 
+        songguesser_enrich_queue_answers(sp, queue, hints)
+
         random.shuffle(queue)
         game_id = secrets.token_urlsafe(16)
         game = {
@@ -974,13 +1112,19 @@ def songguesser_next():
 
     game["current_index"] = int(game.get("current_index", 0)) + 1
     if game["current_index"] >= len(game.get("queue") or []):
+        summary = songguesser_summary_payload(game)
         songguesser_games.pop(game.get("id"), None)
         session.pop("songguesser_game_id", None)
         try:
             pause_spotify()
         except Exception:
             pass
-        return jsonify({"ok": True, "complete": True, "message": "Songguesser complete."})
+        return jsonify({
+            "ok": True,
+            "complete": True,
+            "message": "Songguesser complete.",
+            "summary": summary,
+        })
 
     try:
         return jsonify(songguesser_start_current(game))
