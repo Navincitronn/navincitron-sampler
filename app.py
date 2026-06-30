@@ -77,6 +77,55 @@ TOPSTER_ADMIN_ALLOWED_IPS = {
     if item.strip()
 }
 
+TOPSTER_STORE_KEYS = {"grid", "ranked"}
+TOPSTER_STORE_ALIASES = {
+    "grid": "grid",
+    "grid-file": "grid",
+    "album-list": "grid",
+    "album_list": "grid",
+    "albums": "grid",
+    "ranked": "ranked",
+    "ranked-sheet": "ranked",
+    "ranked_album_list": "ranked",
+    "ranked-album-list": "ranked",
+}
+
+
+def normalize_topster_store_key(value: Any = None) -> str:
+    raw = str(value or request.args.get("source") or request.args.get("kind") or "grid").strip().lower()
+    return TOPSTER_STORE_ALIASES.get(raw, "grid")
+
+
+def is_topster_source_container(value: Any) -> bool:
+    return isinstance(value, dict) and any(key in value for key in TOPSTER_STORE_KEYS)
+
+
+def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
+    data = read_json_file(path, {})
+    if not isinstance(data, dict):
+        data = {}
+
+    if is_topster_source_container(data):
+        return {
+            "grid": data.get("grid") if isinstance(data.get("grid"), dict) else {},
+            "ranked": data.get("ranked") if isinstance(data.get("ranked"), dict) else {},
+        }
+
+    # Backward-compatible migration path: older builds stored one flat object.
+    # Seed both public stores from that flat object until each one is saved independently.
+    return {
+        "grid": data,
+        "ranked": data,
+    }
+
+
+def write_topster_source_map(path: Path, source_key: str, source_value: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    source_key = normalize_topster_store_key(source_key)
+    source_map = get_topster_source_map(path)
+    source_map[source_key] = source_value
+    write_json_file(path, source_map)
+    return source_map
+
 
 def normalize_secret_text(value: Any) -> str:
     text = str(value or "").replace("\ufeff", "").strip()
@@ -218,13 +267,15 @@ def write_json_file(path: Path, data: Any) -> None:
     temp_path.replace(path)
 
 
-def get_topster_settings() -> dict[str, Any]:
-    settings = read_json_file(TOPSTER_SETTINGS_FILE, {})
+def get_topster_settings(source_key: str | None = None) -> dict[str, Any]:
+    settings_map = get_topster_source_map(TOPSTER_SETTINGS_FILE)
+    settings = settings_map.get(normalize_topster_store_key(source_key), {})
     return settings if isinstance(settings, dict) else {}
 
 
-def get_topster_cover_cache() -> dict[str, Any]:
-    cover_cache = read_json_file(TOPSTER_COVER_CACHE_FILE, {})
+def get_topster_cover_cache(source_key: str | None = None) -> dict[str, Any]:
+    cover_cache_map = get_topster_source_map(TOPSTER_COVER_CACHE_FILE)
+    cover_cache = cover_cache_map.get(normalize_topster_store_key(source_key), {})
     return cover_cache if isinstance(cover_cache, dict) else {}
 
 
@@ -354,13 +405,16 @@ def topster_admin_status():
 
 @app.route("/api/topster-shared-store", methods=["GET", "PUT", "DELETE"])
 def topster_shared_store():
+    source_key = normalize_topster_store_key()
+
     if request.method == "GET":
         return jsonify(
             {
                 "ok": True,
+                "source": source_key,
                 "writable": is_topster_admin(),
-                "settings": get_topster_settings(),
-                "coverCache": get_topster_cover_cache(),
+                "settings": get_topster_settings(source_key),
+                "coverCache": get_topster_cover_cache(source_key),
             }
         )
 
@@ -369,31 +423,33 @@ def topster_shared_store():
         return admin_error
 
     if request.method == "DELETE":
-        write_json_file(TOPSTER_COVER_CACHE_FILE, {})
+        source_map = write_topster_source_map(TOPSTER_COVER_CACHE_FILE, source_key, {})
         return jsonify(
             {
                 "ok": True,
+                "source": source_key,
                 "writable": True,
-                "settings": get_topster_settings(),
-                "coverCache": {},
+                "settings": get_topster_settings(source_key),
+                "coverCache": source_map.get(source_key, {}),
             }
         )
 
     payload = request.get_json(silent=True) or {}
 
-    settings = get_topster_settings()
+    settings = get_topster_settings(source_key)
     if isinstance(payload.get("settings"), dict):
         settings = normalize_topster_settings(payload["settings"])
-        write_json_file(TOPSTER_SETTINGS_FILE, settings)
+        write_topster_source_map(TOPSTER_SETTINGS_FILE, source_key, settings)
 
-    cover_cache = get_topster_cover_cache()
+    cover_cache = get_topster_cover_cache(source_key)
     if isinstance(payload.get("coverCache"), dict):
         cover_cache = normalize_topster_cover_cache(payload["coverCache"])
-        write_json_file(TOPSTER_COVER_CACHE_FILE, cover_cache)
+        write_topster_source_map(TOPSTER_COVER_CACHE_FILE, source_key, cover_cache)
 
     return jsonify(
         {
             "ok": True,
+            "source": source_key,
             "writable": True,
             "settings": settings,
             "coverCache": cover_cache,
