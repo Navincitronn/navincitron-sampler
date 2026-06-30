@@ -175,6 +175,8 @@ def simplify_album(album: dict) -> dict:
         "name": album.get("name") or "Unknown album",
         "artists": [artist["name"] for artist in simplify_artists(album.get("artists"))],
         "external_url": external_urls.get("spotify"),
+        "release_date": album.get("release_date"),
+        "release_date_precision": album.get("release_date_precision"),
         "images": images,
         "cover_url": best_image_url(images),
         "tracks_first_page": [],
@@ -216,6 +218,8 @@ def simplify_track(track: dict, album_context: dict | None = None) -> dict:
         "artists": simplify_artists(track.get("artists")),
         "album": {
             "name": album_name,
+            "release_date": album.get("release_date") or (album_context or {}).get("release_date"),
+            "release_date_precision": album.get("release_date_precision") or (album_context or {}).get("release_date_precision"),
             "images": album_images,
             "cover_url": best_image_url(album_images),
         },

@@ -6,6 +6,8 @@ import hmac
 import io
 import json
 import os
+import random
+import secrets
 import signal
 import subprocess
 import sys
@@ -27,6 +29,11 @@ try:
 except ImportError:
     spotipy = None
     SpotifyOAuth = None
+
+try:
+    import sampler as sampler_tools
+except ImportError:
+    sampler_tools = None
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -530,6 +537,11 @@ sampler_lock = threading.Lock()
 log_lines: deque[str] = deque(maxlen=300)
 last_command: list[str] = []
 current_cover_cache: dict[str, Any] = {"timestamp": 0.0, "data": None}
+songguesser_games: dict[str, dict[str, Any]] = {}
+SONGGUESSER_CLIP_SECONDS = 30
+SONGGUESSER_ASSUMED_DURATION_SECONDS = 180
+SONGGUESSER_LOCAL_SEEK_DELAY_SECONDS = 0.0
+SONGGUESSER_SONG_COUNT = 5
 
 
 def append_log(line: str) -> None:
@@ -612,6 +624,378 @@ def write_sampler_token_cache() -> Path:
     token_cache_path.write_text(json.dumps(token_info), encoding="utf-8")
 
     return token_cache_path
+
+
+def configure_sampler_tools() -> None:
+    if sampler_tools is None:
+        raise RuntimeError("sampler.py could not be imported by app.py.")
+
+    sampler_tools.CACHE_FILE = str(BASE_DIR / "album_cache.json")
+    sampler_tools.STATE_FILE = str(STATE_FILE)
+
+
+def songguesser_release_year_from_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 4 and text[:4].isdigit():
+        return text[:4]
+    return ""
+
+
+def songguesser_release_decade_from_year(year: str) -> str:
+    if len(year) == 4 and year.isdigit():
+        return f"{year[:3]}0s"
+    return ""
+
+
+def songguesser_track_answer(prepared: dict[str, Any]) -> dict[str, Any]:
+    configure_sampler_tools()
+
+    track = prepared.get("track") or {}
+    album = track.get("album") if isinstance(track.get("album"), dict) else {}
+
+    artist = sampler_tools.format_track_artist(track)
+    song = sampler_tools.format_track_name(track)
+    album_name = album.get("name") or prepared.get("album_name") or "Unknown album"
+    cover_url = sampler_tools.prepared_cover_url(prepared)
+    release_year = songguesser_release_year_from_text(album.get("release_date") or prepared.get("release_date"))
+    release_decade = songguesser_release_decade_from_year(release_year)
+
+    return {
+        "artist": artist,
+        "album": album_name,
+        "song": song,
+        "releaseYear": release_year,
+        "releaseDecade": release_decade,
+        "coverUrl": cover_url,
+    }
+
+
+def songguesser_candidate_from_album_track(album: dict[str, Any], track: dict[str, Any]) -> dict[str, Any]:
+    configure_sampler_tools()
+
+    prepared = sampler_tools.prepare_album_track_clip(
+        album=album,
+        track=track,
+        clip_seconds=SONGGUESSER_CLIP_SECONDS,
+        random_start=True,
+        assumed_duration_seconds=SONGGUESSER_ASSUMED_DURATION_SECONDS,
+    )
+    prepared["release_date"] = album.get("release_date")
+
+    return {"prepared": prepared, "answer": songguesser_track_answer(prepared)}
+
+
+def songguesser_candidate_from_playlist_item(playlist_bundle: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    configure_sampler_tools()
+
+    prepared = sampler_tools.prepare_playlist_item_clip(
+        playlist_bundle=playlist_bundle,
+        item=item,
+        clip_seconds=SONGGUESSER_CLIP_SECONDS,
+        random_start=True,
+        assumed_duration_seconds=SONGGUESSER_ASSUMED_DURATION_SECONDS,
+    )
+
+    return {"prepared": prepared, "answer": songguesser_track_answer(prepared)}
+
+
+def songguesser_build_album_candidates(
+    sp: Any,
+    cache: dict[str, Any],
+    album_line: str,
+    used_by_source: dict[str, set[str]],
+    maximum: int,
+) -> list[dict[str, Any]]:
+    configure_sampler_tools()
+
+    album = sampler_tools.resolve_album(sp, album_line, cache)
+    tracks = sampler_tools.get_album_tracks_cached(sp, album, cache)
+    playable_tracks = sampler_tools.get_unique_playable_album_tracks(
+        tracks=tracks,
+        required_clip_seconds=SONGGUESSER_CLIP_SECONDS,
+    )
+    random.shuffle(playable_tracks)
+
+    source_key = f"album::{album.get('id') or album_line}"
+    used_keys = used_by_source.setdefault(source_key, set())
+    candidates: list[dict[str, Any]] = []
+
+    for track in playable_tracks:
+        track_key = sampler_tools.track_dedupe_key(track)
+        if track_key in used_keys:
+            continue
+        used_keys.add(track_key)
+        candidates.append(songguesser_candidate_from_album_track(album, track))
+        if len(candidates) >= maximum:
+            break
+
+    return candidates
+
+
+def songguesser_build_playlist_candidates(
+    sp: Any,
+    cache: dict[str, Any],
+    playlist_link: str,
+    used_by_source: dict[str, set[str]],
+    maximum: int,
+) -> list[dict[str, Any]]:
+    configure_sampler_tools()
+
+    playlist_id = sampler_tools.extract_spotify_playlist_id(playlist_link)
+    if not playlist_id:
+        raise RuntimeError("Invalid Spotify playlist link or URI.")
+
+    playlist_bundle = sampler_tools.get_playlist_bundle_cached(sp, playlist_id, cache)
+    playlist_items = sampler_tools.get_unique_playable_playlist_items(
+        playlist_items=playlist_bundle.get("items") or [],
+        required_clip_seconds=SONGGUESSER_CLIP_SECONDS,
+    )
+    random.shuffle(playlist_items)
+
+    source_key = f"playlist::{playlist_id}"
+    used_keys = used_by_source.setdefault(source_key, set())
+    candidates: list[dict[str, Any]] = []
+
+    for item in playlist_items:
+        item_key = sampler_tools.playlist_item_dedupe_key(item)
+        if item_key in used_keys:
+            continue
+        used_keys.add(item_key)
+        candidates.append(songguesser_candidate_from_playlist_item(playlist_bundle, item))
+        if len(candidates) >= maximum:
+            break
+
+    return candidates
+
+
+def songguesser_build_candidates_from_file(sp: Any, cache: dict[str, Any], albums_file: Path) -> list[dict[str, Any]]:
+    configure_sampler_tools()
+
+    lines = sampler_tools.load_album_lines(str(albums_file))
+    if not lines:
+        raise RuntimeError("No album or playlist links were found in the uploaded text file.")
+
+    used_by_source: dict[str, set[str]] = {}
+    candidates: list[dict[str, Any]] = []
+
+    # Multiple passes allow a short file to contribute more than one unique song
+    # from the same album/playlist while still preventing repeats from that source.
+    for _pass_index in range(max(1, SONGGUESSER_SONG_COUNT)):
+        shuffled_lines = lines[:]
+        random.shuffle(shuffled_lines)
+        progress_before = len(candidates)
+
+        for line in shuffled_lines:
+            remaining = SONGGUESSER_SONG_COUNT - len(candidates)
+            if remaining <= 0:
+                break
+
+            try:
+                if sampler_tools.extract_spotify_playlist_id(line):
+                    candidates.extend(songguesser_build_playlist_candidates(sp, cache, line, used_by_source, 1))
+                else:
+                    candidates.extend(songguesser_build_album_candidates(sp, cache, line, used_by_source, 1))
+            except Exception as error:
+                append_log(f"[songguesser warning: skipped source {line!r}: {error}]")
+
+        if len(candidates) >= SONGGUESSER_SONG_COUNT:
+            break
+        if len(candidates) == progress_before:
+            break
+
+    if len(candidates) < SONGGUESSER_SONG_COUNT:
+        raise RuntimeError(
+            f"Songguesser requires five playable unique songs, but only found {len(candidates)} in the uploaded text file."
+        )
+
+    return candidates[:SONGGUESSER_SONG_COUNT]
+
+
+def songguesser_build_candidates_from_single_link(sp: Any, cache: dict[str, Any], link: str) -> list[dict[str, Any]]:
+    configure_sampler_tools()
+
+    used_by_source: dict[str, set[str]] = {}
+
+    if sampler_tools.extract_spotify_album_id(link):
+        candidates = songguesser_build_album_candidates(
+            sp=sp,
+            cache=cache,
+            album_line=link,
+            used_by_source=used_by_source,
+            maximum=SONGGUESSER_SONG_COUNT,
+        )
+    elif sampler_tools.extract_spotify_playlist_id(link):
+        candidates = songguesser_build_playlist_candidates(
+            sp=sp,
+            cache=cache,
+            playlist_link=link,
+            used_by_source=used_by_source,
+            maximum=SONGGUESSER_SONG_COUNT,
+        )
+    else:
+        raise RuntimeError("Invalid Spotify album or playlist link/URI.")
+
+    if len(candidates) < SONGGUESSER_SONG_COUNT:
+        raise RuntimeError(
+            f"Songguesser requires five playable unique songs, but only found {len(candidates)} in that album/playlist."
+        )
+
+    return candidates[:SONGGUESSER_SONG_COUNT]
+
+
+def songguesser_public_payload(game: dict[str, Any], candidate: dict[str, Any], position_ms: int) -> dict[str, Any]:
+    answer = candidate.get("answer") or {}
+    hints_enabled = game.get("hints") or {}
+    release_year = answer.get("releaseYear") or ""
+    release_decade = answer.get("releaseDecade") or ""
+
+    hints = {
+        "releaseYear": release_year if hints_enabled.get("releaseYear") and release_year else None,
+        "releaseDecade": release_decade if hints_enabled.get("releaseDecade") and release_decade else None,
+        "artist": answer.get("artist") if hints_enabled.get("artist") else None,
+        "album": answer.get("album") if hints_enabled.get("album") else None,
+    }
+
+    now = time.time()
+    return {
+        "ok": True,
+        "complete": False,
+        "progress": int(game.get("current_index", 0)) + 1,
+        "total": len(game.get("queue") or []),
+        "clipSeconds": SONGGUESSER_CLIP_SECONDS,
+        "positionMs": position_ms,
+        "startedAt": now,
+        "endsAt": now + SONGGUESSER_CLIP_SECONDS,
+        "answer": answer,
+        "hints": hints,
+    }
+
+
+def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
+    configure_sampler_tools()
+
+    queue = game.get("queue") or []
+    current_index = int(game.get("current_index", 0))
+
+    if current_index >= len(queue):
+        return {"ok": True, "complete": True, "message": "Songguesser complete."}
+
+    sp = get_spotify_client()
+    device_id = sampler_tools.get_device_id(sp, None)
+    candidate = queue[current_index]
+    prepared = candidate["prepared"]
+    position_ms = sampler_tools.start_prepared_clip(
+        sp=sp,
+        device_id=device_id,
+        prepared=prepared,
+        local_seek_delay_seconds=SONGGUESSER_LOCAL_SEEK_DELAY_SECONDS,
+    )
+    game["started_at"] = time.time()
+    game["position_ms"] = position_ms
+    return songguesser_public_payload(game, candidate, position_ms)
+
+
+def get_current_songguesser_game() -> dict[str, Any] | None:
+    game_id = session.get("songguesser_game_id")
+    if not game_id:
+        return None
+    return songguesser_games.get(game_id)
+
+
+@app.route("/api/songguesser/start", methods=["POST"])
+def songguesser_start():
+    with sampler_lock:
+        if process_is_running():
+            return jsonify({"ok": False, "error": "Stop the regular sampler before starting Songguesser."}), 409
+
+        is_form_request = bool(request.form or request.files)
+        data = request.form if is_form_request else (request.get_json(silent=True) or {})
+        source_mode = str(data.get("sourceMode", "file")).strip().lower()
+        if source_mode not in {"file", "playlist"}:
+            return jsonify({"ok": False, "error": "Invalid source mode."}), 400
+
+        hints = {
+            "releaseYear": form_bool(data.get("hintReleaseYear"), False),
+            "releaseDecade": form_bool(data.get("hintReleaseDecade"), False),
+            "artist": form_bool(data.get("hintArtist"), False),
+            "album": form_bool(data.get("hintAlbum"), False),
+        }
+
+        try:
+            sp = get_spotify_client()
+        except RuntimeError:
+            return jsonify({"ok": False, "error": "Press Login with Spotify before starting Songguesser."}), 401
+        except Exception as error:
+            return jsonify({"ok": False, "error": f"Could not connect to Spotify: {error}"}), 500
+
+        configure_sampler_tools()
+        cache = sampler_tools.load_cache()
+
+        try:
+            if source_mode == "playlist":
+                link = str(data.get("playlistLink", "")).strip()
+                if not link:
+                    return jsonify({"ok": False, "error": "Enter a Spotify album or playlist link first."}), 400
+                queue = songguesser_build_candidates_from_single_link(sp, cache, link)
+            else:
+                uploaded_albums_file = save_uploaded_albums_file()
+                if uploaded_albums_file is None:
+                    return jsonify({"ok": False, "error": "Upload a .txt file containing album or playlist links."}), 400
+                queue = songguesser_build_candidates_from_file(sp, cache, uploaded_albums_file)
+        except Exception as error:
+            return jsonify({"ok": False, "error": str(error)}), 400
+
+        random.shuffle(queue)
+        game_id = secrets.token_urlsafe(16)
+        game = {
+            "id": game_id,
+            "queue": queue[:SONGGUESSER_SONG_COUNT],
+            "current_index": 0,
+            "hints": hints,
+            "created_at": time.time(),
+        }
+        songguesser_games[game_id] = game
+        session["songguesser_game_id"] = game_id
+        append_log("[starting Songguesser]")
+
+        try:
+            return jsonify(songguesser_start_current(game))
+        except Exception as error:
+            songguesser_games.pop(game_id, None)
+            session.pop("songguesser_game_id", None)
+            return jsonify({"ok": False, "error": str(error)}), 500
+
+
+@app.route("/api/songguesser/next", methods=["POST"])
+def songguesser_next():
+    game = get_current_songguesser_game()
+    if game is None:
+        return jsonify({"ok": False, "error": "No active Songguesser game."}), 404
+
+    game["current_index"] = int(game.get("current_index", 0)) + 1
+    if game["current_index"] >= len(game.get("queue") or []):
+        songguesser_games.pop(game.get("id"), None)
+        session.pop("songguesser_game_id", None)
+        try:
+            pause_spotify()
+        except Exception:
+            pass
+        return jsonify({"ok": True, "complete": True, "message": "Songguesser complete."})
+
+    try:
+        return jsonify(songguesser_start_current(game))
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 500
+
+
+@app.route("/api/songguesser/stop", methods=["POST"])
+def songguesser_stop():
+    game = get_current_songguesser_game()
+    if game is not None:
+        songguesser_games.pop(game.get("id"), None)
+    session.pop("songguesser_game_id", None)
+    pause_spotify()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/start", methods=["POST"])
@@ -786,6 +1170,11 @@ def start_sampler():
 @app.route("/api/stop", methods=["POST"])
 def stop_sampler():
     global sampler_process
+
+    game = get_current_songguesser_game()
+    if game is not None:
+        songguesser_games.pop(game.get("id"), None)
+    session.pop("songguesser_game_id", None)
 
     with sampler_lock:
         was_running = process_is_running()
