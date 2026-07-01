@@ -7,6 +7,7 @@ import io
 import json
 import os
 import random
+import re
 import secrets
 import signal
 import subprocess
@@ -14,6 +15,7 @@ import sys
 import time
 import threading
 from collections import deque
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -736,6 +738,116 @@ def songguesser_candidate_from_playlist_item(playlist_bundle: dict[str, Any], it
 
 
 
+
+def normalize_songguesser_grid_text(value: Any) -> str:
+    text = str(value or "").lower()
+    text = re.sub(r"\([^)]*\b(deluxe|remaster|remastered|live|remix|remixed|expanded|anniversary|bonus|demo|mono|stereo|edition)\b[^)]*\)", " ", text)
+    text = re.sub(r"\[[^\]]*\b(deluxe|remaster|remastered|live|remix|remixed|expanded|anniversary|bonus|demo|mono|stereo|edition)\b[^\]]*\]", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_songguesser_grid_line(line: str) -> dict[str, str] | None:
+    text = str(line or "").strip()
+    if not text or text.startswith("#") or " - " not in text:
+        return None
+
+    match = re.match(r"^(?P<artist>.+?)\s+-\s+(?P<album>.+?)\s*\((?P<date>[^()]*)\)\s*$", text)
+    if not match:
+        return None
+
+    artist = match.group("artist").strip()
+    album = match.group("album").strip()
+    raw_date = match.group("date").strip()
+    year_match = re.search(r"\b(18|19|20)\d{2}\b", raw_date)
+    year = year_match.group(0) if year_match else ""
+
+    if not artist or not album or not year:
+        return None
+
+    return {
+        "artist": artist,
+        "album": album,
+        "releaseYear": year,
+        "releaseDecade": songguesser_release_decade_from_year(year),
+    }
+
+
+def load_songguesser_grid_entries() -> list[dict[str, str]]:
+    if not GRID_FILE.exists():
+        return []
+
+    entries: list[dict[str, str]] = []
+    try:
+        for line in GRID_FILE.read_text(encoding="utf-8").splitlines():
+            entry = parse_songguesser_grid_line(line)
+            if entry:
+                entries.append(entry)
+    except Exception as error:
+        append_log(f"[songguesser warning: could not read grid.txt for hints: {error}]")
+
+    return entries
+
+
+def songguesser_grid_match_score(answer: dict[str, Any], entry: dict[str, str]) -> float:
+    answer_album = normalize_songguesser_grid_text(answer.get("album"))
+    answer_artist = normalize_songguesser_grid_text(answer.get("artist"))
+    entry_album = normalize_songguesser_grid_text(entry.get("album"))
+    entry_artist = normalize_songguesser_grid_text(entry.get("artist"))
+
+    if not answer_album or not entry_album:
+        return 0.0
+
+    album_ratio = SequenceMatcher(None, answer_album, entry_album).ratio()
+    artist_ratio = SequenceMatcher(None, answer_artist, entry_artist).ratio() if answer_artist and entry_artist else 0.0
+
+    # Exact/near-exact album title should be enough; matching artist improves confidence.
+    score = album_ratio * 0.78 + artist_ratio * 0.22
+
+    if answer_album == entry_album:
+        score += 0.15
+    elif answer_album in entry_album or entry_album in answer_album:
+        score += 0.10
+
+    if answer_artist and entry_artist and (answer_artist in entry_artist or entry_artist in answer_artist):
+        score += 0.08
+
+    return min(score, 1.0)
+
+
+def songguesser_grid_lookup(answer: dict[str, Any]) -> dict[str, str] | None:
+    entries = load_songguesser_grid_entries()
+    if not entries:
+        return None
+
+    best_entry = None
+    best_score = 0.0
+
+    for entry in entries:
+        score = songguesser_grid_match_score(answer, entry)
+        if score > best_score:
+            best_score = score
+            best_entry = entry
+
+    # "Remotely close" but still guarded enough to avoid random false positives.
+    if best_entry and best_score >= 0.68:
+        return best_entry
+
+    return None
+
+
+def apply_songguesser_grid_metadata(answer: dict[str, Any]) -> bool:
+    match = songguesser_grid_lookup(answer)
+    if not match:
+        return False
+
+    answer["album"] = match.get("album") or answer.get("album")
+    answer["releaseYear"] = match.get("releaseYear") or answer.get("releaseYear") or ""
+    answer["releaseDecade"] = match.get("releaseDecade") or answer.get("releaseDecade") or ""
+    return True
+
+
+
 def songguesser_answer_has_unknown_album(answer: dict[str, Any]) -> bool:
     album = str(answer.get("album") or "").strip().lower()
     return not album or album in {"unknown album", "none", "null"}
@@ -828,10 +940,22 @@ def songguesser_search_track_metadata(sp: Any, answer: dict[str, Any]) -> dict[s
     return None
 
 
-def songguesser_enrich_queue_answers(sp: Any, queue: list[dict[str, Any]], hints_enabled: dict[str, Any]) -> None:
+def songguesser_enrich_queue_answers(
+    sp: Any,
+    queue: list[dict[str, Any]],
+    hints_enabled: dict[str, Any],
+    prefer_grid: bool = False,
+) -> None:
     for candidate in queue:
         answer = candidate.get("answer")
         if not isinstance(answer, dict):
+            continue
+
+        grid_matched = False
+        if prefer_grid and any(hints_enabled.get(key) for key in ("releaseYear", "releaseDecade")):
+            grid_matched = apply_songguesser_grid_metadata(answer)
+
+        if grid_matched:
             continue
 
         if not songguesser_should_lookup_answer(answer, hints_enabled):
@@ -859,6 +983,7 @@ def songguesser_summary_payload(game: dict[str, Any]) -> list[dict[str, Any]]:
                 "song": answer.get("song") or "Unknown song",
                 "album": answer.get("album") or "Unknown album",
                 "coverUrl": answer.get("coverUrl"),
+                "correctCount": candidate.get("correctCount", 0),
             }
         )
 
@@ -1117,7 +1242,7 @@ def songguesser_start():
         except Exception as error:
             return jsonify({"ok": False, "error": str(error)}), 400
 
-        songguesser_enrich_queue_answers(sp, queue, hints)
+        songguesser_enrich_queue_answers(sp, queue, hints, prefer_grid=(source_mode == "file"))
 
         random.shuffle(queue)
         game_id = secrets.token_urlsafe(16)
