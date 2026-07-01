@@ -18,6 +18,7 @@ from spotipy.oauth2 import SpotifyOAuth
 ALBUMS_FILE = "albums.txt"
 CACHE_FILE = "album_cache.json"
 STATE_FILE = "sampler_state.json"
+ACTIVE_DEVICE_ID_OVERRIDE: str | None = None
 
 SCOPE = (
     "user-read-playback-state "
@@ -977,7 +978,7 @@ def choose_random_playlist_item(playlist_items: list[dict], clip_seconds: int) -
         track = item["track"]
         duration_ms = item.get("duration_ms")
         local_file = item.get("is_local", False)
-        blind_public_playlist = bool(item.get("blind_public_playlist"))
+        blind_public_playlist = bool(chosen_item.get("blind_public_playlist"))
 
         if blind_public_playlist:
             playable_items.append(item)
@@ -1528,6 +1529,86 @@ def prepare_clip(
     )
 
 
+
+def spotify_playback_error_is_stale_device(error: Exception) -> bool:
+    """
+    Spotify Connect device IDs are session-like. The desktop app can still be
+    open while the Web API rejects an older device_id with 404 Not found /
+    Device not found.
+    """
+
+    status = getattr(error, "http_status", None)
+    text = str(error).lower()
+
+    if status == 404:
+        return True
+
+    return (
+        "me/player/play" in text
+        and "404" in text
+        and ("not found" in text or "device not found" in text)
+    )
+
+
+def start_playback_with_device_retry(
+    sp: spotipy.Spotify,
+    device_id: str | None,
+    playback_kwargs: dict,
+) -> str | None:
+    """
+    Starts playback and refreshes the Spotify Connect device if Spotify rejects
+    the cached device_id.
+
+    The first attempt uses the known device ID. If Spotify returns 404/Device
+    not found, it re-queries available devices and retries. If Spotify still
+    rejects the explicit ID, it makes one final attempt without a device_id so
+    Spotify can use the currently active device.
+    """
+
+    attempted_device_ids: set[str | None] = set()
+    candidate_device_ids: list[str | None] = [device_id]
+    last_error: Exception | None = None
+
+    while candidate_device_ids:
+        current_device_id = candidate_device_ids.pop(0)
+
+        if current_device_id in attempted_device_ids:
+            continue
+
+        attempted_device_ids.add(current_device_id)
+
+        try:
+            sp.start_playback(device_id=current_device_id, **playback_kwargs)
+            return current_device_id
+        except Exception as error:
+            if not spotify_playback_error_is_stale_device(error):
+                raise
+
+            last_error = error
+            print(
+                "WARNING: Spotify rejected the current playback device "
+                f"({current_device_id or 'active device'}) as unavailable. "
+                "Refreshing Spotify Connect devices and retrying."
+            )
+
+            try:
+                refreshed_device_id = get_device_id(sp, None)
+                if refreshed_device_id not in attempted_device_ids:
+                    candidate_device_ids.append(refreshed_device_id)
+            except Exception as refresh_error:
+                print(f"WARNING: Could not refresh Spotify device list: {refresh_error}")
+
+            # Final fallback: let Spotify target the active player, if one exists.
+            if None not in attempted_device_ids:
+                candidate_device_ids.append(None)
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError("Spotify playback failed before any playback attempt was made.")
+
+
+
 def start_prepared_clip(
     sp: spotipy.Spotify,
     device_id: str,
@@ -1537,22 +1618,32 @@ def start_prepared_clip(
     """
     Starts an already prepared clip immediately.
 
-    Normal Spotify tracks/playlists start directly at the computed position.
-    Local-file playlist items are selected by playlist position, then seeked
-    after the Spotify client has loaded the local file.
+    If Spotify rejects the previously cached Spotify Connect device ID, this
+    refreshes the device and retries instead of letting every later clip fail
+    with Device not found.
     """
 
+    global ACTIVE_DEVICE_ID_OVERRIDE
+
     position_ms = int(prepared.get("position_ms") or 0)
+    effective_device_id = ACTIVE_DEVICE_ID_OVERRIDE or device_id
 
     save_sampler_state(prepared, position_ms)
 
     if prepared["kind"] == "track_uri":
         track = prepared["track"]
-        sp.start_playback(
-            device_id=device_id,
-            uris=[track["uri"]],
-            position_ms=position_ms,
+        used_device_id = start_playback_with_device_retry(
+            sp=sp,
+            device_id=effective_device_id,
+            playback_kwargs={
+                "uris": [track["uri"]],
+                "position_ms": position_ms,
+            },
         )
+
+        if used_device_id:
+            ACTIVE_DEVICE_ID_OVERRIDE = used_device_id
+
         return position_ms
 
     if prepared["kind"] == "playlist_context":
@@ -1561,12 +1652,18 @@ def start_prepared_clip(
 
         start_position_ms = 0 if is_local else position_ms
 
-        sp.start_playback(
-            device_id=device_id,
-            context_uri=f"spotify:playlist:{prepared['playlist_id']}",
-            offset={"position": prepared["playlist_position"]},
-            position_ms=start_position_ms,
+        used_device_id = start_playback_with_device_retry(
+            sp=sp,
+            device_id=effective_device_id,
+            playback_kwargs={
+                "context_uri": f"spotify:playlist:{prepared['playlist_id']}",
+                "offset": {"position": prepared["playlist_position"]},
+                "position_ms": start_position_ms,
+            },
         )
+
+        if used_device_id:
+            ACTIVE_DEVICE_ID_OVERRIDE = used_device_id
 
         if prepared.get("blind_public_playlist"):
             update_prepared_from_current_playback(sp, prepared, position_ms)
@@ -1575,7 +1672,7 @@ def start_prepared_clip(
             time.sleep(local_seek_delay_seconds)
 
             try:
-                sp.seek_track(position_ms=position_ms, device_id=device_id)
+                sp.seek_track(position_ms=position_ms, device_id=ACTIVE_DEVICE_ID_OVERRIDE or used_device_id or effective_device_id)
             except Exception as error:
                 print(
                     "WARNING: Spotify started the local file but rejected the seek request. "
