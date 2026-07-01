@@ -455,10 +455,32 @@ def get_playlist_bundle_cached(sp: spotipy.Spotify, playlist_id: str, cache: dic
 
     playlist = sp.playlist(
         playlist_id,
-        fields="id,name,owner(display_name),external_urls,images,snapshot_id",
+        fields="id,name,owner(display_name),external_urls,images,snapshot_id,tracks(total)",
     )
 
-    playlist_items = get_all_playlist_items(sp, playlist_id)
+    public_items_inaccessible = False
+
+    try:
+        playlist_items = get_all_playlist_items(sp, playlist_id)
+    except Exception as error:
+        if not spotify_error_is_forbidden(error):
+            raise
+
+        total = ((playlist.get("tracks") or {}).get("total") or 0)
+        if not total:
+            raise RuntimeError(
+                "Spotify returned 403 for this playlist's items and did not "
+                "return a playlist track count, so this public playlist cannot "
+                "be sampled through the Web API."
+            ) from error
+
+        playlist_items = make_public_playlist_placeholder_items(total)
+        public_items_inaccessible = True
+        print(
+            "WARNING: Spotify returned 403 for this public playlist's items. "
+            "Using playlist-context playback by offset and discovering track "
+            "metadata after each item starts."
+        )
 
     bundle = {
         "id": playlist_id,
@@ -469,6 +491,7 @@ def get_playlist_bundle_cached(sp: spotipy.Spotify, playlist_id: str, cache: dic
         "cover_url": best_image_url(playlist.get("images") or []),
         "snapshot_id": playlist.get("snapshot_id"),
         "items": playlist_items,
+        "public_items_inaccessible": public_items_inaccessible,
     }
 
     cache[cache_key] = bundle
@@ -747,6 +770,102 @@ def make_placeholder_local_track(playlist_position: int) -> dict:
     }
 
 
+
+def make_public_playlist_placeholder_track(playlist_position: int) -> dict:
+    """
+    Placeholder used when Spotify forbids reading another user's public playlist
+    items. Playback can still use playlist context + offset; track metadata is
+    discovered after playback starts via current_playback().
+    """
+
+    return {
+        "id": None,
+        "uri": None,
+        "name": f"Public playlist item at position {playlist_position + 1}",
+        "duration_ms": None,
+        "type": "track",
+        "is_local": False,
+        "artists": [{"name": "Unknown artist"}],
+        "album": {
+            "name": "Unknown album",
+            "release_date": None,
+            "release_date_precision": None,
+            "images": [],
+            "cover_url": None,
+        },
+    }
+
+
+def make_public_playlist_placeholder_items(total: int) -> list[dict]:
+    total = max(0, int(total or 0))
+    return [
+        {
+            "track": make_public_playlist_placeholder_track(position),
+            "playlist_position": position,
+            "is_local": False,
+            "duration_ms": None,
+            "blind_public_playlist": True,
+        }
+        for position in range(total)
+    ]
+
+
+def spotify_error_is_forbidden(error: Exception) -> bool:
+    status = getattr(error, "http_status", None)
+    if status == 403:
+        return True
+
+    text = str(error).lower()
+    return "403" in text and "forbidden" in text
+
+
+def update_prepared_from_current_playback(
+    sp: spotipy.Spotify,
+    prepared: dict,
+    position_ms: int,
+) -> None:
+    """
+    For public playlists whose items cannot be fetched, discover the actual
+    non-local track after playback starts. This is intentionally used only for
+    blind public-playlist fallback items.
+    """
+
+    if not prepared.get("blind_public_playlist"):
+        return
+
+    for _attempt in range(8):
+        time.sleep(0.25)
+
+        try:
+            playback = sp.current_playback()
+        except Exception:
+            continue
+
+        if not isinstance(playback, dict):
+            continue
+
+        item = playback.get("item")
+        if not isinstance(item, dict) or item.get("type") != "track":
+            continue
+
+        track = simplify_track(item)
+        prepared["track"] = track
+        prepared["track_text"] = f"{format_track_name(track)} - {format_track_artist(track)}"
+        prepared["is_local"] = False
+
+        album = track.get("album") if isinstance(track.get("album"), dict) else {}
+        if album.get("cover_url") or album.get("images"):
+            prepared["cover_url"] = album.get("cover_url") or best_image_url(album.get("images"))
+        if album.get("name"):
+            prepared["album_name"] = album.get("name")
+        if album.get("release_date"):
+            prepared["release_date"] = album.get("release_date")
+
+        save_sampler_state(prepared, position_ms)
+        return
+
+
+
 def get_playlist_page(sp: spotipy.Spotify, playlist_id: str, limit: int, offset: int) -> dict:
     """
     Do not use a restrictive fields= filter here.
@@ -858,6 +977,11 @@ def choose_random_playlist_item(playlist_items: list[dict], clip_seconds: int) -
         track = item["track"]
         duration_ms = item.get("duration_ms")
         local_file = item.get("is_local", False)
+        blind_public_playlist = bool(item.get("blind_public_playlist"))
+
+        if blind_public_playlist:
+            playable_items.append(item)
+            continue
 
         if not track.get("uri") and not local_file:
             continue
@@ -1343,7 +1467,11 @@ def prepare_playlist_clip(
     owner_name = playlist_bundle.get("owner_name", "Unknown owner")
     track_artist = format_track_artist(track)
 
-    if is_local:
+    blind_public_playlist = bool(item.get("blind_public_playlist"))
+
+    if blind_public_playlist:
+        track_text = f"Public playlist position {playlist_position + 1}"
+    elif is_local:
         track_text = f"{format_track_name(track)} - {track_artist} [local file]"
     else:
         track_text = f"{format_track_name(track)} - {track_artist}"
@@ -1360,6 +1488,7 @@ def prepare_playlist_clip(
         "cover_url": playlist_bundle.get("cover_url"),
         "album_name": playlist_bundle.get("name"),
         "is_local": is_local,
+        "blind_public_playlist": blind_public_playlist,
     }
 
 
@@ -1439,6 +1568,9 @@ def start_prepared_clip(
             position_ms=start_position_ms,
         )
 
+        if prepared.get("blind_public_playlist"):
+            update_prepared_from_current_playback(sp, prepared, position_ms)
+
         if is_local and position_ms > 0:
             time.sleep(local_seek_delay_seconds)
 
@@ -1506,6 +1638,9 @@ def playlist_item_is_playable(item: dict, required_clip_seconds: int) -> bool:
     duration_ms = item.get("duration_ms")
     local_file = bool(item.get("is_local", False))
 
+    if item.get("blind_public_playlist"):
+        return True
+
     if not track.get("uri") and not local_file:
         return False
 
@@ -1516,6 +1651,9 @@ def playlist_item_is_playable(item: dict, required_clip_seconds: int) -> bool:
 
 
 def playlist_item_dedupe_key(item: dict) -> str:
+    if item.get("blind_public_playlist"):
+        return f"public_playlist_position::{item.get('playlist_position')}"
+
     track = item.get("track") or {}
     uri = track.get("uri")
 
