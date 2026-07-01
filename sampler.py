@@ -978,7 +978,7 @@ def choose_random_playlist_item(playlist_items: list[dict], clip_seconds: int) -
         track = item["track"]
         duration_ms = item.get("duration_ms")
         local_file = item.get("is_local", False)
-        blind_public_playlist = bool(chosen_item.get("blind_public_playlist"))
+        blind_public_playlist = bool(item.get("blind_public_playlist"))
 
         if blind_public_playlist:
             playable_items.append(item)
@@ -1468,7 +1468,7 @@ def prepare_playlist_clip(
     owner_name = playlist_bundle.get("owner_name", "Unknown owner")
     track_artist = format_track_artist(track)
 
-    blind_public_playlist = bool(item.get("blind_public_playlist"))
+    blind_public_playlist = bool(chosen_item.get("blind_public_playlist"))
 
     if blind_public_playlist:
         track_text = f"Public playlist position {playlist_position + 1}"
@@ -1815,8 +1815,11 @@ def prepare_playlist_item_clip(
     playlist_name = playlist_bundle.get("name", "Unknown playlist")
     owner_name = playlist_bundle.get("owner_name", "Unknown owner")
     track_artist = format_track_artist(track)
+    blind_public_playlist = bool(item.get("blind_public_playlist"))
 
-    if is_local:
+    if blind_public_playlist:
+        track_text = f"Public playlist position {playlist_position + 1}"
+    elif is_local:
         track_text = f"{format_track_name(track)} - {track_artist} [local file]"
     else:
         track_text = f"{format_track_name(track)} - {track_artist}"
@@ -1833,6 +1836,7 @@ def prepare_playlist_item_clip(
         "cover_url": playlist_bundle.get("cover_url"),
         "album_name": playlist_bundle.get("name"),
         "is_local": is_local,
+        "blind_public_playlist": blind_public_playlist,
     }
 
 
