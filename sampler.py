@@ -8,7 +8,8 @@ import random
 import re
 import time
 from pathlib import Path
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urlencode
+from urllib.request import Request, urlopen
 
 import spotipy
 from dotenv import load_dotenv
@@ -18,6 +19,7 @@ from spotipy.oauth2 import SpotifyOAuth
 ALBUMS_FILE = "albums.txt"
 CACHE_FILE = "album_cache.json"
 STATE_FILE = "sampler_state.json"
+CONTROL_FILE = "sampler_control.json"
 ACTIVE_DEVICE_ID_OVERRIDE: str | None = None
 
 SCOPE = (
@@ -499,6 +501,121 @@ def get_playlist_bundle_cached(sp: spotipy.Spotify, playlist_id: str, cache: dic
     save_cache(cache)
 
     return bundle
+
+
+def get_lastfm_api_key() -> str:
+    return (
+        os.getenv("LASTFM_API_KEY")
+        or os.getenv("TOPSTER_LASTFM_API_KEY")
+        or "7c87436dbff96020ebb6e3a75cb0f396"
+    ).strip()
+
+
+def is_useful_lastfm_image(url: str | None) -> bool:
+    if not url:
+        return False
+
+    lowered = url.lower()
+    return "2a96cbd8b46e442fc41c2b86b821562f" not in lowered
+
+
+def best_lastfm_image_url(images: list | None) -> str | None:
+    if not images:
+        return None
+
+    for size_name in ("mega", "extralarge", "large", "medium", "small"):
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            if image.get("size") != size_name:
+                continue
+            url = image.get("#text") or image.get("url")
+            if is_useful_lastfm_image(url):
+                return url
+
+    for image in reversed(images):
+        if not isinstance(image, dict):
+            continue
+        url = image.get("#text") or image.get("url")
+        if is_useful_lastfm_image(url):
+            return url
+
+    return None
+
+
+def lastfm_get_json(params: dict) -> dict | None:
+    api_key = get_lastfm_api_key()
+    if not api_key:
+        return None
+
+    query = dict(params)
+    query["api_key"] = api_key
+    query["format"] = "json"
+    query["autocorrect"] = "1"
+
+    url = "https://ws.audioscrobbler.com/2.0/?" + urlencode(query)
+    request = Request(url, headers={"User-Agent": "navincitron-sampler/1.0"})
+
+    try:
+        with urlopen(request, timeout=6) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception as error:
+        print(f"WARNING: Last.fm cover lookup failed: {error}")
+        return None
+
+
+def lookup_lastfm_local_cover_url(track: dict, cache: dict | None = None) -> str | None:
+    artist = format_track_artist(track)
+    title = format_track_name(track)
+    album = track.get("album") if isinstance(track.get("album"), dict) else {}
+    album_name = str(album.get("name") or "").strip()
+
+    if not artist or artist == "Unknown artist" or not title or title == "Unknown track":
+        return None
+
+    cache_key = f"lastfm_cover::{artist.lower()}::{title.lower()}::{album_name.lower()}"
+    if isinstance(cache, dict) and cache_key in cache:
+        return cache.get(cache_key) or None
+
+    cover_url = None
+
+    if album_name and album_name.lower() not in {"unknown album", "none", "null"}:
+        data = lastfm_get_json({"method": "album.getinfo", "artist": artist, "album": album_name})
+        if isinstance(data, dict):
+            cover_url = best_lastfm_image_url((data.get("album") or {}).get("image"))
+
+    if not cover_url:
+        data = lastfm_get_json({"method": "track.getInfo", "artist": artist, "track": title})
+        if isinstance(data, dict):
+            track_data = data.get("track") or {}
+            album_data = track_data.get("album") or {}
+            cover_url = best_lastfm_image_url(album_data.get("image"))
+
+    if isinstance(cache, dict):
+        cache[cache_key] = cover_url or ""
+        try:
+            save_cache(cache)
+        except Exception:
+            pass
+
+    return cover_url
+
+
+def apply_lastfm_local_cover(track: dict, cache: dict | None = None) -> str | None:
+    cover_url = lookup_lastfm_local_cover_url(track, cache)
+    if not cover_url:
+        return None
+
+    album = track.get("album")
+    if not isinstance(album, dict):
+        album = {}
+        track["album"] = album
+
+    album["cover_url"] = cover_url
+    if not album.get("images"):
+        album["images"] = [{"url": cover_url, "width": 300, "height": 300}]
+
+    return cover_url
 
 
 def prepared_cover_url(prepared: dict) -> str | None:
@@ -1470,6 +1587,10 @@ def prepare_playlist_clip(
 
     blind_public_playlist = bool(chosen_item.get("blind_public_playlist"))
 
+    local_lastfm_cover_url = None
+    if is_local and not blind_public_playlist:
+        local_lastfm_cover_url = apply_lastfm_local_cover(track, cache)
+
     if blind_public_playlist:
         track_text = f"Public playlist position {playlist_position + 1}"
     elif is_local:
@@ -1486,7 +1607,7 @@ def prepare_playlist_clip(
         "track": track,
         "position_ms": position_ms,
         "clip_seconds": clip_seconds,
-        "cover_url": playlist_bundle.get("cover_url"),
+        "cover_url": local_lastfm_cover_url or playlist_bundle.get("cover_url"),
         "album_name": playlist_bundle.get("name"),
         "is_local": is_local,
         "blind_public_playlist": blind_public_playlist,
@@ -1685,15 +1806,72 @@ def start_prepared_clip(
     raise RuntimeError(f"Unknown prepared clip kind: {prepared.get('kind')!r}")
 
 
-def wait_for_clip_or_stop(clip_seconds: int) -> None:
+
+def read_sampler_control(control_file: str | None) -> dict:
+    if not control_file:
+        return {}
+
+    path = Path(control_file)
+    if not path.exists():
+        return {}
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def wait_for_clip_or_stop(clip_seconds: int, control_file: str | None = None) -> str:
     """
-    Keeps timing simple. The previous clip is not paused; the next call to
-    start_playback() interrupts it.
+    Waits for the current sample duration.
+
+    When controlled by the Flask page, Pause keeps Spotify paused and prevents
+    this timer from counting down. Next and Previous return immediately so the
+    playback loop can skip/replay without killing sampler.py.
     """
 
-    time.sleep(clip_seconds)
+    if clip_seconds <= 0:
+        return "complete"
 
+    if not control_file:
+        time.sleep(clip_seconds)
+        return "complete"
 
+    remaining_seconds = float(clip_seconds)
+    last_tick = time.monotonic()
+    initial_control = read_sampler_control(control_file)
+    last_seq = initial_control.get("seq")
+    paused = bool(initial_control.get("paused"))
+
+    while remaining_seconds > 0:
+        time.sleep(min(0.25, max(0.05, remaining_seconds)))
+        now = time.monotonic()
+        elapsed = now - last_tick
+        last_tick = now
+
+        control = read_sampler_control(control_file)
+        paused = bool(control.get("paused", paused))
+        seq = control.get("seq")
+        command = str(control.get("command") or "").strip().lower()
+
+        if seq != last_seq:
+            last_seq = seq
+
+            if command == "pause":
+                paused = True
+                print("[sampler paused]")
+            elif command in {"play", "resume"}:
+                paused = False
+                print("[sampler resumed]")
+            elif command in {"next", "previous"}:
+                print(f"[sampler control: {command}]")
+                return command
+
+        if not paused:
+            remaining_seconds -= elapsed
+
+    return "complete"
 
 
 def choose_effective_clip_seconds(args: argparse.Namespace) -> int:
@@ -1796,6 +1974,7 @@ def prepare_playlist_item_clip(
     clip_seconds: int,
     random_start: bool,
     assumed_duration_seconds: int,
+    cache: dict | None = None,
 ) -> dict:
     track = item["track"]
     playlist_position = item["playlist_position"]
@@ -1817,6 +1996,10 @@ def prepare_playlist_item_clip(
     track_artist = format_track_artist(track)
     blind_public_playlist = bool(item.get("blind_public_playlist"))
 
+    local_lastfm_cover_url = None
+    if is_local and not blind_public_playlist:
+        local_lastfm_cover_url = apply_lastfm_local_cover(track, cache)
+
     if blind_public_playlist:
         track_text = f"Public playlist position {playlist_position + 1}"
     elif is_local:
@@ -1833,7 +2016,7 @@ def prepare_playlist_item_clip(
         "track": track,
         "position_ms": position_ms,
         "clip_seconds": clip_seconds,
-        "cover_url": playlist_bundle.get("cover_url"),
+        "cover_url": local_lastfm_cover_url or playlist_bundle.get("cover_url"),
         "album_name": playlist_bundle.get("name"),
         "is_local": is_local,
         "blind_public_playlist": blind_public_playlist,
@@ -1921,8 +2104,11 @@ def play_prepared_items_no_repeat(
     completion_label: str,
 ) -> None:
     stopped_by_user = False
+    index = 0
 
-    for index, prepared in enumerate(prepared_items, start=1):
+    while index < len(prepared_items):
+        prepared = prepared_items[index]
+
         try:
             position_ms = start_prepared_clip(
                 sp=sp,
@@ -1934,16 +2120,24 @@ def play_prepared_items_no_repeat(
             position_seconds = position_ms // 1000
 
             print(
-                f"[{index}/{len(prepared_items)}] "
+                f"[{index + 1}/{len(prepared_items)}] "
                 f"{prepared['source_text']} | "
                 f"Track: {prepared['track_text']} | "
                 f"Start: {position_seconds}s"
             )
 
-            wait_for_clip_or_stop(int(prepared.get("clip_seconds") or args.clip_seconds))
+            control_result = wait_for_clip_or_stop(
+                int(prepared.get("clip_seconds") or args.clip_seconds),
+                args.control_file,
+            )
 
-            if args.delay_seconds > 0:
+            if args.delay_seconds > 0 and control_result == "complete":
                 time.sleep(args.delay_seconds)
+
+            if control_result == "previous":
+                index = max(0, index - 1)
+            else:
+                index += 1
 
         except KeyboardInterrupt:
             stopped_by_user = True
@@ -1957,7 +2151,8 @@ def play_prepared_items_no_repeat(
             break
 
         except Exception as error:
-            print(f"[{index}/{len(prepared_items)}] ERROR: {error}")
+            print(f"[{index + 1}/{len(prepared_items)}] ERROR: {error}")
+            index += 1
 
             if args.delay_seconds > 0:
                 time.sleep(args.delay_seconds)
@@ -1968,6 +2163,7 @@ def play_prepared_items_no_repeat(
             sp.pause_playback(device_id=device_id)
         except Exception:
             pass
+
 
 
 def run_single_album_mode(
@@ -2090,6 +2286,7 @@ def run_single_playlist_mode(
             clip_seconds=choose_effective_clip_seconds(args),
             random_start=args.random_start,
             assumed_duration_seconds=args.assumed_duration_seconds,
+            cache=cache,
         )
         for item in playable_items
     ]
@@ -2265,6 +2462,16 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--control-file",
+        type=str,
+        default=CONTROL_FILE,
+        help=(
+            "Path to sampler_control.json written by the Flask backend for "
+            "pause/play/previous/next commands."
+        ),
+    )
+
+    parser.add_argument(
         "--local-seek-delay-seconds",
         type=float,
         default=0.0,
@@ -2362,20 +2569,50 @@ def main() -> None:
         )
 
     with ThreadPoolExecutor(max_workers=1) as executor:
-        prepared_future: Future | None = (
-            submit_prepare(executor, lines[0], choose_effective_clip_seconds(args))
-            if lines
-            else None
-        )
+        prepared_cache: dict[int, dict] = {}
+        future_cache: dict[int, Future] = {}
 
-        for index, line in enumerate(lines, start=1):
-            next_future: Future | None = None
+        def submit_prepare(executor: ThreadPoolExecutor, line: str, clip_seconds: int) -> Future:
+            return executor.submit(
+                prepare_clip,
+                sp,
+                line,
+                cache,
+                clip_seconds,
+                args.random_start,
+                args.debug_playlist,
+                args.debug_playlist_raw,
+                args.assumed_duration_seconds,
+            )
+
+        def schedule_prepare(line_index: int) -> None:
+            if line_index < 0 or line_index >= len(lines):
+                return
+            if line_index in prepared_cache or line_index in future_cache:
+                return
+            future_cache[line_index] = submit_prepare(
+                executor,
+                lines[line_index],
+                choose_effective_clip_seconds(args),
+            )
+
+        def get_prepared(line_index: int) -> dict:
+            if line_index in prepared_cache:
+                return prepared_cache[line_index]
+            schedule_prepare(line_index)
+            future = future_cache.pop(line_index)
+            prepared_cache[line_index] = future.result()
+            return prepared_cache[line_index]
+
+        play_index = 0
+        schedule_prepare(play_index)
+
+        while play_index < len(lines):
+            line = lines[play_index]
 
             try:
-                if prepared_future is None:
-                    break
-
-                prepared = prepared_future.result()
+                prepared = get_prepared(play_index)
+                schedule_prepare(play_index + 1)
 
                 position_ms = start_prepared_clip(
                     sp=sp,
@@ -2384,14 +2621,7 @@ def main() -> None:
                     local_seek_delay_seconds=args.local_seek_delay_seconds,
                 )
 
-                if index < len(lines):
-                    next_future = submit_prepare(
-                        executor,
-                        lines[index],
-                        choose_effective_clip_seconds(args),
-                    )
-
-                original_index = start_offset + index
+                original_index = start_offset + play_index + 1
                 position_seconds = position_ms // 1000
 
                 print(
@@ -2401,12 +2631,18 @@ def main() -> None:
                     f"Start: {position_seconds}s"
                 )
 
-                wait_for_clip_or_stop(int(prepared.get("clip_seconds") or args.clip_seconds))
+                control_result = wait_for_clip_or_stop(
+                    int(prepared.get("clip_seconds") or args.clip_seconds),
+                    args.control_file,
+                )
 
-                if args.delay_seconds > 0:
+                if args.delay_seconds > 0 and control_result == "complete":
                     time.sleep(args.delay_seconds)
 
-                prepared_future = next_future
+                if control_result == "previous":
+                    play_index = max(0, play_index - 1)
+                else:
+                    play_index += 1
 
             except KeyboardInterrupt:
                 stopped_by_user = True
@@ -2420,17 +2656,9 @@ def main() -> None:
                 break
 
             except Exception as error:
-                original_index = start_offset + index
+                original_index = start_offset + play_index + 1
                 print(f"[{original_index}/{len(all_lines)}] ERROR for '{line}': {error}")
-
-                if index < len(lines):
-                    prepared_future = submit_prepare(
-                        executor,
-                        lines[index],
-                        choose_effective_clip_seconds(args),
-                    )
-                else:
-                    prepared_future = None
+                play_index += 1
 
                 if args.delay_seconds > 0:
                     time.sleep(args.delay_seconds)

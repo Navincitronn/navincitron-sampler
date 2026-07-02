@@ -55,6 +55,7 @@ RANKED_SHEET_ID = "1JiZwXGPANDlhkobNPo0Xdw_5MrNpG1fWTbEbL-I1dcA"
 RANKED_SHEET_GID = "0"
 UPLOAD_DIR = BASE_DIR / ".sampler_uploads"
 STATE_FILE = BASE_DIR / "sampler_state.json"
+CONTROL_FILE = BASE_DIR / "sampler_control.json"
 TOPSTER_COVER_CACHE_FILE = BASE_DIR / "topster_cover_cache.json"
 TOPSTER_SETTINGS_FILE = BASE_DIR / "topster_settings.json"
 TOPSTER_SOURCE_TEXT_FILE = BASE_DIR / "topster_source_text.json"
@@ -1006,6 +1007,40 @@ def pause_spotify() -> None:
         append_log(f"[warning: could not pause Spotify playback: {error}]")
 
 
+def read_sampler_control_file() -> dict[str, Any]:
+    if not CONTROL_FILE.exists():
+        return {"seq": 0, "paused": False, "command": None}
+
+    try:
+        data = json.loads(CONTROL_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {"seq": 0, "paused": False, "command": None}
+    except Exception:
+        return {"seq": 0, "paused": False, "command": None}
+
+
+def write_sampler_control(command: str | None, paused: bool | None = None) -> dict[str, Any]:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    current = read_sampler_control_file()
+    state = {
+        "seq": int(current.get("seq") or 0) + 1,
+        "command": command,
+        "paused": bool(current.get("paused", False)) if paused is None else bool(paused),
+        "updatedAt": time.time(),
+    }
+
+    temp_path = CONTROL_FILE.with_suffix(CONTROL_FILE.suffix + ".tmp")
+    temp_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    temp_path.replace(CONTROL_FILE)
+    return state
+
+
+def reset_sampler_control() -> None:
+    state = {"seq": 0, "command": None, "paused": False, "updatedAt": time.time()}
+    temp_path = CONTROL_FILE.with_suffix(CONTROL_FILE.suffix + ".tmp")
+    temp_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    temp_path.replace(CONTROL_FILE)
+
+
 def process_is_running() -> bool:
     global sampler_process
     return sampler_process is not None and sampler_process.poll() is None
@@ -1697,6 +1732,8 @@ def start_sampler():
             str(local_seek_delay_seconds),
             "--spotify-token-cache",
             str(spotify_token_cache),
+            "--control-file",
+            str(CONTROL_FILE),
         ]
 
         if source_mode == "playlist":
@@ -1727,6 +1764,7 @@ def start_sampler():
         if random_start:
             cmd.append("--random-start")
 
+        reset_sampler_control()
         log_lines.clear()
         append_log("[starting sampler.py]")
         append_log(" ".join(cmd))
@@ -1754,6 +1792,54 @@ def start_sampler():
         return jsonify({"ok": True, "running": True})
 
 
+
+@app.route("/api/control/pause", methods=["POST"])
+def sampler_control_pause():
+    if not process_is_running():
+        return jsonify({"ok": False, "error": "sampler.py is not running."}), 409
+
+    write_sampler_control("pause", paused=True)
+    pause_spotify()
+    return jsonify({"ok": True, "running": process_is_running(), "samplerControl": read_sampler_control_file()})
+
+
+@app.route("/api/control/play", methods=["POST"])
+def sampler_control_play():
+    if not process_is_running():
+        return jsonify({"ok": False, "error": "sampler.py is not running."}), 409
+
+    write_sampler_control("resume", paused=False)
+
+    try:
+        sp = get_spotify_client()
+        sp.start_playback()
+        append_log("[Spotify playback resumed]")
+    except Exception as error:
+        append_log(f"[warning: could not resume Spotify playback directly: {error}]")
+
+    return jsonify({"ok": True, "running": process_is_running(), "samplerControl": read_sampler_control_file()})
+
+
+@app.route("/api/control/next", methods=["POST"])
+def sampler_control_next():
+    if not process_is_running():
+        return jsonify({"ok": False, "error": "sampler.py is not running."}), 409
+
+    write_sampler_control("next", paused=False)
+    append_log("[sampler control requested: next track]")
+    return jsonify({"ok": True, "running": process_is_running(), "samplerControl": read_sampler_control_file()})
+
+
+@app.route("/api/control/previous", methods=["POST"])
+def sampler_control_previous():
+    if not process_is_running():
+        return jsonify({"ok": False, "error": "sampler.py is not running."}), 409
+
+    write_sampler_control("previous", paused=False)
+    append_log("[sampler control requested: previous track]")
+    return jsonify({"ok": True, "running": process_is_running(), "samplerControl": read_sampler_control_file()})
+
+
 @app.route("/api/stop", methods=["POST"])
 def stop_sampler():
     global sampler_process
@@ -1777,6 +1863,7 @@ def stop_sampler():
             except Exception as error:
                 append_log(f"[warning: could not terminate sampler.py cleanly: {error}]")
 
+        write_sampler_control("stop", paused=False)
         pause_spotify()
 
         return jsonify({"ok": True, "running": process_is_running(), "wasRunning": was_running})
@@ -1841,6 +1928,7 @@ def status():
             "lastCommand": last_command,
             "log": list(log_lines),
             "coverArt": get_current_cover_art(),
+            "samplerControl": read_sampler_control_file(),
         }
     )
 
