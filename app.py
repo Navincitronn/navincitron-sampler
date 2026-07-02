@@ -35,6 +35,15 @@ try:
 except ImportError:
     sampler_tools = None
 
+try:
+    import redis
+    from redis.exceptions import RedisError
+except ImportError:
+    redis = None
+
+    class RedisError(Exception):
+        pass
+
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -48,6 +57,9 @@ UPLOAD_DIR = BASE_DIR / ".sampler_uploads"
 STATE_FILE = BASE_DIR / "sampler_state.json"
 TOPSTER_COVER_CACHE_FILE = BASE_DIR / "topster_cover_cache.json"
 TOPSTER_SETTINGS_FILE = BASE_DIR / "topster_settings.json"
+TOPSTER_REDIS_KEY_PREFIX = os.getenv("TOPSTER_REDIS_KEY_PREFIX", "navincitron:topster").strip() or "navincitron:topster"
+TOPSTER_REDIS_CLIENT: Any | None = None
+TOPSTER_REDIS_CLIENT_ERROR = ""
 
 SCOPE = (
     "user-read-playback-state "
@@ -310,16 +322,159 @@ def write_json_file(path: Path, data: Any) -> None:
     temp_path.replace(path)
 
 
-def get_topster_settings(source_key: str | None = None) -> dict[str, Any]:
+def get_topster_redis_url() -> str:
+    # REDIS_URL is the standard Render Key Value / Redis-style connection env var.
+    # TOPSTER_REDIS_URL can be used instead if the sampler later gets another Redis dependency.
+    return normalize_secret_text(os.getenv("TOPSTER_REDIS_URL") or os.getenv("REDIS_URL") or "")
+
+
+def topster_redis_is_configured() -> bool:
+    return bool(get_topster_redis_url())
+
+
+def get_topster_redis_client() -> Any | None:
+    global TOPSTER_REDIS_CLIENT, TOPSTER_REDIS_CLIENT_ERROR
+
+    redis_url = get_topster_redis_url()
+    if not redis_url:
+        return None
+
+    if redis is None:
+        TOPSTER_REDIS_CLIENT_ERROR = "Redis client package is not installed. Add redis>=5.0.0 to requirements.txt and redeploy."
+        return None
+
+    if TOPSTER_REDIS_CLIENT is None:
+        try:
+            TOPSTER_REDIS_CLIENT = redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_connect_timeout=3,
+                socket_timeout=5,
+                health_check_interval=30,
+            )
+            TOPSTER_REDIS_CLIENT_ERROR = ""
+        except Exception as error:
+            TOPSTER_REDIS_CLIENT_ERROR = f"Could not create Redis client: {error}"
+            TOPSTER_REDIS_CLIENT = None
+
+    return TOPSTER_REDIS_CLIENT
+
+
+def get_topster_storage_backend_name() -> str:
+    if topster_redis_is_configured():
+        return "redis" if redis is not None else "json-fallback-redis-package-missing"
+    return "json"
+
+
+def topster_redis_key(kind: str, source_key: str | None = None) -> str:
+    source_key = normalize_topster_store_key(source_key)
+    safe_prefix = TOPSTER_REDIS_KEY_PREFIX.strip(":") or "navincitron:topster"
+    return f"{safe_prefix}:{kind}:{source_key}"
+
+
+def read_topster_redis_json(kind: str, source_key: str | None = None) -> dict[str, Any] | None:
+    client = get_topster_redis_client()
+    if client is None:
+        if topster_redis_is_configured():
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        return None
+
+    key = topster_redis_key(kind, source_key)
+    try:
+        raw = client.get(key)
+    except RedisError as error:
+        raise RuntimeError(f"Topster Redis read failed for {key}: {error}") from error
+
+    if raw is None:
+        return None
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"Topster Redis value for {key} is not valid JSON: {error}") from error
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"Topster Redis value for {key} is not a JSON object.")
+
+    return parsed
+
+
+def write_topster_redis_json(kind: str, source_key: str | None, value: dict[str, Any]) -> None:
+    client = get_topster_redis_client()
+    if client is None:
+        raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+
+    key = topster_redis_key(kind, source_key)
+    try:
+        client.set(key, json.dumps(value, ensure_ascii=False))
+    except RedisError as error:
+        raise RuntimeError(f"Topster Redis write failed for {key}: {error}") from error
+
+
+def delete_topster_redis_key(kind: str, source_key: str | None = None) -> None:
+    client = get_topster_redis_client()
+    if client is None:
+        raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+
+    key = topster_redis_key(kind, source_key)
+    try:
+        client.delete(key)
+    except RedisError as error:
+        raise RuntimeError(f"Topster Redis delete failed for {key}: {error}") from error
+
+
+def get_topster_json_settings(source_key: str | None = None) -> dict[str, Any]:
     settings_map = get_topster_source_map(TOPSTER_SETTINGS_FILE)
     settings = settings_map.get(normalize_topster_store_key(source_key), {})
     return settings if isinstance(settings, dict) else {}
 
 
-def get_topster_cover_cache(source_key: str | None = None) -> dict[str, Any]:
+def get_topster_json_cover_cache(source_key: str | None = None) -> dict[str, Any]:
     cover_cache_map = get_topster_source_map(TOPSTER_COVER_CACHE_FILE)
     cover_cache = cover_cache_map.get(normalize_topster_store_key(source_key), {})
     return cover_cache if isinstance(cover_cache, dict) else {}
+
+
+def get_topster_settings(source_key: str | None = None) -> dict[str, Any]:
+    source_key = normalize_topster_store_key(source_key)
+
+    if topster_redis_is_configured():
+        redis_settings = read_topster_redis_json("settings", source_key)
+        if isinstance(redis_settings, dict):
+            return redis_settings
+
+        # One-time migration path: if older JSON files exist in local/dev storage,
+        # seed Redis the first time this source is requested.
+        json_settings = get_topster_json_settings(source_key)
+        if json_settings:
+            json_settings = normalize_topster_settings(json_settings)
+            write_topster_redis_json("settings", source_key, json_settings)
+            return json_settings
+
+        return {}
+
+    return get_topster_json_settings(source_key)
+
+
+def get_topster_cover_cache(source_key: str | None = None) -> dict[str, Any]:
+    source_key = normalize_topster_store_key(source_key)
+
+    if topster_redis_is_configured():
+        redis_cover_cache = read_topster_redis_json("cover_cache", source_key)
+        if isinstance(redis_cover_cache, dict):
+            return redis_cover_cache
+
+        # One-time migration path: if older JSON files exist in local/dev storage,
+        # seed Redis the first time this source is requested.
+        json_cover_cache = get_topster_json_cover_cache(source_key)
+        if json_cover_cache:
+            json_cover_cache = normalize_topster_cover_cache(json_cover_cache)
+            write_topster_redis_json("cover_cache", source_key, json_cover_cache)
+            return json_cover_cache
+
+        return {}
+
+    return get_topster_json_cover_cache(source_key)
 
 
 def normalize_topster_cover_cache(value: Any) -> dict[str, Any]:
@@ -456,6 +611,10 @@ def topster_admin_status():
             "passwordConfigured": topster_admin_password_is_configured(),
             "ipAllowed": is_admin_ip_allowed(),
             "frontendOrigins": FRONTEND_ORIGINS,
+            "topsterStorageBackend": get_topster_storage_backend_name(),
+            "topsterRedisConfigured": topster_redis_is_configured(),
+            "topsterRedisPackageInstalled": redis is not None,
+            "topsterRedisClientError": TOPSTER_REDIS_CLIENT_ERROR,
         }
     )
 
@@ -463,15 +622,31 @@ def topster_admin_status():
 @app.route("/api/topster-shared-store", methods=["GET", "PUT", "DELETE"])
 def topster_shared_store():
     source_key = normalize_topster_store_key()
+    storage_backend = get_topster_storage_backend_name()
 
     if request.method == "GET":
+        try:
+            settings = get_topster_settings(source_key)
+            cover_cache = get_topster_cover_cache(source_key)
+        except RuntimeError as error:
+            return jsonify(
+                {
+                    "ok": False,
+                    "source": source_key,
+                    "writable": is_topster_admin(),
+                    "storageBackend": storage_backend,
+                    "error": str(error),
+                }
+            ), 503
+
         return jsonify(
             {
                 "ok": True,
                 "source": source_key,
                 "writable": is_topster_admin(),
-                "settings": get_topster_settings(source_key),
-                "coverCache": get_topster_cover_cache(source_key),
+                "storageBackend": storage_backend,
+                "settings": settings,
+                "coverCache": cover_cache,
             }
         )
 
@@ -480,38 +655,112 @@ def topster_shared_store():
         return admin_error
 
     if request.method == "DELETE":
-        source_map = write_topster_source_map(TOPSTER_COVER_CACHE_FILE, source_key, {})
+        try:
+            if topster_redis_is_configured():
+                write_topster_redis_json("cover_cache", source_key, {})
+                cover_cache = {}
+            else:
+                source_map = write_topster_source_map(TOPSTER_COVER_CACHE_FILE, source_key, {})
+                cover_cache = source_map.get(source_key, {})
+
+            settings = get_topster_settings(source_key)
+        except RuntimeError as error:
+            return jsonify(
+                {
+                    "ok": False,
+                    "source": source_key,
+                    "writable": True,
+                    "storageBackend": storage_backend,
+                    "error": str(error),
+                }
+            ), 503
+
         return jsonify(
             {
                 "ok": True,
                 "source": source_key,
                 "writable": True,
-                "settings": get_topster_settings(source_key),
-                "coverCache": source_map.get(source_key, {}),
+                "storageBackend": storage_backend,
+                "settings": settings,
+                "coverCache": cover_cache,
             }
         )
 
     payload = request.get_json(silent=True) or {}
 
-    settings = get_topster_settings(source_key)
-    if isinstance(payload.get("settings"), dict):
-        settings = normalize_topster_settings(payload["settings"])
-        write_topster_source_map(TOPSTER_SETTINGS_FILE, source_key, settings)
+    try:
+        settings = get_topster_settings(source_key)
+        if isinstance(payload.get("settings"), dict):
+            settings = normalize_topster_settings(payload["settings"])
+            if topster_redis_is_configured():
+                write_topster_redis_json("settings", source_key, settings)
+            else:
+                write_topster_source_map(TOPSTER_SETTINGS_FILE, source_key, settings)
 
-    cover_cache = get_topster_cover_cache(source_key)
-    if isinstance(payload.get("coverCache"), dict):
-        cover_cache = normalize_topster_cover_cache(payload["coverCache"])
-        write_topster_source_map(TOPSTER_COVER_CACHE_FILE, source_key, cover_cache)
+        cover_cache = get_topster_cover_cache(source_key)
+        if isinstance(payload.get("coverCache"), dict):
+            cover_cache = normalize_topster_cover_cache(payload["coverCache"])
+            if topster_redis_is_configured():
+                write_topster_redis_json("cover_cache", source_key, cover_cache)
+            else:
+                write_topster_source_map(TOPSTER_COVER_CACHE_FILE, source_key, cover_cache)
+    except RuntimeError as error:
+        return jsonify(
+            {
+                "ok": False,
+                "source": source_key,
+                "writable": True,
+                "storageBackend": storage_backend,
+                "error": str(error),
+            }
+        ), 503
 
     return jsonify(
         {
             "ok": True,
             "source": source_key,
             "writable": True,
+            "storageBackend": storage_backend,
             "settings": settings,
             "coverCache": cover_cache,
         }
     )
+
+
+@app.route("/api/topster-storage-status", methods=["GET"])
+def topster_storage_status():
+    source_key = normalize_topster_store_key()
+    storage_backend = get_topster_storage_backend_name()
+    status: dict[str, Any] = {
+        "ok": True,
+        "source": source_key,
+        "storageBackend": storage_backend,
+        "redisConfigured": topster_redis_is_configured(),
+        "redisPackageInstalled": redis is not None,
+        "redisClientError": TOPSTER_REDIS_CLIENT_ERROR,
+        "keys": {},
+    }
+
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is None:
+                raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+            for kind in ("settings", "cover_cache"):
+                key = topster_redis_key(kind, source_key)
+                raw = client.get(key)
+                status["keys"][kind] = {
+                    "key": key,
+                    "exists": raw is not None,
+                    "bytes": len(raw.encode("utf-8")) if isinstance(raw, str) else 0,
+                }
+            client.ping()
+        except Exception as error:
+            status["ok"] = False
+            status["error"] = str(error)
+            return jsonify(status), 503
+
+    return jsonify(status)
 
 
 def require_env_vars(*names: str) -> None:
