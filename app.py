@@ -346,9 +346,6 @@ def normalize_topster_cover_cache(value: Any) -> dict[str, Any]:
 
 
 def normalize_topster_settings(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-
     allowed_fonts = {
         "Arial", "Verdana", "Helvetica Neue", "Sans-serif", "Monospace",
         "Open Sans", "Helvetica", "Georgia", "Tahoma", "Calibri",
@@ -363,14 +360,31 @@ def normalize_topster_settings(value: Any) -> dict[str, Any]:
             return fallback
         return min(maximum, max(minimum, number))
 
+    def normalize_single_settings(raw_value: Any) -> dict[str, Any]:
+        raw = raw_value if isinstance(raw_value, dict) else {}
+        return {
+            "width": clamp_int(raw.get("width"), 1, 25, 10),
+            "height": clamp_int(raw.get("height"), 1, 10, 10),
+            "sidebarMode": raw.get("sidebarMode") if raw.get("sidebarMode") in allowed_sidebar_modes else "artist-title",
+            "roundCorners": clamp_int(raw.get("roundCorners"), 0, 24, 0),
+            "albumGap": clamp_int(raw.get("albumGap"), 0, 100, 4),
+            "font": raw.get("font") if raw.get("font") in allowed_fonts else "Arial",
+            "coverOverlay": raw.get("coverOverlay") if raw.get("coverOverlay") in allowed_cover_overlays else "none",
+        }
+
+    raw = value if isinstance(value, dict) else {}
+    has_device_profiles = isinstance(raw.get("desktop"), dict) or isinstance(raw.get("mobile"), dict)
+
+    if has_device_profiles:
+        desktop_settings = normalize_single_settings(raw.get("desktop") or raw.get("mobile") or {})
+        mobile_settings = normalize_single_settings(raw.get("mobile") or raw.get("desktop") or {})
+    else:
+        desktop_settings = normalize_single_settings(raw)
+        mobile_settings = normalize_single_settings(raw)
+
     return {
-        "width": clamp_int(value.get("width"), 1, 25, 10),
-        "height": clamp_int(value.get("height"), 1, 10, 10),
-        "sidebarMode": value.get("sidebarMode") if value.get("sidebarMode") in allowed_sidebar_modes else "artist-title",
-        "roundCorners": clamp_int(value.get("roundCorners"), 0, 24, 0),
-        "albumGap": clamp_int(value.get("albumGap"), 0, 100, 4),
-        "font": value.get("font") if value.get("font") in allowed_fonts else "Arial",
-        "coverOverlay": value.get("coverOverlay") if value.get("coverOverlay") in allowed_cover_overlays else "none",
+        "desktop": desktop_settings,
+        "mobile": mobile_settings,
     }
 
 
