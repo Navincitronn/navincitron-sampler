@@ -57,6 +57,7 @@ UPLOAD_DIR = BASE_DIR / ".sampler_uploads"
 STATE_FILE = BASE_DIR / "sampler_state.json"
 TOPSTER_COVER_CACHE_FILE = BASE_DIR / "topster_cover_cache.json"
 TOPSTER_SETTINGS_FILE = BASE_DIR / "topster_settings.json"
+TOPSTER_SOURCE_TEXT_FILE = BASE_DIR / "topster_source_text.json"
 TOPSTER_REDIS_KEY_PREFIX = os.getenv("TOPSTER_REDIS_KEY_PREFIX", "navincitron:topster").strip() or "navincitron:topster"
 TOPSTER_REDIS_CLIENT: Any | None = None
 TOPSTER_REDIS_CLIENT_ERROR = ""
@@ -96,13 +97,19 @@ TOPSTER_ADMIN_ALLOWED_IPS = {
     if item.strip()
 }
 
-TOPSTER_STORE_KEYS = {"grid", "ranked"}
+TOPSTER_STORE_KEYS = {"grid", "ranked", "draft"}
 TOPSTER_STORE_ALIASES = {
     "grid": "grid",
     "grid-file": "grid",
     "album-list": "grid",
     "album_list": "grid",
     "albums": "grid",
+    "draft": "draft",
+    "draft-file": "draft",
+    "draft_grid": "draft",
+    "draft-grid": "draft",
+    "draft_album_list": "draft",
+    "draft-album-list": "draft",
     "ranked": "ranked",
     "ranked-sheet": "ranked",
     "ranked_album_list": "ranked",
@@ -128,13 +135,16 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
         return {
             "grid": data.get("grid") if isinstance(data.get("grid"), dict) else {},
             "ranked": data.get("ranked") if isinstance(data.get("ranked"), dict) else {},
+            "draft": data.get("draft") if isinstance(data.get("draft"), dict) else {},
         }
 
     # Backward-compatible migration path: older builds stored one flat object.
-    # Seed both public stores from that flat object until each one is saved independently.
+    # Seed the existing public stores from that flat object until each one is saved independently.
+    # Draft starts empty because it is based on a host-uploaded Notepad file, not grid.txt.
     return {
         "grid": data,
         "ranked": data,
+        "draft": {},
     }
 
 
@@ -274,6 +284,16 @@ def redirect_album_list_html():
 @app.route("/ranked_album_list.html")
 def redirect_ranked_album_list_html():
     return redirect_topster_frontend_page("ranked_album_list.html")
+
+
+@app.route("/draft_grid.html")
+def redirect_draft_grid_html():
+    return redirect_topster_frontend_page("draft_grid.html")
+
+
+@app.route("/draft_album_list.html")
+def redirect_draft_album_list_html():
+    return redirect_topster_frontend_page("draft_album_list.html")
 
 
 def is_allowed_frontend_url(url: str) -> bool:
@@ -435,6 +455,12 @@ def get_topster_json_cover_cache(source_key: str | None = None) -> dict[str, Any
     return cover_cache if isinstance(cover_cache, dict) else {}
 
 
+def get_topster_json_source_text(source_key: str | None = None) -> dict[str, Any]:
+    source_text_map = get_topster_source_map(TOPSTER_SOURCE_TEXT_FILE)
+    source_text = source_text_map.get(normalize_topster_store_key(source_key), {})
+    return normalize_topster_source_text(source_text) if isinstance(source_text, dict) else {}
+
+
 def get_topster_settings(source_key: str | None = None) -> dict[str, Any]:
     source_key = normalize_topster_store_key(source_key)
 
@@ -475,6 +501,57 @@ def get_topster_cover_cache(source_key: str | None = None) -> dict[str, Any]:
         return {}
 
     return get_topster_json_cover_cache(source_key)
+
+
+def get_topster_source_text(source_key: str | None = None) -> dict[str, Any]:
+    source_key = normalize_topster_store_key(source_key)
+
+    if topster_redis_is_configured():
+        redis_source_text = read_topster_redis_json("source_text", source_key)
+        if isinstance(redis_source_text, dict):
+            return normalize_topster_source_text(redis_source_text)
+
+        json_source_text = get_topster_json_source_text(source_key)
+        if json_source_text:
+            write_topster_redis_json("source_text", source_key, json_source_text)
+            return json_source_text
+
+        return {}
+
+    return get_topster_json_source_text(source_key)
+
+
+def normalize_topster_source_text(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+
+    text = value.get("text")
+    if not isinstance(text, str):
+        return {}
+
+    # Keep the stored source intentionally small. A Topster draft text file should be text lines, not binary content.
+    max_chars = 3_000_000
+    if len(text) > max_chars:
+        text = text[:max_chars]
+
+    signature = value.get("signature")
+    if not isinstance(signature, str) or not signature.strip():
+        signature = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+    source_name = value.get("sourceName") or value.get("source") or "draft notepad file"
+    if not isinstance(source_name, str):
+        source_name = "draft notepad file"
+
+    updated_at = value.get("updatedAt")
+    if not isinstance(updated_at, str) or not updated_at.strip():
+        updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    return {
+        "text": text,
+        "signature": signature,
+        "sourceName": source_name[:240],
+        "updatedAt": updated_at,
+    }
 
 
 def normalize_topster_cover_cache(value: Any) -> dict[str, Any]:
@@ -628,6 +705,7 @@ def topster_shared_store():
         try:
             settings = get_topster_settings(source_key)
             cover_cache = get_topster_cover_cache(source_key)
+            source_text = get_topster_source_text(source_key)
         except RuntimeError as error:
             return jsonify(
                 {
@@ -647,6 +725,10 @@ def topster_shared_store():
                 "storageBackend": storage_backend,
                 "settings": settings,
                 "coverCache": cover_cache,
+                "sourceText": source_text.get("text", ""),
+                "sourceSignature": source_text.get("signature", ""),
+                "sourceName": source_text.get("sourceName", ""),
+                "sourceUpdatedAt": source_text.get("updatedAt", ""),
             }
         )
 
@@ -664,6 +746,7 @@ def topster_shared_store():
                 cover_cache = source_map.get(source_key, {})
 
             settings = get_topster_settings(source_key)
+            source_text = get_topster_source_text(source_key)
         except RuntimeError as error:
             return jsonify(
                 {
@@ -683,6 +766,10 @@ def topster_shared_store():
                 "storageBackend": storage_backend,
                 "settings": settings,
                 "coverCache": cover_cache,
+                "sourceText": source_text.get("text", ""),
+                "sourceSignature": source_text.get("signature", ""),
+                "sourceName": source_text.get("sourceName", ""),
+                "sourceUpdatedAt": source_text.get("updatedAt", ""),
             }
         )
 
@@ -704,6 +791,21 @@ def topster_shared_store():
                 write_topster_redis_json("cover_cache", source_key, cover_cache)
             else:
                 write_topster_source_map(TOPSTER_COVER_CACHE_FILE, source_key, cover_cache)
+
+        source_text = get_topster_source_text(source_key)
+        if isinstance(payload.get("sourceText"), str):
+            source_text = normalize_topster_source_text(
+                {
+                    "text": payload.get("sourceText", ""),
+                    "signature": payload.get("sourceSignature", ""),
+                    "sourceName": payload.get("sourceName", "draft notepad file"),
+                    "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+            )
+            if topster_redis_is_configured():
+                write_topster_redis_json("source_text", source_key, source_text)
+            else:
+                write_topster_source_map(TOPSTER_SOURCE_TEXT_FILE, source_key, source_text)
     except RuntimeError as error:
         return jsonify(
             {
@@ -723,6 +825,10 @@ def topster_shared_store():
             "storageBackend": storage_backend,
             "settings": settings,
             "coverCache": cover_cache,
+            "sourceText": source_text.get("text", ""),
+            "sourceSignature": source_text.get("signature", ""),
+            "sourceName": source_text.get("sourceName", ""),
+            "sourceUpdatedAt": source_text.get("updatedAt", ""),
         }
     )
 
@@ -746,7 +852,7 @@ def topster_storage_status():
             client = get_topster_redis_client()
             if client is None:
                 raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
-            for kind in ("settings", "cover_cache"):
+            for kind in ("settings", "cover_cache", "source_text"):
                 key = topster_redis_key(kind, source_key)
                 raw = client.get(key)
                 status["keys"][kind] = {
@@ -761,6 +867,29 @@ def topster_storage_status():
             return jsonify(status), 503
 
     return jsonify(status)
+
+
+@app.route("/api/draft-grid-text", methods=["GET"])
+def draft_grid_text():
+    source_key = "draft"
+    try:
+        source_text = get_topster_source_text(source_key)
+    except RuntimeError as error:
+        return jsonify({"ok": False, "source": source_key, "error": str(error)}), 503
+
+    text = source_text.get("text", "")
+    if not text:
+        return jsonify({"ok": False, "source": source_key, "error": "No draft Topster file has been published yet."}), 404
+
+    return jsonify(
+        {
+            "ok": True,
+            "source": source_text.get("sourceName") or "draft notepad file",
+            "signature": source_text.get("signature") or hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16],
+            "updatedAt": source_text.get("updatedAt", ""),
+            "text": text,
+        }
+    )
 
 
 def require_env_vars(*names: str) -> None:
