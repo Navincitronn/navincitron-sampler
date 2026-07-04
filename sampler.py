@@ -1587,10 +1587,6 @@ def prepare_playlist_clip(
 
     blind_public_playlist = bool(chosen_item.get("blind_public_playlist"))
 
-    local_lastfm_cover_url = None
-    if is_local and not blind_public_playlist:
-        local_lastfm_cover_url = apply_lastfm_local_cover(track, cache)
-
     if blind_public_playlist:
         track_text = f"Public playlist position {playlist_position + 1}"
     elif is_local:
@@ -1607,7 +1603,7 @@ def prepare_playlist_clip(
         "track": track,
         "position_ms": position_ms,
         "clip_seconds": clip_seconds,
-        "cover_url": local_lastfm_cover_url or playlist_bundle.get("cover_url"),
+        "cover_url": playlist_bundle.get("cover_url"),
         "album_name": playlist_bundle.get("name"),
         "is_local": is_local,
         "blind_public_playlist": blind_public_playlist,
@@ -1975,6 +1971,7 @@ def prepare_playlist_item_clip(
     random_start: bool,
     assumed_duration_seconds: int,
     cache: dict | None = None,
+    use_lastfm_local_cover: bool = False,
 ) -> dict:
     track = item["track"]
     playlist_position = item["playlist_position"]
@@ -1997,7 +1994,7 @@ def prepare_playlist_item_clip(
     blind_public_playlist = bool(item.get("blind_public_playlist"))
 
     local_lastfm_cover_url = None
-    if is_local and not blind_public_playlist:
+    if use_lastfm_local_cover and is_local and not blind_public_playlist:
         local_lastfm_cover_url = apply_lastfm_local_cover(track, cache)
 
     if blind_public_playlist:
@@ -2287,6 +2284,7 @@ def run_single_playlist_mode(
             random_start=args.random_start,
             assumed_duration_seconds=args.assumed_duration_seconds,
             cache=cache,
+            use_lastfm_local_cover=True,
         )
         for item in playable_items
     ]
