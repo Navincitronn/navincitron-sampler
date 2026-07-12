@@ -1819,6 +1819,93 @@ def current_lyrics():
     return response
 
 
+@app.route("/api/lyrics/control/<action>", methods=["POST"])
+def lyrics_playback_control(action: str):
+    action = str(action or "").strip().lower()
+    allowed_actions = {"previous", "pause", "play", "next"}
+    if action not in allowed_actions:
+        return jsonify(
+            {
+                "ok": False,
+                "authenticated": True,
+                "error": "Unsupported Spotify playback control.",
+            }
+        ), 400
+
+    try:
+        spotify_client = get_spotify_client()
+    except Exception as error:
+        response = jsonify(
+            {
+                "ok": False,
+                "authenticated": False,
+                "error": str(error),
+            }
+        )
+        response.status_code = 401
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    sampler_running = process_is_running()
+
+    try:
+        if action == "pause":
+            if sampler_running:
+                write_sampler_control("pause", paused=True)
+            spotify_client.pause_playback()
+            message = "Spotify playback paused."
+
+        elif action == "play":
+            if sampler_running:
+                write_sampler_control("resume", paused=False)
+            spotify_client.start_playback()
+            message = "Spotify playback resumed."
+
+        elif action == "next":
+            if sampler_running:
+                # Keep sampler.py's current clip timer and history synchronized
+                # with transport changes initiated from lyrics.html.
+                write_sampler_control("next", paused=False)
+                append_log("[lyrics page requested: next track]")
+                message = "Next track requested from the sampler."
+            else:
+                spotify_client.next_track()
+                message = "Skipped to the next Spotify track."
+
+        else:  # previous
+            if sampler_running:
+                write_sampler_control("previous", paused=False)
+                append_log("[lyrics page requested: previous track]")
+                message = "Previous track requested from the sampler."
+            else:
+                spotify_client.previous_track()
+                message = "Returned to the previous Spotify track."
+
+    except Exception as error:
+        response = jsonify(
+            {
+                "ok": False,
+                "authenticated": True,
+                "error": f"Could not control Spotify playback: {error}",
+            }
+        )
+        response.status_code = 502
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    response = jsonify(
+        {
+            "ok": True,
+            "authenticated": True,
+            "action": action,
+            "samplerRunning": sampler_running,
+            "message": message,
+        }
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def pause_spotify() -> None:
     try:
         sp = get_spotify_client()
