@@ -7,16 +7,18 @@ import io
 import json
 import os
 import random
+import re
 import secrets
 import signal
 import subprocess
 import sys
 import time
 import threading
+import unicodedata
 from collections import deque
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
@@ -295,6 +297,11 @@ def redirect_draft_grid_html():
 @app.route("/draft_album_list.html")
 def redirect_draft_album_list_html():
     return redirect_topster_frontend_page("draft_album_list.html")
+
+
+@app.route("/lyrics.html")
+def redirect_lyrics_html():
+    return redirect_topster_frontend_page("lyrics.html")
 
 
 def is_allowed_frontend_url(url: str) -> bool:
@@ -936,6 +943,12 @@ def get_session_token_info() -> dict[str, Any]:
 
 @app.route("/login")
 def login():
+    # Preserve the page that initiated OAuth so lyrics.html can reconnect without
+    # changing the existing shuffle.html login behavior.
+    session["spotify_oauth_next"] = safe_frontend_redirect_url(
+        request.args.get("next"),
+        "/shuffle.html",
+    )
     return redirect(make_oauth().get_authorize_url())
 
 
@@ -949,7 +962,11 @@ def callback():
     token_info = make_oauth().get_access_token(code, as_dict=True)
     session["spotify_token_info"] = token_info
 
-    return redirect(FRONTEND_ORIGIN.rstrip("/") + "/shuffle.html")
+    next_url = session.pop(
+        "spotify_oauth_next",
+        FRONTEND_ORIGIN.rstrip("/") + "/shuffle.html",
+    )
+    return redirect(safe_frontend_redirect_url(next_url, "/shuffle.html"))
 
 
 @app.route("/api/auth-status")
@@ -996,6 +1013,573 @@ def get_spotify_client():
 
     token_info = get_session_token_info()
     return spotipy.Spotify(auth=token_info["access_token"])
+
+
+# lyrics.html uses Spotify only to identify the user's current track. Genius
+# metadata and the official Genius lyrics/annotation embed are resolved here so
+# no Spotify or Genius credentials are exposed to browser JavaScript.
+GENIUS_LOOKUP_CACHE: dict[str, dict[str, Any]] = {}
+GENIUS_LOOKUP_CACHE_LOCK = threading.Lock()
+GENIUS_LOOKUP_CACHE_MAX_ITEMS = 500
+GENIUS_MATCH_TTL_SECONDS = 7 * 24 * 60 * 60
+GENIUS_MISS_TTL_SECONDS = 60 * 60
+
+
+def get_genius_access_token() -> str:
+    # A Genius Client Access Token is optional. When it is absent, the backend
+    # uses Genius's public search/song JSON endpoints and still renders Genius's
+    # official embed.js output for lyrics and annotations.
+    return normalize_secret_text(os.getenv("GENIUS_ACCESS_TOKEN") or "")
+
+
+def genius_json_request(url: str, access_token: str = "") -> dict[str, Any]:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 NavincitronLyrics/1.0",
+    }
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+
+    genius_request = Request(url, headers=headers)
+    with urlopen(genius_request, timeout=12) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("Genius returned an invalid JSON response.")
+    return payload
+
+
+def genius_search_request(query: str) -> dict[str, Any]:
+    encoded_query = quote_plus(query)
+    access_token = get_genius_access_token()
+    errors: list[str] = []
+
+    if access_token:
+        try:
+            return genius_json_request(
+                f"https://api.genius.com/search?q={encoded_query}",
+                access_token,
+            )
+        except Exception as error:
+            errors.append(f"official API: {error}")
+
+    try:
+        return genius_json_request(
+            f"https://genius.com/api/search/multi?per_page=10&q={encoded_query}"
+        )
+    except Exception as error:
+        errors.append(f"public API: {error}")
+
+    raise RuntimeError("; ".join(errors) or "Genius search failed.")
+
+
+def genius_song_request(song_id: int) -> dict[str, Any]:
+    access_token = get_genius_access_token()
+    errors: list[str] = []
+
+    if access_token:
+        try:
+            return genius_json_request(
+                f"https://api.genius.com/songs/{song_id}?text_format=plain",
+                access_token,
+            )
+        except Exception as error:
+            errors.append(f"official API: {error}")
+
+    try:
+        return genius_json_request(
+            f"https://genius.com/api/songs/{song_id}?text_format=plain"
+        )
+    except Exception as error:
+        errors.append(f"public API: {error}")
+
+    raise RuntimeError("; ".join(errors) or "Genius song lookup failed.")
+
+
+def genius_song_hits(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return []
+
+    hits: list[dict[str, Any]] = []
+
+    direct_hits = response.get("hits")
+    if isinstance(direct_hits, list):
+        hits.extend(item for item in direct_hits if isinstance(item, dict))
+
+    sections = response.get("sections")
+    if isinstance(sections, list):
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            section_type = str(section.get("type") or "").lower()
+            if section_type and section_type not in {"song", "songs", "top_hit", "top hits"}:
+                continue
+            section_hits = section.get("hits")
+            if isinstance(section_hits, list):
+                hits.extend(item for item in section_hits if isinstance(item, dict))
+
+    songs: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+
+    for hit in hits:
+        result = hit.get("result") if isinstance(hit.get("result"), dict) else hit
+        if not isinstance(result, dict):
+            continue
+        try:
+            song_id = int(result.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if song_id in seen_ids:
+            continue
+        seen_ids.add(song_id)
+        songs.append(result)
+
+    return songs
+
+
+def normalize_lyrics_match_text(value: Any) -> str:
+    text = unicodedata.normalize(
+        "NFKD",
+        str(value or "").casefold().replace("&", " and "),
+    )
+    text = "".join(character for character in text if not unicodedata.combining(character))
+    text = re.sub(r"[’']", "", text)
+    text = "".join(character if character.isalnum() else " " for character in text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def clean_lyrics_track_title(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    qualifier_words = (
+        r"remaster(?:ed|ing)?|live|radio edit|single edit|album version|"
+        r"mono|stereo|bonus track|deluxe|version|mix|edit|instrumental|karaoke"
+    )
+    text = re.sub(
+        rf"\s*[\[(][^\])]*(?:{qualifier_words})[^\])]*[\])]\s*",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        rf"\s+-\s+[^-]*(?:{qualifier_words})[^-]*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", text).strip(" -")
+
+
+def lyrics_token_overlap(left: Any, right: Any) -> float:
+    left_tokens = set(normalize_lyrics_match_text(left).split())
+    right_tokens = set(normalize_lyrics_match_text(right).split())
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / max(len(left_tokens), len(right_tokens))
+
+
+def genius_result_artist_names(song: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+
+    primary_artist = song.get("primary_artist")
+    if isinstance(primary_artist, dict) and primary_artist.get("name"):
+        names.append(str(primary_artist["name"]))
+
+    for key in ("featured_artists", "artist_names"):
+        value = song.get(key)
+        if isinstance(value, str):
+            names.append(value)
+        elif isinstance(value, list):
+            for artist in value:
+                if isinstance(artist, dict) and artist.get("name"):
+                    names.append(str(artist["name"]))
+                elif isinstance(artist, str):
+                    names.append(artist)
+
+    return list(dict.fromkeys(name.strip() for name in names if name.strip()))
+
+
+def score_genius_song_match(
+    song: dict[str, Any],
+    track_title: str,
+    track_artists: list[str],
+    album_name: str,
+) -> float:
+    candidate_title = str(song.get("title") or song.get("title_with_featured") or "")
+    requested_title = normalize_lyrics_match_text(track_title)
+    requested_clean_title = normalize_lyrics_match_text(clean_lyrics_track_title(track_title))
+    candidate_title_norm = normalize_lyrics_match_text(candidate_title)
+    candidate_clean_title = normalize_lyrics_match_text(clean_lyrics_track_title(candidate_title))
+
+    score = 0.0
+    if requested_title and candidate_title_norm == requested_title:
+        score += 72.0
+    elif requested_clean_title and candidate_clean_title == requested_clean_title:
+        score += 65.0
+    elif requested_clean_title and (
+        requested_clean_title in candidate_clean_title
+        or candidate_clean_title in requested_clean_title
+    ):
+        score += 48.0
+    else:
+        score += 45.0 * lyrics_token_overlap(requested_clean_title, candidate_clean_title)
+
+    requested_artist_text = " ".join(track_artists)
+    candidate_artists = genius_result_artist_names(song)
+    candidate_artist_text = " ".join(candidate_artists)
+    requested_artist_norm = normalize_lyrics_match_text(requested_artist_text)
+    candidate_artist_norm = normalize_lyrics_match_text(candidate_artist_text)
+
+    if requested_artist_norm and candidate_artist_norm == requested_artist_norm:
+        score += 35.0
+    elif requested_artist_norm and candidate_artist_norm and (
+        requested_artist_norm in candidate_artist_norm
+        or candidate_artist_norm in requested_artist_norm
+    ):
+        score += 28.0
+    else:
+        score += 28.0 * lyrics_token_overlap(requested_artist_text, candidate_artist_text)
+
+    candidate_album = song.get("album")
+    candidate_album_name = (
+        str(candidate_album.get("name") or "")
+        if isinstance(candidate_album, dict)
+        else ""
+    )
+    if album_name and candidate_album_name:
+        album_overlap = lyrics_token_overlap(album_name, candidate_album_name)
+        if normalize_lyrics_match_text(album_name) == normalize_lyrics_match_text(candidate_album_name):
+            score += 10.0
+        else:
+            score += 8.0 * album_overlap
+
+    return score
+
+
+def plain_text_from_genius_value(value: Any) -> str:
+    if isinstance(value, str):
+        # The API normally supplies plain text when text_format=plain. Strip tags
+        # defensively if a deployment receives an HTML fallback instead.
+        text = re.sub(r"<[^>]+>", " ", value)
+        return re.sub(r"\s+", " ", text).strip()
+
+    if isinstance(value, list):
+        parts = [plain_text_from_genius_value(item) for item in value]
+        return " ".join(part for part in parts if part).strip()
+
+    if not isinstance(value, dict):
+        return ""
+
+    for key in ("plain", "markdown", "html"):
+        if value.get(key):
+            text = plain_text_from_genius_value(value.get(key))
+            if text:
+                return text
+
+    if value.get("children"):
+        text = plain_text_from_genius_value(value.get("children"))
+        if text:
+            return text
+
+    return ""
+
+
+def genius_song_description(song: dict[str, Any]) -> str:
+    description = plain_text_from_genius_value(song.get("description"))
+    if description:
+        return description
+
+    description_annotation = song.get("description_annotation")
+    if isinstance(description_annotation, dict):
+        body = plain_text_from_genius_value(description_annotation.get("body"))
+        if body:
+            return body
+
+        annotations = description_annotation.get("annotations")
+        if isinstance(annotations, list):
+            for annotation in annotations:
+                if not isinstance(annotation, dict):
+                    continue
+                body = plain_text_from_genius_value(annotation.get("body"))
+                if body:
+                    return body
+
+    return ""
+
+
+def local_spotify_uri_metadata(uri: str) -> dict[str, str]:
+    # Local Spotify URIs use spotify:local:artist:album:title:duration. Artist,
+    # album, and title may be percent encoded.
+    parts = str(uri or "").split(":")
+    if len(parts) < 6 or parts[0:2] != ["spotify", "local"]:
+        return {}
+
+    return {
+        "artist": unquote(parts[2]).replace("+", " ").strip(),
+        "album": unquote(parts[3]).replace("+", " ").strip(),
+        "title": unquote(parts[4]).replace("+", " ").strip(),
+    }
+
+
+def spotify_current_track_snapshot(playback: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(playback, dict):
+        return None
+
+    item = playback.get("item")
+    if not isinstance(item, dict) or item.get("type") not in {None, "track"}:
+        return None
+
+    uri = str(item.get("uri") or "")
+    local_metadata = local_spotify_uri_metadata(uri)
+
+    title = str(item.get("name") or local_metadata.get("title") or "").strip()
+    artists = [
+        str(artist.get("name") or "").strip()
+        for artist in (item.get("artists") or [])
+        if isinstance(artist, dict) and str(artist.get("name") or "").strip()
+    ]
+    if not artists and local_metadata.get("artist"):
+        artists = [local_metadata["artist"]]
+
+    album = item.get("album") if isinstance(item.get("album"), dict) else {}
+    album_name = str(album.get("name") or local_metadata.get("album") or "").strip()
+    album_images = album.get("images") if isinstance(album.get("images"), list) else []
+    best_image = best_spotify_image(album_images)
+    cover_url = str((best_image or {}).get("url") or "").strip()
+
+    if not title:
+        return None
+
+    is_local = bool(item.get("is_local")) or uri.startswith("spotify:local:")
+    external_urls = item.get("external_urls") if isinstance(item.get("external_urls"), dict) else {}
+    spotify_url = "" if is_local else str(external_urls.get("spotify") or "").strip()
+
+    track_key = str(item.get("id") or uri or "").strip()
+    if not track_key:
+        track_key = "local::" + "::".join(
+            [
+                normalize_lyrics_match_text(" ".join(artists)),
+                normalize_lyrics_match_text(album_name),
+                normalize_lyrics_match_text(title),
+            ]
+        )
+
+    return {
+        "key": track_key,
+        "id": item.get("id"),
+        "uri": uri,
+        "title": title,
+        "artists": artists,
+        "artist": ", ".join(artists) or "Unknown artist",
+        "album": album_name or "Unknown album",
+        "coverUrl": cover_url,
+        "spotifyUrl": spotify_url,
+        "isLocal": is_local,
+        "isPlaying": bool(playback.get("is_playing")),
+        "progressMs": int(playback.get("progress_ms") or 0),
+        "durationMs": int(item.get("duration_ms") or 0),
+    }
+
+
+def build_genius_song_payload(song: dict[str, Any]) -> dict[str, Any]:
+    song_id = int(song["id"])
+    primary_artist = song.get("primary_artist")
+    artist_name = (
+        str(primary_artist.get("name") or "").strip()
+        if isinstance(primary_artist, dict)
+        else ""
+    )
+    album = song.get("album")
+    album_name = (
+        str(album.get("name") or "").strip()
+        if isinstance(album, dict)
+        else ""
+    )
+
+    path = str(song.get("path") or "").strip()
+    url = str(song.get("url") or "").strip()
+    if not url and path:
+        url = "https://genius.com" + path
+
+    return {
+        "id": song_id,
+        "title": str(song.get("title") or song.get("title_with_featured") or "").strip(),
+        "artist": artist_name,
+        "album": album_name,
+        "url": url,
+        "thumbnailUrl": str(
+            song.get("song_art_image_thumbnail_url")
+            or song.get("header_image_thumbnail_url")
+            or song.get("song_art_image_url")
+            or ""
+        ).strip(),
+        "imageUrl": str(
+            song.get("song_art_image_url")
+            or song.get("header_image_url")
+            or song.get("song_art_image_thumbnail_url")
+            or ""
+        ).strip(),
+        "description": genius_song_description(song),
+        "annotationCount": int(song.get("annotation_count") or 0),
+        "embedScriptUrl": f"https://genius.com/songs/{song_id}/embed.js",
+    }
+
+
+def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
+    cache_key = str(track.get("key") or "")
+    now = time.time()
+
+    with GENIUS_LOOKUP_CACHE_LOCK:
+        cached = GENIUS_LOOKUP_CACHE.get(cache_key)
+        if isinstance(cached, dict):
+            ttl = GENIUS_MATCH_TTL_SECONDS if cached.get("value") else GENIUS_MISS_TTL_SECONDS
+            if now - float(cached.get("timestamp") or 0) < ttl:
+                return cached.get("value")
+
+    title = str(track.get("title") or "").strip()
+    artists = [str(value).strip() for value in (track.get("artists") or []) if str(value).strip()]
+    album_name = str(track.get("album") or "").strip()
+    primary_artist = artists[0] if artists else ""
+
+    queries = [" ".join(part for part in (title, primary_artist) if part).strip()]
+    cleaned_title = clean_lyrics_track_title(title)
+    cleaned_query = " ".join(part for part in (cleaned_title, primary_artist) if part).strip()
+    if cleaned_query and cleaned_query not in queries:
+        queries.append(cleaned_query)
+
+    candidates: dict[int, dict[str, Any]] = {}
+    for query in queries[:2]:
+        if not query:
+            continue
+        payload = genius_search_request(query)
+        for song in genius_song_hits(payload):
+            try:
+                song_id = int(song.get("id"))
+            except (TypeError, ValueError):
+                continue
+            candidates[song_id] = song
+        if candidates:
+            # A second query is useful only when the exact Spotify title did not
+            # produce plausible candidates.
+            best_now = max(
+                score_genius_song_match(song, title, artists, album_name)
+                for song in candidates.values()
+            )
+            if best_now >= 90:
+                break
+
+    best_song: dict[str, Any] | None = None
+    best_score = 0.0
+    for candidate in candidates.values():
+        score = score_genius_song_match(candidate, title, artists, album_name)
+        if score > best_score:
+            best_score = score
+            best_song = candidate
+
+    result: dict[str, Any] | None = None
+    if best_song is not None and best_score >= 48.0:
+        try:
+            details_payload = genius_song_request(int(best_song["id"]))
+            response = details_payload.get("response")
+            detailed_song = response.get("song") if isinstance(response, dict) else None
+            if isinstance(detailed_song, dict):
+                best_song = detailed_song
+        except Exception:
+            # Search results still provide the ID, URL, title, artist, and art,
+            # so the official Genius embed remains usable if detail lookup fails.
+            pass
+
+        result = build_genius_song_payload(best_song)
+        result["matchScore"] = round(best_score, 1)
+
+    with GENIUS_LOOKUP_CACHE_LOCK:
+        GENIUS_LOOKUP_CACHE[cache_key] = {"timestamp": now, "value": result}
+        if len(GENIUS_LOOKUP_CACHE) > GENIUS_LOOKUP_CACHE_MAX_ITEMS:
+            oldest_key = min(
+                GENIUS_LOOKUP_CACHE,
+                key=lambda key: float(GENIUS_LOOKUP_CACHE[key].get("timestamp") or 0),
+            )
+            GENIUS_LOOKUP_CACHE.pop(oldest_key, None)
+
+    return result
+
+
+@app.route("/api/lyrics/current", methods=["GET"])
+def current_lyrics():
+    try:
+        spotify_client = get_spotify_client()
+    except Exception as error:
+        response = jsonify(
+            {
+                "ok": False,
+                "authenticated": False,
+                "error": str(error),
+            }
+        )
+        response.status_code = 401
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    try:
+        try:
+            playback = spotify_client.current_playback(additional_types="track")
+        except TypeError:
+            # Compatibility with older Spotipy builds whose current_playback()
+            # method predates the additional_types keyword.
+            playback = spotify_client.current_playback()
+    except Exception as error:
+        response = jsonify(
+            {
+                "ok": False,
+                "authenticated": True,
+                "error": f"Could not read Spotify playback: {error}",
+            }
+        )
+        response.status_code = 502
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    track = spotify_current_track_snapshot(playback)
+    if track is None:
+        response = jsonify(
+            {
+                "ok": True,
+                "authenticated": True,
+                "playing": False,
+                "track": None,
+                "genius": None,
+            }
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    genius_song = None
+    genius_error = ""
+    try:
+        genius_song = lookup_genius_song(track)
+    except Exception as error:
+        genius_error = str(error)
+
+    # Prefer the exact Spotify album cover for non-local tracks. Local files
+    # usually have no Spotify art, so use the matched Genius artwork instead.
+    if not track.get("coverUrl") and genius_song:
+        track["coverUrl"] = genius_song.get("thumbnailUrl") or genius_song.get("imageUrl") or ""
+
+    response = jsonify(
+        {
+            "ok": True,
+            "authenticated": True,
+            "playing": True,
+            "track": track,
+            "genius": genius_song,
+            "geniusError": genius_error,
+        }
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def pause_spotify() -> None:
