@@ -18,7 +18,8 @@ import unicodedata
 from collections import deque
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus, unquote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote_plus, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
@@ -1026,75 +1027,75 @@ GENIUS_MISS_TTL_SECONDS = 60 * 60
 
 
 def get_genius_access_token() -> str:
-    # A Genius Client Access Token is optional. When it is absent, the backend
-    # uses Genius's public search/song JSON endpoints and still renders Genius's
-    # official embed.js output for lyrics and annotations.
-    return normalize_secret_text(os.getenv("GENIUS_ACCESS_TOKEN") or "")
+    # Genius's official API requires a Client Access Token. Accept a few common
+    # environment-variable names so existing deployments can add the token
+    # without changing code. The token must remain server-side.
+    return normalize_secret_text(
+        os.getenv("GENIUS_ACCESS_TOKEN")
+        or os.getenv("GENIUS_CLIENT_ACCESS_TOKEN")
+        or os.getenv("GENIUS_API_TOKEN")
+        or ""
+    )
 
 
-def genius_json_request(url: str, access_token: str = "") -> dict[str, Any]:
+def genius_json_request(url: str, access_token: str) -> dict[str, Any]:
+    if not access_token:
+        raise RuntimeError(
+            "Genius API access token is not configured. Add GENIUS_ACCESS_TOKEN "
+            "to the backend environment and redeploy."
+        )
+
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 NavincitronLyrics/1.0",
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "NavincitronLyrics/1.1 (+https://www.navincitron.com)",
     }
-    if access_token:
-        headers["Authorization"] = f"Bearer {access_token}"
-
     genius_request = Request(url, headers=headers)
-    with urlopen(genius_request, timeout=12) as response:
-        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+
+    try:
+        with urlopen(genius_request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except HTTPError as error:
+        if error.code in {401, 403}:
+            raise RuntimeError(
+                f"Genius rejected the configured access token (HTTP {error.code}). "
+                "Generate a Client Access Token in the Genius API Clients dashboard "
+                "and update GENIUS_ACCESS_TOKEN."
+            ) from error
+        raise RuntimeError(f"Genius API request failed with HTTP {error.code}.") from error
+    except URLError as error:
+        raise RuntimeError(f"Could not reach the Genius API: {error.reason}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Genius returned an unreadable JSON response.") from error
 
     if not isinstance(payload, dict):
         raise RuntimeError("Genius returned an invalid JSON response.")
+
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        status = int(meta.get("status") or 0)
+        if status and status >= 400:
+            message = str(meta.get("message") or "Genius API request failed.").strip()
+            raise RuntimeError(f"Genius API error {status}: {message}")
+
     return payload
 
 
 def genius_search_request(query: str) -> dict[str, Any]:
-    encoded_query = quote_plus(query)
     access_token = get_genius_access_token()
-    errors: list[str] = []
-
-    if access_token:
-        try:
-            return genius_json_request(
-                f"https://api.genius.com/search?q={encoded_query}",
-                access_token,
-            )
-        except Exception as error:
-            errors.append(f"official API: {error}")
-
-    try:
-        return genius_json_request(
-            f"https://genius.com/api/search/multi?per_page=10&q={encoded_query}"
-        )
-    except Exception as error:
-        errors.append(f"public API: {error}")
-
-    raise RuntimeError("; ".join(errors) or "Genius search failed.")
+    encoded_query = quote_plus(query)
+    return genius_json_request(
+        f"https://api.genius.com/search?q={encoded_query}",
+        access_token,
+    )
 
 
 def genius_song_request(song_id: int) -> dict[str, Any]:
     access_token = get_genius_access_token()
-    errors: list[str] = []
-
-    if access_token:
-        try:
-            return genius_json_request(
-                f"https://api.genius.com/songs/{song_id}?text_format=plain",
-                access_token,
-            )
-        except Exception as error:
-            errors.append(f"official API: {error}")
-
-    try:
-        return genius_json_request(
-            f"https://genius.com/api/songs/{song_id}?text_format=plain"
-        )
-    except Exception as error:
-        errors.append(f"public API: {error}")
-
-    raise RuntimeError("; ".join(errors) or "Genius song lookup failed.")
-
+    return genius_json_request(
+        f"https://api.genius.com/songs/{song_id}?text_format=plain",
+        access_token,
+    )
 
 def genius_song_hits(payload: dict[str, Any]) -> list[dict[str, Any]]:
     response = payload.get("response")
@@ -1310,6 +1311,209 @@ def genius_song_description(song: dict[str, Any]) -> str:
     return ""
 
 
+
+LASTFM_ART_CACHE: dict[str, dict[str, Any]] = {}
+LASTFM_ART_CACHE_LOCK = threading.Lock()
+LASTFM_ART_CACHE_MAX_ITEMS = 500
+LASTFM_ART_MATCH_TTL_SECONDS = 30 * 24 * 60 * 60
+LASTFM_ART_MISS_TTL_SECONDS = 6 * 60 * 60
+
+
+def get_lyrics_lastfm_api_key() -> str:
+    key = normalize_secret_text(
+        os.getenv("LASTFM_API_KEY")
+        or os.getenv("TOPSTER_LASTFM_API_KEY")
+        or ""
+    )
+    if key:
+        return key
+
+    # sampler.py already carries the site's Last.fm key resolution logic. Reuse
+    # it when available instead of maintaining a second key in app.py.
+    sampler_key_getter = getattr(sampler_tools, "get_lastfm_api_key", None)
+    if callable(sampler_key_getter):
+        try:
+            return normalize_secret_text(sampler_key_getter())
+        except Exception:
+            return ""
+
+    return ""
+
+
+def useful_lastfm_image_url(url: Any) -> str:
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    # Last.fm's historical placeholder image is not useful as album art.
+    if "2a96cbd8b46e442fc41c2b86b821562f" in value.lower():
+        return ""
+    return value
+
+
+def best_lastfm_image_url(images: Any) -> str:
+    if not isinstance(images, list):
+        return ""
+
+    preferred_sizes = ("mega", "extralarge", "large", "medium", "small")
+    for preferred_size in preferred_sizes:
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            if str(image.get("size") or "").lower() != preferred_size:
+                continue
+            url = useful_lastfm_image_url(image.get("#text") or image.get("url"))
+            if url:
+                return url
+
+    for image in reversed(images):
+        if not isinstance(image, dict):
+            continue
+        url = useful_lastfm_image_url(image.get("#text") or image.get("url"))
+        if url:
+            return url
+
+    return ""
+
+
+def lastfm_json_request(params: dict[str, Any]) -> dict[str, Any]:
+    api_key = get_lyrics_lastfm_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "Last.fm API key is not configured. Add LASTFM_API_KEY to the backend environment."
+        )
+
+    query = dict(params)
+    query.update({"api_key": api_key, "format": "json", "autocorrect": "1"})
+    url = "https://ws.audioscrobbler.com/2.0/?" + urlencode(query)
+    lastfm_request = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "NavincitronLyrics/1.1 (+https://www.navincitron.com)",
+        },
+    )
+
+    try:
+        with urlopen(lastfm_request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except HTTPError as error:
+        raise RuntimeError(f"Last.fm request failed with HTTP {error.code}.") from error
+    except URLError as error:
+        raise RuntimeError(f"Could not reach Last.fm: {error.reason}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Last.fm returned an unreadable JSON response.") from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("Last.fm returned an invalid JSON response.")
+    if payload.get("error"):
+        raise RuntimeError(
+            f"Last.fm API error {payload.get('error')}: "
+            f"{str(payload.get('message') or 'lookup failed').strip()}"
+        )
+    return payload
+
+
+def lookup_lastfm_local_album_art(track: dict[str, Any]) -> dict[str, str] | None:
+    if not bool(track.get("isLocal")):
+        return None
+
+    title = str(track.get("title") or "").strip()
+    artists = [str(value).strip() for value in (track.get("artists") or []) if str(value).strip()]
+    primary_artist = artists[0] if artists else str(track.get("artist") or "").strip()
+    supplied_album = str(track.get("album") or "").strip()
+    if supplied_album.lower() == "unknown album":
+        supplied_album = ""
+
+    if not title or not primary_artist or primary_artist.lower() == "unknown artist":
+        return None
+
+    cache_key = "::".join(
+        [
+            normalize_lyrics_match_text(primary_artist),
+            normalize_lyrics_match_text(title),
+            normalize_lyrics_match_text(supplied_album),
+        ]
+    )
+    now = time.time()
+
+    with LASTFM_ART_CACHE_LOCK:
+        cached = LASTFM_ART_CACHE.get(cache_key)
+        if isinstance(cached, dict):
+            ttl = (
+                LASTFM_ART_MATCH_TTL_SECONDS
+                if cached.get("value")
+                else LASTFM_ART_MISS_TTL_SECONDS
+            )
+            if now - float(cached.get("timestamp") or 0) < ttl:
+                return cached.get("value")
+
+    canonical_artist = primary_artist
+    canonical_album = supplied_album
+    cover_url = ""
+    lastfm_url = ""
+
+    # track.getInfo is the key step for local files: it identifies the canonical
+    # release containing the artist/title pair, rather than blindly trusting an
+    # incomplete or incorrect local-file album tag.
+    try:
+        track_payload = lastfm_json_request(
+            {"method": "track.getInfo", "artist": primary_artist, "track": title}
+        )
+        track_info = track_payload.get("track")
+        if isinstance(track_info, dict):
+            album_info = track_info.get("album")
+            if isinstance(album_info, dict):
+                canonical_artist = str(album_info.get("artist") or canonical_artist).strip()
+                canonical_album = str(
+                    album_info.get("title") or album_info.get("name") or canonical_album
+                ).strip()
+                cover_url = best_lastfm_image_url(album_info.get("image"))
+                lastfm_url = str(album_info.get("url") or "").strip()
+    except Exception:
+        # A supplied local album tag can still resolve through album.getInfo.
+        pass
+
+    # Fetch the full album record when track.getInfo found the album but omitted
+    # usable artwork, or when Spotify's local URI supplied an album directly.
+    if canonical_album and not cover_url:
+        try:
+            album_payload = lastfm_json_request(
+                {
+                    "method": "album.getInfo",
+                    "artist": canonical_artist or primary_artist,
+                    "album": canonical_album,
+                }
+            )
+            album_info = album_payload.get("album")
+            if isinstance(album_info, dict):
+                canonical_artist = str(album_info.get("artist") or canonical_artist).strip()
+                canonical_album = str(album_info.get("name") or canonical_album).strip()
+                cover_url = best_lastfm_image_url(album_info.get("image"))
+                lastfm_url = str(album_info.get("url") or lastfm_url).strip()
+        except Exception:
+            pass
+
+    result = None
+    if cover_url:
+        result = {
+            "coverUrl": cover_url,
+            "album": canonical_album,
+            "artist": canonical_artist,
+            "lastfmUrl": lastfm_url,
+            "source": "lastfm",
+        }
+
+    with LASTFM_ART_CACHE_LOCK:
+        LASTFM_ART_CACHE[cache_key] = {"timestamp": now, "value": result}
+        if len(LASTFM_ART_CACHE) > LASTFM_ART_CACHE_MAX_ITEMS:
+            oldest_key = min(
+                LASTFM_ART_CACHE,
+                key=lambda key: float(LASTFM_ART_CACHE[key].get("timestamp") or 0),
+            )
+            LASTFM_ART_CACHE.pop(oldest_key, None)
+
+    return result
+
 def local_spotify_uri_metadata(uri: str) -> dict[str, str]:
     # Local Spotify URIs use spotify:local:artist:album:title:duration. Artist,
     # album, and title may be percent encoded.
@@ -1376,6 +1580,7 @@ def spotify_current_track_snapshot(playback: dict[str, Any] | None) -> dict[str,
         "artist": ", ".join(artists) or "Unknown artist",
         "album": album_name or "Unknown album",
         "coverUrl": cover_url,
+        "artworkSource": "spotify" if cover_url else "",
         "spotifyUrl": spotify_url,
         "isLocal": is_local,
         "isPlaying": bool(playback.get("is_playing")),
@@ -1556,17 +1761,45 @@ def current_lyrics():
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    lastfm_art = None
+    lastfm_error = ""
+    if track.get("isLocal") and not track.get("coverUrl"):
+        try:
+            lastfm_art = lookup_lastfm_local_album_art(track)
+        except Exception as error:
+            lastfm_error = str(error)
+
+        if lastfm_art:
+            track["coverUrl"] = lastfm_art.get("coverUrl") or ""
+            track["artworkSource"] = "lastfm"
+            track["lastfmUrl"] = lastfm_art.get("lastfmUrl") or ""
+            canonical_album = str(lastfm_art.get("album") or "").strip()
+            if canonical_album and str(track.get("album") or "").strip().lower() in {"", "unknown album"}:
+                track["album"] = canonical_album
+
     genius_song = None
     genius_error = ""
-    try:
-        genius_song = lookup_genius_song(track)
-    except Exception as error:
-        genius_error = str(error)
+    genius_error_code = ""
+    if not get_genius_access_token():
+        genius_error_code = "not_configured"
+        genius_error = (
+            "Genius API access token is not configured. Add GENIUS_ACCESS_TOKEN "
+            "to the backend environment and redeploy."
+        )
+    else:
+        try:
+            genius_song = lookup_genius_song(track)
+        except Exception as error:
+            genius_error = str(error)
+            lowered_error = genius_error.lower()
+            if "rejected the configured access token" in lowered_error:
+                genius_error_code = "authentication_failed"
+            else:
+                genius_error_code = "lookup_failed"
 
-    # Prefer the exact Spotify album cover for non-local tracks. Local files
-    # usually have no Spotify art, so use the matched Genius artwork instead.
-    if not track.get("coverUrl") and genius_song:
-        track["coverUrl"] = genius_song.get("thumbnailUrl") or genius_song.get("imageUrl") or ""
+    # Non-local tracks retain Spotify's exact album art. Local tracks deliberately
+    # use Last.fm only for album-art recovery so Genius matching cannot substitute
+    # unrelated song-page artwork.
 
     response = jsonify(
         {
@@ -1575,7 +1808,11 @@ def current_lyrics():
             "playing": True,
             "track": track,
             "genius": genius_song,
+            "geniusConfigured": bool(get_genius_access_token()),
             "geniusError": genius_error,
+            "geniusErrorCode": genius_error_code,
+            "lastfmArt": lastfm_art,
+            "lastfmError": lastfm_error,
         }
     )
     response.headers["Cache-Control"] = "no-store"
