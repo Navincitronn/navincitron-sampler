@@ -16,6 +16,7 @@ import time
 import threading
 import unicodedata
 from collections import deque
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -214,10 +215,20 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-only-change-this")
 # Cookies must be usable from www.navincitron.com -> api.navincitron.com fetch(..., credentials:"include").
 # For local http testing, set FRONTEND_ORIGINS=http://127.0.0.1:5000 to avoid Secure-cookie requirements.
 USES_HTTPS_FRONTEND = any(origin.startswith("https://") for origin in FRONTEND_ORIGINS)
+try:
+    SPOTIFY_DEVICE_SESSION_DAYS = max(1, int(os.getenv("SPOTIFY_DEVICE_SESSION_DAYS", "180") or 180))
+except (TypeError, ValueError):
+    SPOTIFY_DEVICE_SESSION_DAYS = 180
+
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=USES_HTTPS_FRONTEND,
     SESSION_COOKIE_SAMESITE="None" if USES_HTTPS_FRONTEND else "Lax",
+    # Spotify's access token expires quickly, but the refresh token and this
+    # browser session should survive ordinary browser restarts and long idle
+    # periods. The OAuth token itself is refreshed server-side when required.
+    PERMANENT_SESSION_LIFETIME=timedelta(days=SPOTIFY_DEVICE_SESSION_DAYS),
+    SESSION_REFRESH_EACH_REQUEST=False,
 )
 
 CORS(
@@ -927,17 +938,199 @@ def make_oauth() -> SpotifyOAuth:
     )
 
 
+SPOTIFY_DEVICE_COOKIE_NAME = (
+    os.getenv("SPOTIFY_DEVICE_COOKIE_NAME", "navincitron_spotify_device").strip()
+    or "navincitron_spotify_device"
+)
+SPOTIFY_DEVICE_SESSION_SECONDS = SPOTIFY_DEVICE_SESSION_DAYS * 24 * 60 * 60
+SPOTIFY_AUTH_REDIS_KEY_PREFIX = (
+    os.getenv("SPOTIFY_AUTH_REDIS_KEY_PREFIX", "navincitron:spotify-auth").strip(":")
+    or "navincitron:spotify-auth"
+)
+SPOTIFY_DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,160}$")
+
+
+class SpotifyLoginRequired(RuntimeError):
+    """The browser has no usable Spotify authorization grant."""
+
+
+class SpotifyTokenRefreshTemporarilyUnavailable(RuntimeError):
+    """The browser is still authorized, but token renewal temporarily failed."""
+
+
+def valid_spotify_device_id(value: Any) -> str:
+    candidate = str(value or "").strip()
+    return candidate if SPOTIFY_DEVICE_ID_PATTERN.fullmatch(candidate) else ""
+
+
+def get_spotify_device_id(create: bool = False) -> str:
+    # The dedicated opaque cookie allows a browser to recover its server-side
+    # token after a Render restart or after Flask's ordinary session cookie is
+    # no longer available. It is intentionally not tied to an IP address.
+    device_id = valid_spotify_device_id(request.cookies.get(SPOTIFY_DEVICE_COOKIE_NAME))
+    if not device_id:
+        device_id = valid_spotify_device_id(session.get("spotify_device_id"))
+
+    if not device_id and create:
+        device_id = secrets.token_urlsafe(36)
+
+    if device_id:
+        if not session.permanent:
+            session.permanent = True
+        if session.get("spotify_device_id") != device_id:
+            session["spotify_device_id"] = device_id
+
+    return device_id
+
+
+def set_spotify_device_cookie(response: Any, device_id: str) -> Any:
+    device_id = valid_spotify_device_id(device_id)
+    if not device_id:
+        return response
+
+    response.set_cookie(
+        SPOTIFY_DEVICE_COOKIE_NAME,
+        device_id,
+        max_age=SPOTIFY_DEVICE_SESSION_SECONDS,
+        secure=USES_HTTPS_FRONTEND,
+        httponly=True,
+        samesite="None" if USES_HTTPS_FRONTEND else "Lax",
+        path="/",
+    )
+    return response
+
+
+def spotify_auth_redis_key(device_id: str) -> str:
+    digest = hashlib.sha256(device_id.encode("utf-8", errors="ignore")).hexdigest()
+    return f"{SPOTIFY_AUTH_REDIS_KEY_PREFIX}:{digest}"
+
+
+def token_expiration_value(token_info: Any) -> int:
+    if not isinstance(token_info, dict):
+        return 0
+    try:
+        return int(token_info.get("expires_at") or 0)
+    except Exception:
+        return 0
+
+
+def load_spotify_token_info() -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    device_id = get_spotify_device_id(create=False)
+
+    if device_id and topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                raw = client.get(spotify_auth_redis_key(device_id))
+                if raw:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict) and parsed.get("access_token"):
+                        candidates.append(parsed)
+                        client.expire(spotify_auth_redis_key(device_id), SPOTIFY_DEVICE_SESSION_SECONDS)
+        except Exception:
+            # A temporary Redis outage must not log the browser out. The
+            # permanent Flask-session copy below remains an availability fallback.
+            pass
+
+    session_token = session.get("spotify_token_info")
+    if isinstance(session_token, dict) and session_token.get("access_token"):
+        candidates.append(session_token)
+
+    if not candidates:
+        return None
+
+    # Prefer the newest copy when both Redis and the signed session cookie exist.
+    return max(candidates, key=token_expiration_value)
+
+
+def save_spotify_token_info(token_info: dict[str, Any], device_id: str | None = None) -> None:
+    if not isinstance(token_info, dict) or not token_info.get("access_token"):
+        raise RuntimeError("Spotify returned an invalid token response.")
+
+    if not session.permanent:
+        session.permanent = True
+    session["spotify_token_info"] = token_info
+    device_id = valid_spotify_device_id(device_id) or get_spotify_device_id(create=True)
+
+    if device_id and topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                client.setex(
+                    spotify_auth_redis_key(device_id),
+                    SPOTIFY_DEVICE_SESSION_SECONDS,
+                    json.dumps(token_info, ensure_ascii=False),
+                )
+        except Exception:
+            # The permanent signed-cookie copy remains usable when Redis is down.
+            pass
+
+
+def clear_spotify_token_info() -> None:
+    device_id = get_spotify_device_id(create=False)
+    session.pop("spotify_token_info", None)
+
+    if device_id and topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                client.delete(spotify_auth_redis_key(device_id))
+        except Exception:
+            pass
+
+
+def spotify_refresh_requires_login(error: Exception) -> bool:
+    message = str(error or "").lower()
+    permanent_markers = (
+        "invalid_grant",
+        "invalid refresh token",
+        "refresh token expired",
+        "refresh token has expired",
+        "refresh token revoked",
+        "refresh token was revoked",
+    )
+    return any(marker in message for marker in permanent_markers)
+
+
 def get_session_token_info() -> dict[str, Any]:
-    token_info = session.get("spotify_token_info")
+    token_info = load_spotify_token_info()
 
     if not token_info:
-        raise RuntimeError("Not logged in with Spotify.")
+        raise SpotifyLoginRequired("Not logged in with Spotify.")
 
     oauth = make_oauth()
 
     if oauth.is_token_expired(token_info):
-        token_info = oauth.refresh_access_token(token_info["refresh_token"])
-        session["spotify_token_info"] = token_info
+        refresh_token = str(token_info.get("refresh_token") or "").strip()
+        if not refresh_token:
+            clear_spotify_token_info()
+            raise SpotifyLoginRequired("Spotify authorization cannot be refreshed. Please log in again.")
+
+        try:
+            refreshed = oauth.refresh_access_token(refresh_token)
+        except Exception as error:
+            if spotify_refresh_requires_login(error):
+                clear_spotify_token_info()
+                raise SpotifyLoginRequired(
+                    "Spotify authorization expired or was revoked. Please log in again."
+                ) from error
+            raise SpotifyTokenRefreshTemporarilyUnavailable(
+                "Spotify token refresh is temporarily unavailable. The saved browser login was retained and will be retried automatically."
+            ) from error
+
+        if not isinstance(refreshed, dict) or not refreshed.get("access_token"):
+            raise SpotifyTokenRefreshTemporarilyUnavailable(
+                "Spotify returned an incomplete token refresh response. The saved browser login was retained and will be retried automatically."
+            )
+
+        # Spotify may omit a replacement refresh token. In that case the prior
+        # refresh token remains the one the application must retain.
+        if not refreshed.get("refresh_token"):
+            refreshed["refresh_token"] = refresh_token
+
+        token_info = refreshed
+        save_spotify_token_info(token_info)
 
     return token_info
 
@@ -946,11 +1139,14 @@ def get_session_token_info() -> dict[str, Any]:
 def login():
     # Preserve the page that initiated OAuth so lyrics.html can reconnect without
     # changing the existing shuffle.html login behavior.
+    session.permanent = True
+    device_id = get_spotify_device_id(create=True)
     session["spotify_oauth_next"] = safe_frontend_redirect_url(
         request.args.get("next"),
         "/shuffle.html",
     )
-    return redirect(make_oauth().get_authorize_url())
+    response = redirect(make_oauth().get_authorize_url())
+    return set_spotify_device_cookie(response, device_id)
 
 
 @app.route("/callback")
@@ -960,14 +1156,16 @@ def callback():
     if not code:
         return "Spotify authorization failed: missing code.", 400
 
+    device_id = get_spotify_device_id(create=True)
     token_info = make_oauth().get_access_token(code, as_dict=True)
-    session["spotify_token_info"] = token_info
+    save_spotify_token_info(token_info, device_id=device_id)
 
     next_url = session.pop(
         "spotify_oauth_next",
         FRONTEND_ORIGIN.rstrip("/") + "/shuffle.html",
     )
-    return redirect(safe_frontend_redirect_url(next_url, "/shuffle.html"))
+    response = redirect(safe_frontend_redirect_url(next_url, "/shuffle.html"))
+    return set_spotify_device_cookie(response, device_id)
 
 
 @app.route("/api/auth-status")
@@ -975,8 +1173,26 @@ def auth_status():
     try:
         get_session_token_info()
         return jsonify({"ok": True, "authenticated": True})
-    except Exception:
+    except SpotifyTokenRefreshTemporarilyUnavailable as error:
+        return jsonify(
+            {
+                "ok": True,
+                "authenticated": True,
+                "temporarilyUnavailable": True,
+                "error": str(error),
+            }
+        )
+    except SpotifyLoginRequired:
         return jsonify({"ok": True, "authenticated": False})
+    except Exception as error:
+        return jsonify(
+            {
+                "ok": False,
+                "authenticated": True,
+                "temporarilyUnavailable": True,
+                "error": f"Could not verify Spotify authorization: {error}",
+            }
+        ), 503
 
 
 sampler_process: subprocess.Popen[str] | None = None
@@ -1716,7 +1932,7 @@ def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
 def current_lyrics():
     try:
         spotify_client = get_spotify_client()
-    except Exception as error:
+    except SpotifyLoginRequired as error:
         response = jsonify(
             {
                 "ok": False,
@@ -1725,6 +1941,19 @@ def current_lyrics():
             }
         )
         response.status_code = 401
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except SpotifyTokenRefreshTemporarilyUnavailable as error:
+        response = jsonify(
+            {
+                "ok": False,
+                "authenticated": True,
+                "temporarilyUnavailable": True,
+                "error": str(error),
+            }
+        )
+        response.status_code = 503
+        response.headers["Retry-After"] = "6"
         response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -1834,7 +2063,7 @@ def lyrics_playback_control(action: str):
 
     try:
         spotify_client = get_spotify_client()
-    except Exception as error:
+    except SpotifyLoginRequired as error:
         response = jsonify(
             {
                 "ok": False,
@@ -1843,6 +2072,19 @@ def lyrics_playback_control(action: str):
             }
         )
         response.status_code = 401
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except SpotifyTokenRefreshTemporarilyUnavailable as error:
+        response = jsonify(
+            {
+                "ok": False,
+                "authenticated": True,
+                "temporarilyUnavailable": True,
+                "error": str(error),
+            }
+        )
+        response.status_code = 503
+        response.headers["Retry-After"] = "6"
         response.headers["Cache-Control"] = "no-store"
         return response
 
