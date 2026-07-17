@@ -941,6 +941,22 @@ def topster_shared_store():
         )
 
     payload = request.get_json(silent=True) or {}
+    payload_source = payload.get("source")
+    if payload_source is not None:
+        normalized_payload_source = normalize_topster_store_key(payload_source)
+        if normalized_payload_source != source_key:
+            return jsonify(
+                {
+                    "ok": False,
+                    "source": source_key,
+                    "writable": True,
+                    "storageBackend": storage_backend,
+                    "error": (
+                        f"Topster source mismatch: URL targets {source_key!r} "
+                        f"but payload targets {normalized_payload_source!r}."
+                    ),
+                }
+            ), 409
 
     try:
         settings = get_topster_settings(source_key)
