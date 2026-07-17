@@ -102,7 +102,7 @@ TOPSTER_ADMIN_ALLOWED_IPS = {
     if item.strip()
 }
 
-TOPSTER_STORE_KEYS = {"grid", "ranked", "draft"}
+TOPSTER_STORE_KEYS = {"grid", "ranked", "draft", "checklist"}
 TOPSTER_STORE_ALIASES = {
     "grid": "grid",
     "grid-file": "grid",
@@ -115,6 +115,12 @@ TOPSTER_STORE_ALIASES = {
     "draft-grid": "draft",
     "draft_album_list": "draft",
     "draft-album-list": "draft",
+    "checklist": "checklist",
+    "checklist-file": "checklist",
+    "draft_checklist": "checklist",
+    "draft-checklist": "checklist",
+    "checklist_album_list": "checklist",
+    "checklist-album-list": "checklist",
     "ranked": "ranked",
     "ranked-sheet": "ranked",
     "ranked_album_list": "ranked",
@@ -141,6 +147,7 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
             "grid": data.get("grid") if isinstance(data.get("grid"), dict) else {},
             "ranked": data.get("ranked") if isinstance(data.get("ranked"), dict) else {},
             "draft": data.get("draft") if isinstance(data.get("draft"), dict) else {},
+            "checklist": data.get("checklist") if isinstance(data.get("checklist"), dict) else {},
         }
 
     # Backward-compatible migration path: older builds stored one flat object.
@@ -150,6 +157,7 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
         "grid": data,
         "ranked": data,
         "draft": {},
+        "checklist": {},
     }
 
 
@@ -220,6 +228,22 @@ try:
 except (TypeError, ValueError):
     SPOTIFY_DEVICE_SESSION_DAYS = 180
 
+try:
+    TOPSTER_ADMIN_SESSION_DAYS = max(1, int(os.getenv("TOPSTER_ADMIN_SESSION_DAYS", "365") or 365))
+except (TypeError, ValueError):
+    TOPSTER_ADMIN_SESSION_DAYS = 365
+
+TOPSTER_ADMIN_DEVICE_COOKIE_NAME = (
+    os.getenv("TOPSTER_ADMIN_DEVICE_COOKIE_NAME", "navincitron_topster_admin_device").strip()
+    or "navincitron_topster_admin_device"
+)
+TOPSTER_ADMIN_DEVICE_SESSION_SECONDS = TOPSTER_ADMIN_SESSION_DAYS * 24 * 60 * 60
+TOPSTER_ADMIN_DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,160}$")
+TOPSTER_ADMIN_DEVICE_REDIS_KEY_PREFIX = (
+    os.getenv("TOPSTER_ADMIN_DEVICE_REDIS_KEY_PREFIX", "navincitron:topster-admin-device").strip(":")
+    or "navincitron:topster-admin-device"
+)
+
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=USES_HTTPS_FRONTEND,
@@ -227,7 +251,7 @@ app.config.update(
     # Spotify's access token expires quickly, but the refresh token and this
     # browser session should survive ordinary browser restarts and long idle
     # periods. The OAuth token itself is refreshed server-side when required.
-    PERMANENT_SESSION_LIFETIME=timedelta(days=SPOTIFY_DEVICE_SESSION_DAYS),
+    PERMANENT_SESSION_LIFETIME=timedelta(days=max(SPOTIFY_DEVICE_SESSION_DAYS, TOPSTER_ADMIN_SESSION_DAYS)),
     SESSION_REFRESH_EACH_REQUEST=False,
 )
 
@@ -259,10 +283,121 @@ def is_admin_ip_allowed() -> bool:
     return not TOPSTER_ADMIN_ALLOWED_IPS or request_ip_address() in TOPSTER_ADMIN_ALLOWED_IPS
 
 
+def valid_topster_admin_device_id(value: Any) -> str:
+    candidate = str(value or "").strip()
+    return candidate if TOPSTER_ADMIN_DEVICE_ID_PATTERN.fullmatch(candidate) else ""
+
+
+def topster_admin_device_redis_key(device_id: str) -> str:
+    digest = hashlib.sha256(device_id.encode("utf-8", errors="ignore")).hexdigest()
+    return f"{TOPSTER_ADMIN_DEVICE_REDIS_KEY_PREFIX}:{digest}"
+
+
+def get_topster_admin_device_id(create: bool = False) -> str:
+    device_id = valid_topster_admin_device_id(request.cookies.get(TOPSTER_ADMIN_DEVICE_COOKIE_NAME))
+    if not device_id:
+        device_id = valid_topster_admin_device_id(session.get("topster_admin_device_id"))
+
+    if not device_id and create:
+        device_id = secrets.token_urlsafe(36)
+
+    if device_id:
+        if not session.permanent:
+            session.permanent = True
+        session["topster_admin_device_id"] = device_id
+
+    return device_id
+
+
+def topster_admin_device_is_remembered() -> bool:
+    if not is_admin_ip_allowed():
+        return False
+
+    device_id = get_topster_admin_device_id(create=False)
+    if not device_id or not topster_redis_is_configured():
+        return False
+
+    try:
+        client = get_topster_redis_client()
+        if client is None:
+            return False
+        key = topster_admin_device_redis_key(device_id)
+        if not client.get(key):
+            return False
+        client.expire(key, TOPSTER_ADMIN_DEVICE_SESSION_SECONDS)
+        session.permanent = True
+        session["topster_admin"] = True
+        return True
+    except Exception:
+        return False
+
+
+def remember_topster_admin_device(response: Any) -> Any:
+    session.permanent = True
+    session["topster_admin"] = True
+    device_id = get_topster_admin_device_id(create=True)
+
+    if device_id and topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                client.setex(
+                    topster_admin_device_redis_key(device_id),
+                    TOPSTER_ADMIN_DEVICE_SESSION_SECONDS,
+                    json.dumps(
+                        {
+                            "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "lastIp": request_ip_address(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+        except Exception:
+            # The permanent signed Flask session remains the fallback.
+            pass
+
+    if device_id:
+        response.set_cookie(
+            TOPSTER_ADMIN_DEVICE_COOKIE_NAME,
+            device_id,
+            max_age=TOPSTER_ADMIN_DEVICE_SESSION_SECONDS,
+            secure=USES_HTTPS_FRONTEND,
+            httponly=True,
+            samesite="None" if USES_HTTPS_FRONTEND else "Lax",
+            path="/",
+        )
+
+    return response
+
+
+def forget_topster_admin_device(response: Any) -> Any:
+    device_id = get_topster_admin_device_id(create=False)
+    if device_id and topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                client.delete(topster_admin_device_redis_key(device_id))
+        except Exception:
+            pass
+
+    session.pop("topster_admin", None)
+    session.pop("topster_admin_device_id", None)
+    response.delete_cookie(
+        TOPSTER_ADMIN_DEVICE_COOKIE_NAME,
+        secure=USES_HTTPS_FRONTEND,
+        httponly=True,
+        samesite="None" if USES_HTTPS_FRONTEND else "Lax",
+        path="/",
+    )
+    return response
+
+
 def is_topster_admin() -> bool:
     if is_local_request():
         return True
-    return bool(session.get("topster_admin")) and is_admin_ip_allowed()
+    if not is_admin_ip_allowed():
+        return False
+    return bool(session.get("topster_admin")) or topster_admin_device_is_remembered()
 
 
 def redirect_topster_frontend_page(filename: str):
@@ -309,6 +444,16 @@ def redirect_draft_grid_html():
 @app.route("/draft_album_list.html")
 def redirect_draft_album_list_html():
     return redirect_topster_frontend_page("draft_album_list.html")
+
+
+@app.route("/draft_checklist.html")
+def redirect_draft_checklist_html():
+    return redirect_topster_frontend_page("draft_checklist.html")
+
+
+@app.route("/checklist.html")
+def redirect_checklist_html():
+    return redirect_topster_frontend_page("checklist.html")
 
 
 @app.route("/lyrics.html")
@@ -654,8 +799,9 @@ def topster_admin_login():
                 "Set TOPSTER_ADMIN_PASSWORD in the backend hosting environment and restart/redeploy the service."
             ), 500
         if submitted_topster_password_is_valid(submitted_password):
+            session.permanent = True
             session["topster_admin"] = True
-            return redirect(next_url)
+            return remember_topster_admin_device(redirect(next_url))
         return "Invalid Topster admin password.", 403
 
     if is_topster_admin():
@@ -680,7 +826,7 @@ def topster_admin_login():
     <body>
         <form method=\"post\">
             <h1>Topster Admin Login</h1>
-            <p>Only the host/admin computer can edit Grid and Ranked Grid.</p>
+            <p>Only the host/admin computer can edit Grid, Ranked Grid, Draft Grid, and Checklist pages.</p>
             {"<p style='color:#ffcf85;font-weight:bold;'>Admin password is not configured on this backend.</p>" if not topster_admin_password_is_configured() else ""}
             <input type=\"hidden\" name=\"next\" value=\"{escaped_next}\">
             <label for=\"password\">Password</label>
@@ -694,8 +840,7 @@ def topster_admin_login():
 
 @app.route("/api/topster-admin-logout", methods=["POST"])
 def topster_admin_logout():
-    session.pop("topster_admin", None)
-    return jsonify({"ok": True})
+    return forget_topster_admin_device(jsonify({"ok": True}))
 
 
 @app.route("/api/topster-admin-status", methods=["GET"])
@@ -707,6 +852,8 @@ def topster_admin_status():
             "writable": is_topster_admin(),
             "passwordConfigured": topster_admin_password_is_configured(),
             "ipAllowed": is_admin_ip_allowed(),
+            "rememberedDevice": bool(valid_topster_admin_device_id(request.cookies.get(TOPSTER_ADMIN_DEVICE_COOKIE_NAME))),
+            "adminSessionDays": TOPSTER_ADMIN_SESSION_DAYS,
             "frontendOrigins": FRONTEND_ORIGINS,
             "topsterStorageBackend": get_topster_storage_backend_name(),
             "topsterRedisConfigured": topster_redis_is_configured(),
@@ -799,6 +946,11 @@ def topster_shared_store():
         settings = get_topster_settings(source_key)
         if isinstance(payload.get("settings"), dict):
             settings = normalize_topster_settings(payload["settings"])
+            if source_key == "checklist":
+                for profile_name in ("desktop", "mobile"):
+                    profile = settings.get(profile_name)
+                    if isinstance(profile, dict):
+                        profile["coverOverlay"] = "none"
             if topster_redis_is_configured():
                 write_topster_redis_json("settings", source_key, settings)
             else:
@@ -818,7 +970,10 @@ def topster_shared_store():
                 {
                     "text": payload.get("sourceText", ""),
                     "signature": payload.get("sourceSignature", ""),
-                    "sourceName": payload.get("sourceName", "draft notepad file"),
+                    "sourceName": payload.get(
+                        "sourceName",
+                        "checklist notepad file" if source_key == "checklist" else "draft notepad file",
+                    ),
                     "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 }
             )
@@ -905,6 +1060,29 @@ def draft_grid_text():
         {
             "ok": True,
             "source": source_text.get("sourceName") or "draft notepad file",
+            "signature": source_text.get("signature") or hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16],
+            "updatedAt": source_text.get("updatedAt", ""),
+            "text": text,
+        }
+    )
+
+
+@app.route("/api/checklist-text", methods=["GET"])
+def checklist_text():
+    source_key = "checklist"
+    try:
+        source_text = get_topster_source_text(source_key)
+    except RuntimeError as error:
+        return jsonify({"ok": False, "source": source_key, "error": str(error)}), 503
+
+    text = source_text.get("text", "")
+    if not text:
+        return jsonify({"ok": False, "source": source_key, "error": "No checklist file has been published yet."}), 404
+
+    return jsonify(
+        {
+            "ok": True,
+            "source": source_text.get("sourceName") or "checklist notepad file",
             "signature": source_text.get("signature") or hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16],
             "updatedAt": source_text.get("updatedAt", ""),
             "text": text,
@@ -3187,10 +3365,10 @@ def root():
 
 @app.route("/<path:filename>")
 def static_files(filename: str):
-    protected_topster_pages = {"grid.html", "ranked_grid.html"}
+    protected_topster_pages = {"grid.html", "ranked_grid.html", "draft_grid.html", "draft_checklist.html"}
 
     if filename in protected_topster_pages and not is_topster_admin():
-        if TOPSTER_ADMIN_PASSWORD:
+        if topster_admin_password_is_configured():
             return redirect("/topster-admin-login")
         return "Topster editor access is restricted to the host computer.", 403
 
