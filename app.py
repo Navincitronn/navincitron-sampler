@@ -102,7 +102,7 @@ TOPSTER_ADMIN_ALLOWED_IPS = {
     if item.strip()
 }
 
-TOPSTER_STORE_KEYS = {"grid", "ranked", "draft", "checklist"}
+TOPSTER_STORE_KEYS = {"grid", "ranked", "draft", "checklist", "rolling_stone_500_albums_2003"}
 TOPSTER_STORE_ALIASES = {
     "grid": "grid",
     "grid-file": "grid",
@@ -121,6 +121,11 @@ TOPSTER_STORE_ALIASES = {
     "draft-checklist": "checklist",
     "checklist_album_list": "checklist",
     "checklist-album-list": "checklist",
+    "rolling_stone_500_albums_2003": "rolling_stone_500_albums_2003",
+    "rolling-stone-500-albums-2003": "rolling_stone_500_albums_2003",
+    "rolling-stone-500-albums-2003-file": "rolling_stone_500_albums_2003",
+    "rolling_stone_500_albums_2003_draft": "rolling_stone_500_albums_2003",
+    "rolling_stone_500_albums_2003_list": "rolling_stone_500_albums_2003",
     "ranked": "ranked",
     "ranked-sheet": "ranked",
     "ranked_album_list": "ranked",
@@ -148,6 +153,7 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
             "ranked": data.get("ranked") if isinstance(data.get("ranked"), dict) else {},
             "draft": data.get("draft") if isinstance(data.get("draft"), dict) else {},
             "checklist": data.get("checklist") if isinstance(data.get("checklist"), dict) else {},
+            "rolling_stone_500_albums_2003": data.get("rolling_stone_500_albums_2003") if isinstance(data.get("rolling_stone_500_albums_2003"), dict) else {},
         }
 
     # Backward-compatible migration path: older builds stored one flat object.
@@ -158,6 +164,7 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
         "ranked": data,
         "draft": {},
         "checklist": {},
+        "rolling_stone_500_albums_2003": {},
     }
 
 
@@ -454,6 +461,16 @@ def redirect_draft_checklist_html():
 @app.route("/checklist.html")
 def redirect_checklist_html():
     return redirect_topster_frontend_page("checklist.html")
+
+
+@app.route("/rolling_stone_500_albums_2003_draft.html")
+def redirect_rolling_stone_500_albums_2003_draft_html():
+    return redirect_topster_frontend_page("rolling_stone_500_albums_2003_draft.html")
+
+
+@app.route("/rolling_stone_500_albums_2003_list.html")
+def redirect_rolling_stone_500_albums_2003_list_html():
+    return redirect_topster_frontend_page("rolling_stone_500_albums_2003_list.html")
 
 
 @app.route("/lyrics.html")
@@ -3381,7 +3398,7 @@ def root():
 
 @app.route("/<path:filename>")
 def static_files(filename: str):
-    protected_topster_pages = {"grid.html", "ranked_grid.html", "draft_grid.html", "draft_checklist.html"}
+    protected_topster_pages = {"grid.html", "ranked_grid.html", "draft_grid.html", "draft_checklist.html", "rolling_stone_500_albums_2003_draft.html"}
 
     if filename in protected_topster_pages and not is_topster_admin():
         if topster_admin_password_is_configured():
