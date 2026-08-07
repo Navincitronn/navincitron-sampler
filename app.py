@@ -102,7 +102,7 @@ TOPSTER_ADMIN_ALLOWED_IPS = {
     if item.strip()
 }
 
-TOPSTER_STORE_KEYS = {"grid", "ranked", "draft", "checklist", "rolling_stone_500_albums_2003", "rolling_stone_500_albums_2012", "rolling_stone_500_albums_2020", "rolling_stone_500_albums_2023"}
+TOPSTER_STORE_KEYS = {"grid", "ranked", "draft", "checklist", "rolling_stone_500_albums_2003", "rolling_stone_500_albums_2012", "rolling_stone_500_albums_2020", "rolling_stone_500_albums_2023", "nme_500_albums"}
 TOPSTER_STORE_ALIASES = {
     "grid": "grid",
     "grid-file": "grid",
@@ -141,6 +141,11 @@ TOPSTER_STORE_ALIASES = {
     "rolling-stone-500-albums-2023-file": "rolling_stone_500_albums_2023",
     "rolling_stone_500_albums_2023_draft": "rolling_stone_500_albums_2023",
     "rolling_stone_500_albums_2023_list": "rolling_stone_500_albums_2023",
+    "nme_500_albums": "nme_500_albums",
+    "nme-500-albums": "nme_500_albums",
+    "nme-500-albums-file": "nme_500_albums",
+    "nme_500_albums_draft": "nme_500_albums",
+    "nme_500_albums_list": "nme_500_albums",
     "ranked": "ranked",
     "ranked-sheet": "ranked",
     "ranked_album_list": "ranked",
@@ -172,6 +177,7 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
             "rolling_stone_500_albums_2012": data.get("rolling_stone_500_albums_2012") if isinstance(data.get("rolling_stone_500_albums_2012"), dict) else {},
             "rolling_stone_500_albums_2020": data.get("rolling_stone_500_albums_2020") if isinstance(data.get("rolling_stone_500_albums_2020"), dict) else {},
             "rolling_stone_500_albums_2023": data.get("rolling_stone_500_albums_2023") if isinstance(data.get("rolling_stone_500_albums_2023"), dict) else {},
+            "nme_500_albums": data.get("nme_500_albums") if isinstance(data.get("nme_500_albums"), dict) else {},
         }
 
     # Backward-compatible migration path: older builds stored one flat object.
@@ -186,6 +192,7 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
         "rolling_stone_500_albums_2012": {},
         "rolling_stone_500_albums_2020": {},
         "rolling_stone_500_albums_2023": {},
+        "nme_500_albums": {},
     }
 
 
@@ -522,6 +529,16 @@ def redirect_rolling_stone_500_albums_2023_draft_html():
 @app.route("/rolling_stone_500_albums_2023_list.html")
 def redirect_rolling_stone_500_albums_2023_list_html():
     return redirect_topster_frontend_page("rolling_stone_500_albums_2023_list.html")
+
+
+@app.route("/nme_500_albums_draft.html")
+def redirect_nme_500_albums_draft_html():
+    return redirect_topster_frontend_page("nme_500_albums_draft.html")
+
+
+@app.route("/nme_500_albums_list.html")
+def redirect_nme_500_albums_list_html():
+    return redirect_topster_frontend_page("nme_500_albums_list.html")
 
 
 @app.route("/lyrics.html")
@@ -3449,7 +3466,7 @@ def root():
 
 @app.route("/<path:filename>")
 def static_files(filename: str):
-    protected_topster_pages = {"grid.html", "ranked_grid.html", "draft_grid.html", "draft_checklist.html", "rolling_stone_500_albums_2003_draft.html", "rolling_stone_500_albums_2012_draft.html", "rolling_stone_500_albums_2020_draft.html", "rolling_stone_500_albums_2023_draft.html"}
+    protected_topster_pages = {"grid.html", "ranked_grid.html", "draft_grid.html", "draft_checklist.html", "rolling_stone_500_albums_2003_draft.html", "rolling_stone_500_albums_2012_draft.html", "rolling_stone_500_albums_2020_draft.html", "rolling_stone_500_albums_2023_draft.html", "nme_500_albums_draft.html"}
 
     if filename in protected_topster_pages and not is_topster_admin():
         if topster_admin_password_is_configured():
