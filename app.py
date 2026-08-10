@@ -102,7 +102,7 @@ TOPSTER_ADMIN_ALLOWED_IPS = {
     if item.strip()
 }
 
-TOPSTER_STORE_KEYS = {"grid", "ranked", "draft", "checklist", "rolling_stone_500_albums_2003", "rolling_stone_500_albums_2012", "rolling_stone_500_albums_2020", "rolling_stone_500_albums_2023", "nme_500_albums", "1001_albums_you_must_hear_before_you_die"}
+TOPSTER_STORE_KEYS = {"grid", "ranked", "draft", "checklist", "rolling_stone_500_albums_2003", "rolling_stone_500_albums_2012", "rolling_stone_500_albums_2020", "rolling_stone_500_albums_2023", "nme_500_albums", "1001_albums_you_must_hear_before_you_die", "rate_your_music"}
 TOPSTER_STORE_ALIASES = {
     "grid": "grid",
     "grid-file": "grid",
@@ -151,6 +151,11 @@ TOPSTER_STORE_ALIASES = {
     "1001-albums-you-must-hear-before-you-die-file": "1001_albums_you_must_hear_before_you_die",
     "1001_albums_you_must_hear_before_you_die_draft": "1001_albums_you_must_hear_before_you_die",
     "1001_albums_you_must_hear_before_you_die_list": "1001_albums_you_must_hear_before_you_die",
+    "rate_your_music": "rate_your_music",
+    "rate-your-music": "rate_your_music",
+    "rate-your-music-chart": "rate_your_music",
+    "rate_your_music_draft": "rate_your_music",
+    "rate_your_music_list": "rate_your_music",
     "ranked": "ranked",
     "ranked-sheet": "ranked",
     "ranked_album_list": "ranked",
@@ -184,6 +189,7 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
             "rolling_stone_500_albums_2023": data.get("rolling_stone_500_albums_2023") if isinstance(data.get("rolling_stone_500_albums_2023"), dict) else {},
             "nme_500_albums": data.get("nme_500_albums") if isinstance(data.get("nme_500_albums"), dict) else {},
             "1001_albums_you_must_hear_before_you_die": data.get("1001_albums_you_must_hear_before_you_die") if isinstance(data.get("1001_albums_you_must_hear_before_you_die"), dict) else {},
+            "rate_your_music": data.get("rate_your_music") if isinstance(data.get("rate_your_music"), dict) else {},
         }
 
     # Backward-compatible migration path: older builds stored one flat object.
@@ -200,6 +206,7 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
         "rolling_stone_500_albums_2023": {},
         "nme_500_albums": {},
         "1001_albums_you_must_hear_before_you_die": {},
+        "rate_your_music": {},
     }
 
 
@@ -556,6 +563,16 @@ def redirect_1001_albums_you_must_hear_before_you_die_draft_html():
 @app.route("/1001_albums_you_must_hear_before_you_die_list.html")
 def redirect_1001_albums_you_must_hear_before_you_die_list_html():
     return redirect_topster_frontend_page("1001_albums_you_must_hear_before_you_die_list.html")
+
+
+@app.route("/rate_your_music_draft.html")
+def redirect_rate_your_music_draft_html():
+    return redirect_topster_frontend_page("rate_your_music_draft.html")
+
+
+@app.route("/rate_your_music_list.html")
+def redirect_rate_your_music_list_html():
+    return redirect_topster_frontend_page("rate_your_music_list.html")
 
 
 @app.route("/lyrics.html")
@@ -3483,7 +3500,7 @@ def root():
 
 @app.route("/<path:filename>")
 def static_files(filename: str):
-    protected_topster_pages = {"grid.html", "ranked_grid.html", "draft_grid.html", "draft_checklist.html", "rolling_stone_500_albums_2003_draft.html", "rolling_stone_500_albums_2012_draft.html", "rolling_stone_500_albums_2020_draft.html", "rolling_stone_500_albums_2023_draft.html", "nme_500_albums_draft.html", "1001_albums_you_must_hear_before_you_die_draft.html"}
+    protected_topster_pages = {"grid.html", "ranked_grid.html", "draft_grid.html", "draft_checklist.html", "rolling_stone_500_albums_2003_draft.html", "rolling_stone_500_albums_2012_draft.html", "rolling_stone_500_albums_2020_draft.html", "rolling_stone_500_albums_2023_draft.html", "nme_500_albums_draft.html", "1001_albums_you_must_hear_before_you_die_draft.html", "rate_your_music_draft.html"}
 
     if filename in protected_topster_pages and not is_topster_admin():
         if topster_admin_password_is_configured():
