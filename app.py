@@ -258,6 +258,16 @@ def read_env_file_value(name: str) -> str:
     return ""
 
 
+def get_topster_admin_username() -> str:
+    # Existing deployments only had TOPSTER_ADMIN_PASSWORD. The username therefore
+    # defaults to "admin" unless TOPSTER_ADMIN_USERNAME is configured explicitly.
+    return normalize_secret_text(
+        os.getenv("TOPSTER_ADMIN_USERNAME")
+        or read_env_file_value("TOPSTER_ADMIN_USERNAME")
+        or "admin"
+    ) or "admin"
+
+
 def get_topster_admin_password() -> str:
     return normalize_secret_text(os.getenv("TOPSTER_ADMIN_PASSWORD") or read_env_file_value("TOPSTER_ADMIN_PASSWORD"))
 
@@ -271,6 +281,26 @@ def submitted_topster_password_is_valid(submitted_password: str) -> bool:
     if not configured_password:
         return False
     return hmac.compare_digest(normalize_secret_text(submitted_password), configured_password)
+
+
+def submitted_topster_credentials_are_valid(submitted_username: str, submitted_password: str) -> bool:
+    username_valid = hmac.compare_digest(
+        normalize_secret_text(submitted_username),
+        get_topster_admin_username(),
+    )
+    password_valid = submitted_topster_password_is_valid(submitted_password)
+    return username_valid and password_valid
+
+
+def is_topster_admin_protected_page(filename: str) -> bool:
+    name = str(filename or "").strip().lower()
+    if name in {"hub.html", "grid.html", "ranked_grid.html", "draft_album_list.html"}:
+        return True
+    if name.startswith("draft_") and name.endswith(".html"):
+        return True
+    if name.endswith("_draft.html"):
+        return True
+    return False
 
 
 app = Flask(__name__, static_folder=str(BASE_DIR), static_url_path="")
@@ -437,6 +467,7 @@ def forget_topster_admin_device(response: Any) -> Any:
             pass
 
     session.pop("topster_admin", None)
+    session.pop("topster_admin_username", None)
     session.pop("topster_admin_device_id", None)
     response.delete_cookie(
         TOPSTER_ADMIN_DEVICE_COOKIE_NAME,
@@ -460,7 +491,7 @@ def redirect_topster_frontend_page(filename: str):
     """
     Prevent the backend/API domain from serving stale copies of the static Topster
     pages. The canonical Topster UI lives in navincitron-website.
-    Local Flask development can still serve a local copy if it exists.
+    Protected draft/grid/admin pages require an authenticated admin session.
     """
 
     if is_local_request() and (BASE_DIR / filename).exists():
@@ -469,7 +500,18 @@ def redirect_topster_frontend_page(filename: str):
     target = FRONTEND_ORIGIN.rstrip("/") + "/" + filename
     if request.query_string:
         target += "?" + request.query_string.decode("utf-8", errors="ignore")
+
+    if is_topster_admin_protected_page(filename) and not is_topster_admin():
+        if topster_admin_password_is_configured():
+            return redirect("/topster-admin-login?next=" + quote_plus(target))
+        return "Admin access is locked because TOPSTER_ADMIN_PASSWORD is not configured.", 403
+
     return redirect(target, code=302)
+
+
+@app.route("/hub.html")
+def redirect_hub_html():
+    return redirect_topster_frontend_page("hub.html")
 
 
 @app.route("/grid.html")
@@ -926,6 +968,7 @@ def topster_admin_login():
     next_url = safe_frontend_redirect_url(request.values.get("next"))
 
     if request.method == "POST":
+        submitted_username = request.form.get("username", "")
         submitted_password = request.form.get("password", "")
         if not is_admin_ip_allowed():
             return "Topster admin login is not allowed from this IP address.", 403
@@ -934,11 +977,12 @@ def topster_admin_login():
                 "Topster admin password is not configured on the live backend. "
                 "Set TOPSTER_ADMIN_PASSWORD in the backend hosting environment and restart/redeploy the service."
             ), 500
-        if submitted_topster_password_is_valid(submitted_password):
+        if submitted_topster_credentials_are_valid(submitted_username, submitted_password):
             session.permanent = True
             session["topster_admin"] = True
+            session["topster_admin_username"] = get_topster_admin_username()
             return remember_topster_admin_device(redirect(next_url))
-        return "Invalid Topster admin password.", 403
+        return "Invalid admin username or password.", 403
 
     if is_topster_admin():
         return redirect(next_url)
@@ -951,7 +995,7 @@ def topster_admin_login():
     <head>
         <meta charset=\"utf-8\">
         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-        <title>Topster Admin Login</title>
+        <title>Navincitron Admin Login</title>
         <style>
             body {{ background:#333; color:#fff; font-family:Arial,sans-serif; display:grid; place-items:center; min-height:100vh; margin:0; }}
             form {{ background:#444; border-radius:10px; padding:24px; width:min(420px, calc(100vw - 32px)); }}
@@ -961,12 +1005,14 @@ def topster_admin_login():
     </head>
     <body>
         <form method=\"post\">
-            <h1>Topster Admin Login</h1>
-            <p>Only the host/admin computer can edit Grid, Ranked Grid, Draft Grid, and Checklist pages.</p>
+            <h1>Navincitron Admin Login</h1>
+            <p>Admin authentication is required for the Admin Hub and all draft/grid pages.</p>
             {"<p style='color:#ffcf85;font-weight:bold;'>Admin password is not configured on this backend.</p>" if not topster_admin_password_is_configured() else ""}
             <input type=\"hidden\" name=\"next\" value=\"{escaped_next}\">
-            <label for=\"password\">Password</label>
-            <input id=\"password\" name=\"password\" type=\"password\" autofocus required>
+            <label for=\"username\">Admin username</label>
+            <input id=\"username\" name=\"username\" type=\"text\" autocomplete=\"username\" autofocus required>
+            <label for=\"password\">Admin password</label>
+            <input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required>
             <button type=\"submit\">Log in</button>
         </form>
     </body>
@@ -3517,9 +3563,7 @@ def root():
 
 @app.route("/<path:filename>")
 def static_files(filename: str):
-    protected_topster_pages = {"grid.html", "ranked_grid.html", "draft_grid.html", "draft_checklist.html", "rolling_stone_500_albums_2003_draft.html", "rolling_stone_500_albums_2012_draft.html", "rolling_stone_500_albums_2020_draft.html", "rolling_stone_500_albums_2023_draft.html", "nme_500_albums_draft.html", "1001_albums_you_must_hear_before_you_die_draft.html", "rate_your_music_draft.html", "rolling_stone_greatest_singers_of_all_time_2023_draft.html"}
-
-    if filename in protected_topster_pages and not is_topster_admin():
+    if is_topster_admin_protected_page(filename) and not is_topster_admin():
         if topster_admin_password_is_configured():
             return redirect("/topster-admin-login")
         return "Topster editor access is restricted to the host computer.", 403
