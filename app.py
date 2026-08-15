@@ -294,7 +294,7 @@ def submitted_topster_credentials_are_valid(submitted_username: str, submitted_p
 
 def is_topster_admin_protected_page(filename: str) -> bool:
     name = str(filename or "").strip().lower()
-    if name in {"hub.html", "grid.html", "ranked_grid.html", "draft_album_list.html"}:
+    if name in {"hub.html", "grid.html", "ranked_grid.html", "draft_album_list.html", "lyrics.html"}:
         return True
     if name.startswith("draft_") and name.endswith(".html"):
         return True
@@ -512,6 +512,11 @@ def redirect_topster_frontend_page(filename: str):
 @app.route("/hub.html")
 def redirect_hub_html():
     return redirect_topster_frontend_page("hub.html")
+
+
+@app.route("/lyrics.html")
+def redirect_lyrics_html():
+    return redirect_topster_frontend_page("lyrics.html")
 
 
 @app.route("/grid.html")
@@ -1006,7 +1011,7 @@ def topster_admin_login():
     <body>
         <form method=\"post\">
             <h1>Navincitron Admin Login</h1>
-            <p>Admin authentication is required for the Admin Hub and all draft/grid pages.</p>
+            <p>Admin authentication is required for the Admin Hub, Lyrics, and all draft/grid pages.</p>
             {"<p style='color:#ffcf85;font-weight:bold;'>Admin password is not configured on this backend.</p>" if not topster_admin_password_is_configured() else ""}
             <input type=\"hidden\" name=\"next\" value=\"{escaped_next}\">
             <label for=\"username\">Admin username</label>
