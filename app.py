@@ -66,6 +66,13 @@ TOPSTER_SOURCE_TEXT_FILE = BASE_DIR / "topster_source_text.json"
 TOPSTER_REDIS_KEY_PREFIX = os.getenv("TOPSTER_REDIS_KEY_PREFIX", "navincitron:topster").strip() or "navincitron:topster"
 TOPSTER_REDIS_CLIENT: Any | None = None
 TOPSTER_REDIS_CLIENT_ERROR = ""
+DISCOGS_COLLECTION_USERNAME = (os.getenv("DISCOGS_COLLECTION_USERNAME", "NNavincitron").strip() or "NNavincitron")
+DISCOGS_COLLECTION_MEMORY_CACHE: dict[str, Any] = {}
+try:
+    DISCOGS_COLLECTION_CACHE_SECONDS = max(60, int(os.getenv("DISCOGS_COLLECTION_CACHE_SECONDS", "1800") or 1800))
+except (TypeError, ValueError):
+    DISCOGS_COLLECTION_CACHE_SECONDS = 1800
+
 
 SCOPE = (
     "user-read-playback-state "
@@ -639,11 +646,6 @@ def redirect_rolling_stone_greatest_singers_2023_list_html():
     return redirect_topster_frontend_page("rolling_stone_greatest_singers_of_all_time_2023_list.html")
 
 
-@app.route("/lyrics.html")
-def redirect_lyrics_html():
-    return redirect_topster_frontend_page("lyrics.html")
-
-
 def is_allowed_frontend_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -966,6 +968,193 @@ def normalize_topster_settings(value: Any) -> dict[str, Any]:
         "desktop": desktop_settings,
         "mobile": mobile_settings,
     }
+
+
+def get_discogs_token() -> str:
+    return normalize_secret_text(os.getenv("DISCOGS_TOKEN") or read_env_file_value("DISCOGS_TOKEN") or "")
+
+
+def discogs_collection_redis_key(username: str) -> str:
+    safe_username = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(username or DISCOGS_COLLECTION_USERNAME))
+    return f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:discogs-collection:{safe_username}"
+
+
+def read_discogs_collection_cache(username: str) -> dict[str, Any] | None:
+    now = time.time()
+    memory = DISCOGS_COLLECTION_MEMORY_CACHE.get(username)
+    if isinstance(memory, dict) and (now - float(memory.get("cachedAtEpoch", 0))) < DISCOGS_COLLECTION_CACHE_SECONDS:
+        return memory.get("payload") if isinstance(memory.get("payload"), dict) else None
+
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                raw = client.get(discogs_collection_redis_key(username))
+                if raw:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        DISCOGS_COLLECTION_MEMORY_CACHE[username] = {
+                            "cachedAtEpoch": now,
+                            "payload": parsed,
+                        }
+                        return parsed
+        except Exception:
+            pass
+
+    return None
+
+
+def write_discogs_collection_cache(username: str, payload: dict[str, Any]) -> None:
+    now = time.time()
+    DISCOGS_COLLECTION_MEMORY_CACHE[username] = {
+        "cachedAtEpoch": now,
+        "payload": payload,
+    }
+
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                client.setex(
+                    discogs_collection_redis_key(username),
+                    DISCOGS_COLLECTION_CACHE_SECONDS,
+                    json.dumps(payload, ensure_ascii=False),
+                )
+        except Exception:
+            pass
+
+
+def fetch_discogs_collection_page(username: str, page: int, per_page: int = 100) -> dict[str, Any]:
+    params = urlencode({"page": max(1, int(page)), "per_page": min(100, max(1, int(per_page)))})
+    url = f"https://api.discogs.com/users/{quote_plus(username)}/collection/folders/0/releases?{params}"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Navincitron/1.0 +https://www.navincitron.com",
+    }
+    token = get_discogs_token()
+    if token:
+        headers["Authorization"] = f"Discogs token={token}"
+
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            with urlopen(Request(url, headers=headers), timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            if not isinstance(payload, dict):
+                raise RuntimeError("Discogs returned an invalid collection response.")
+            return payload
+        except HTTPError as error:
+            last_error = error
+            if error.code == 429 and attempt == 0:
+                retry_after = error.headers.get("Retry-After", "2") if error.headers else "2"
+                try:
+                    wait_seconds = min(8.0, max(1.0, float(retry_after)))
+                except (TypeError, ValueError):
+                    wait_seconds = 2.0
+                time.sleep(wait_seconds)
+                continue
+            if error.code in {401, 403} and not token:
+                raise RuntimeError(
+                    "Discogs rejected the public collection request. Configure DISCOGS_TOKEN in Render for reliable authenticated collection access."
+                ) from error
+            raise RuntimeError(f"Discogs collection request failed with HTTP {error.code}.") from error
+        except (URLError, TimeoutError, json.JSONDecodeError) as error:
+            last_error = error
+            if attempt == 0:
+                time.sleep(1.0)
+                continue
+            break
+
+    raise RuntimeError(f"Discogs collection request failed: {last_error}")
+
+
+def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
+    first = fetch_discogs_collection_page(username, 1, 100)
+    pagination = first.get("pagination") if isinstance(first.get("pagination"), dict) else {}
+    total_pages = max(1, int(pagination.get("pages") or 1))
+    total_items = max(0, int(pagination.get("items") or 0))
+    total_pages = min(total_pages, 100)
+
+    releases: list[dict[str, Any]] = []
+    first_releases = first.get("releases")
+    if isinstance(first_releases, list):
+        releases.extend(item for item in first_releases if isinstance(item, dict))
+
+    for page in range(2, total_pages + 1):
+        payload = fetch_discogs_collection_page(username, page, 100)
+        page_releases = payload.get("releases")
+        if isinstance(page_releases, list):
+            releases.extend(item for item in page_releases if isinstance(item, dict))
+
+    unique: dict[str, dict[str, Any]] = {}
+    for item in releases:
+        basic = item.get("basic_information") if isinstance(item.get("basic_information"), dict) else {}
+        title = str(basic.get("title") or "").strip()
+        if not title:
+            continue
+
+        artist_names: list[str] = []
+        raw_artists = basic.get("artists")
+        if isinstance(raw_artists, list):
+            for artist in raw_artists:
+                if not isinstance(artist, dict):
+                    continue
+                name = str(artist.get("name") or "").strip()
+                if name:
+                    artist_names.append(name)
+
+        release_id = basic.get("id") or item.get("id")
+        master_id = basic.get("master_id")
+        year = basic.get("year")
+        key = f"{' | '.join(artist_names).casefold()}::{title.casefold()}"
+        if key in unique:
+            continue
+
+        unique[key] = {
+            "artist": ", ".join(artist_names),
+            "artists": artist_names,
+            "title": title,
+            "year": int(year) if str(year or "").isdigit() else None,
+            "releaseId": int(release_id) if str(release_id or "").isdigit() else None,
+            "masterId": int(master_id) if str(master_id or "").isdigit() and int(master_id) > 0 else None,
+        }
+
+    payload = {
+        "ok": True,
+        "username": username,
+        "itemCount": total_items or len(releases),
+        "uniqueAlbumCount": len(unique),
+        "albums": list(unique.values()),
+        "cachedSeconds": DISCOGS_COLLECTION_CACHE_SECONDS,
+        "authenticatedToDiscogs": bool(get_discogs_token()),
+    }
+    return payload
+
+
+@app.route("/api/discogs-collection", methods=["GET"])
+def api_discogs_collection():
+    username = str(request.args.get("username") or DISCOGS_COLLECTION_USERNAME).strip() or DISCOGS_COLLECTION_USERNAME
+    if username.casefold() != DISCOGS_COLLECTION_USERNAME.casefold():
+        return jsonify({"ok": False, "error": "Only the configured Navincitron Discogs collection is available."}), 400
+
+    force_refresh = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes"}
+    if not force_refresh:
+        cached = read_discogs_collection_cache(username)
+        if cached:
+            return jsonify(cached)
+
+    try:
+        payload = fetch_full_discogs_collection(username)
+        write_discogs_collection_cache(username, payload)
+        return jsonify(payload)
+    except Exception as error:
+        cached = read_discogs_collection_cache(username)
+        if cached:
+            cached = dict(cached)
+            cached["stale"] = True
+            cached["warning"] = str(error)
+            return jsonify(cached)
+        return jsonify({"ok": False, "error": str(error)}), 502
 
 
 @app.route("/topster-admin-login", methods=["GET", "POST"])
