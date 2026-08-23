@@ -109,7 +109,7 @@ TOPSTER_ADMIN_ALLOWED_IPS = {
     if item.strip()
 }
 
-TOPSTER_STORE_KEYS = {"grid", "ranked", "draft", "checklist", "rolling_stone_500_albums_2003", "rolling_stone_500_albums_2012", "rolling_stone_500_albums_2020", "rolling_stone_500_albums_2023", "nme_500_albums", "1001_albums_you_must_hear_before_you_die", "rate_your_music", "rolling_stone_greatest_singers_of_all_time_2023"}
+TOPSTER_STORE_KEYS = {"grid", "ranked", "draft", "checklist", "rolling_stone_500_albums_2003", "rolling_stone_500_albums_2012", "rolling_stone_500_albums_2020", "rolling_stone_500_albums_2023", "nme_500_albums", "1001_albums_you_must_hear_before_you_die", "rate_your_music", "rolling_stone_greatest_singers_of_all_time_2008", "rolling_stone_greatest_singers_of_all_time_2023"}
 TOPSTER_STORE_ALIASES = {
     "grid": "grid",
     "grid-file": "grid",
@@ -163,6 +163,11 @@ TOPSTER_STORE_ALIASES = {
     "rate-your-music-chart": "rate_your_music",
     "rate_your_music_draft": "rate_your_music",
     "rate_your_music_list": "rate_your_music",
+    "rolling_stone_greatest_singers_of_all_time_2008": "rolling_stone_greatest_singers_of_all_time_2008",
+    "rolling-stone-greatest-singers-of-all-time-2008": "rolling_stone_greatest_singers_of_all_time_2008",
+    "rolling-stone-greatest-singers-of-all-time-2008-file": "rolling_stone_greatest_singers_of_all_time_2008",
+    "rolling_stone_greatest_singers_of_all_time_2008_draft": "rolling_stone_greatest_singers_of_all_time_2008",
+    "rolling_stone_greatest_singers_of_all_time_2008_list": "rolling_stone_greatest_singers_of_all_time_2008",
     "rolling_stone_greatest_singers_of_all_time_2023": "rolling_stone_greatest_singers_of_all_time_2023",
     "rolling-stone-greatest-singers-of-all-time-2023": "rolling_stone_greatest_singers_of_all_time_2023",
     "rolling-stone-greatest-singers-of-all-time-2023-file": "rolling_stone_greatest_singers_of_all_time_2023",
@@ -202,6 +207,7 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
             "nme_500_albums": data.get("nme_500_albums") if isinstance(data.get("nme_500_albums"), dict) else {},
             "1001_albums_you_must_hear_before_you_die": data.get("1001_albums_you_must_hear_before_you_die") if isinstance(data.get("1001_albums_you_must_hear_before_you_die"), dict) else {},
             "rate_your_music": data.get("rate_your_music") if isinstance(data.get("rate_your_music"), dict) else {},
+            "rolling_stone_greatest_singers_of_all_time_2008": data.get("rolling_stone_greatest_singers_of_all_time_2008") if isinstance(data.get("rolling_stone_greatest_singers_of_all_time_2008"), dict) else {},
             "rolling_stone_greatest_singers_of_all_time_2023": data.get("rolling_stone_greatest_singers_of_all_time_2023") if isinstance(data.get("rolling_stone_greatest_singers_of_all_time_2023"), dict) else {},
         }
 
@@ -220,6 +226,7 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
         "nme_500_albums": {},
         "1001_albums_you_must_hear_before_you_die": {},
         "rate_your_music": {},
+        "rolling_stone_greatest_singers_of_all_time_2008": {},
         "rolling_stone_greatest_singers_of_all_time_2023": {},
     }
 
@@ -634,6 +641,16 @@ def redirect_rate_your_music_draft_html():
 @app.route("/rate_your_music_list.html")
 def redirect_rate_your_music_list_html():
     return redirect_topster_frontend_page("rate_your_music_list.html")
+
+
+@app.route("/rolling_stone_greatest_singers_of_all_time_2008_draft.html")
+def redirect_rolling_stone_greatest_singers_2008_draft_html():
+    return redirect_topster_frontend_page("rolling_stone_greatest_singers_of_all_time_2008_draft.html")
+
+
+@app.route("/rolling_stone_greatest_singers_of_all_time_2008_list.html")
+def redirect_rolling_stone_greatest_singers_2008_list_html():
+    return redirect_topster_frontend_page("rolling_stone_greatest_singers_of_all_time_2008_list.html")
 
 
 @app.route("/rolling_stone_greatest_singers_of_all_time_2023_draft.html")
@@ -1155,6 +1172,100 @@ def api_discogs_collection():
             cached["warning"] = str(error)
             return jsonify(cached)
         return jsonify({"ok": False, "error": str(error)}), 502
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify({"ok": True, "service": "navincitron-sampler"}), 200
+
+
+MUSICBRAINZ_ASSOCIATED_ACTS_CACHE: dict[str, list[str]] = {}
+
+
+def normalize_musicbrainz_artist_name(value: str) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", "", text.casefold())
+
+
+def fetch_musicbrainz_associated_acts(name: str) -> list[str]:
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        return []
+
+    cache_key = normalize_musicbrainz_artist_name(clean_name)
+    if cache_key in MUSICBRAINZ_ASSOCIATED_ACTS_CACHE:
+        return MUSICBRAINZ_ASSOCIATED_ACTS_CACHE[cache_key]
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Navincitron/1.0 (https://www.navincitron.com)",
+    }
+    search_params = urlencode({
+        "query": f'artist:"{clean_name.replace(chr(34), "")}"',
+        "fmt": "json",
+        "limit": 8,
+    })
+    search_url = f"https://musicbrainz.org/ws/2/artist/?{search_params}"
+
+    with urlopen(Request(search_url, headers=headers), timeout=15) as response:
+        search_payload = json.loads(response.read().decode("utf-8", errors="replace"))
+
+    artists = search_payload.get("artists") if isinstance(search_payload, dict) else []
+    if not isinstance(artists, list) or not artists:
+        MUSICBRAINZ_ASSOCIATED_ACTS_CACHE[cache_key] = []
+        return []
+
+    target_key = normalize_musicbrainz_artist_name(clean_name)
+    selected = next(
+        (item for item in artists if isinstance(item, dict) and normalize_musicbrainz_artist_name(item.get("name", "")) == target_key),
+        artists[0],
+    )
+    artist_id = selected.get("id") if isinstance(selected, dict) else None
+    if not artist_id:
+        MUSICBRAINZ_ASSOCIATED_ACTS_CACHE[cache_key] = []
+        return []
+
+    detail_url = f"https://musicbrainz.org/ws/2/artist/{quote_plus(str(artist_id))}?inc=artist-rels&fmt=json"
+    time.sleep(1.05)  # Respect MusicBrainz's public API request-rate guidance.
+    with urlopen(Request(detail_url, headers=headers), timeout=15) as response:
+        detail = json.loads(response.read().decode("utf-8", errors="replace"))
+
+    acts: list[str] = []
+    relations = detail.get("relations") if isinstance(detail, dict) else []
+    if isinstance(relations, list):
+        for relation in relations:
+            if not isinstance(relation, dict):
+                continue
+            target = relation.get("artist") if isinstance(relation.get("artist"), dict) else None
+            if not target:
+                continue
+            relation_type = str(relation.get("type") or "").casefold()
+            target_type = str(target.get("type") or "").casefold()
+            # Membership/collaboration relations to groups are the useful cases
+            # for artist-image alternatives. Avoid unrelated person-to-person links.
+            if "member of band" not in relation_type and target_type != "group":
+                continue
+            act_name = str(target.get("name") or "").strip()
+            if act_name and normalize_musicbrainz_artist_name(act_name) != target_key and act_name not in acts:
+                acts.append(act_name)
+            if len(acts) >= 12:
+                break
+
+    MUSICBRAINZ_ASSOCIATED_ACTS_CACHE[cache_key] = acts
+    return acts
+
+
+@app.route("/api/musicbrainz-artist-acts", methods=["GET"])
+def api_musicbrainz_artist_acts():
+    name = str(request.args.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "Artist name is required."}), 400
+    try:
+        acts = fetch_musicbrainz_associated_acts(name)
+        return jsonify({"ok": True, "name": name, "acts": acts})
+    except Exception as error:
+        return jsonify({"ok": False, "name": name, "acts": [], "error": str(error)}), 502
 
 
 @app.route("/topster-admin-login", methods=["GET", "POST"])
