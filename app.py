@@ -23,6 +23,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+import requests
+
 from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, request, send_from_directory, session
 from flask_cors import CORS
@@ -2078,13 +2080,156 @@ def _genius_comments_payload_from_request(request_obj: Request, error_prefix: st
     return payload
 
 
+def _genius_public_browser_headers() -> dict[str, str]:
+    """Browser-like headers for Genius's internal genius.com/api endpoints.
+
+    Genius frequently challenges generic/VPS HTTP clients. Keep this profile close
+    to a normal desktop browser and deliberately avoid the custom Navincitron bot UA
+    used for the documented api.genius.com developer endpoints.
+    """
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip",
+        "Connection": "keep-alive",
+    }
+
+
+def _genius_cached_song_url(song_id: int) -> str:
+    """Recover the canonical Genius song URL already resolved for lyrics.html."""
+    with GENIUS_LOOKUP_CACHE_LOCK:
+        for cached in GENIUS_LOOKUP_CACHE.values():
+            if not isinstance(cached, dict):
+                continue
+            value = cached.get("value")
+            if not isinstance(value, dict):
+                continue
+            try:
+                cached_id = int(value.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if cached_id == int(song_id):
+                url = str(value.get("url") or "").strip()
+                if url.startswith("https://genius.com/"):
+                    return url
+    return f"https://genius.com/songs/{int(song_id)}"
+
+
+def _genius_comments_payload_from_requests_response(response: Any, error_prefix: str) -> dict[str, Any]:
+    if response.status_code >= 400:
+        detail = f"{error_prefix} HTTP {response.status_code}."
+        # Preserve a useful distinction when Genius/Cloudflare serves an anti-bot page.
+        body = str(response.text or "")[:1200].lower()
+        if response.status_code == 403 and any(token in body for token in ("captcha", "make sure you're a human", "cloudflare")):
+            detail += " Genius returned an anti-bot/CAPTCHA response."
+        raise RuntimeError(detail)
+
+    try:
+        payload = response.json()
+    except Exception as error:
+        raise RuntimeError(f"{error_prefix}: Genius returned non-JSON data.") from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{error_prefix}: Genius returned an invalid JSON response.")
+
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        status = int(meta.get("status") or 0)
+        if status and status >= 400:
+            message = str(meta.get("message") or "Genius comments request failed.").strip()
+            raise RuntimeError(f"{error_prefix}: API status {status}: {message}")
+    return payload
+
+
+def _genius_public_comments_browser_session(song_id: int, params: dict[str, Any]) -> dict[str, Any]:
+    """Try Genius's browser-facing comments API using a cookie-bearing browser session.
+
+    The public endpoint is what Genius/LyricsGenius uses for song comments. A first
+    page visit lets Genius set any ordinary cookies before the API request, and the
+    second request carries an actual song-page Referer plus same-origin fetch hints.
+    """
+    session_http = requests.Session()
+    document_headers = _genius_public_browser_headers()
+    song_url = _genius_cached_song_url(song_id)
+    referer = song_url
+
+    try:
+        warm_response = session_http.get(
+            song_url,
+            headers=document_headers,
+            timeout=12,
+            allow_redirects=True,
+        )
+        if warm_response.url and str(warm_response.url).startswith("https://genius.com/"):
+            referer = str(warm_response.url)
+    except requests.RequestException:
+        # Warming is helpful but not mandatory; still attempt the internal API.
+        pass
+
+    api_headers = dict(document_headers)
+    api_headers.update(
+        {
+            "Referer": referer,
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+    )
+
+    # First use the same plain format expected by the existing parser.
+    response = session_http.get(
+        f"https://genius.com/api/songs/{int(song_id)}/comments",
+        params=params,
+        headers=api_headers,
+        timeout=12,
+    )
+    if response.status_code < 400:
+        return _genius_comments_payload_from_requests_response(
+            response,
+            "Genius browser-session comments request failed with",
+        )
+
+    first_error = None
+    try:
+        _genius_comments_payload_from_requests_response(
+            response,
+            "Genius browser-session comments request failed with",
+        )
+    except Exception as error:
+        first_error = error
+
+    # Genius's own historical comments requests commonly use html,markdown. Try
+    # that response format as a final compatibility fallback before giving up.
+    alternate_params = dict(params)
+    alternate_params["text_format"] = "html,markdown"
+    alternate_response = session_http.get(
+        f"https://genius.com/api/songs/{int(song_id)}/comments",
+        params=alternate_params,
+        headers=api_headers,
+        timeout=12,
+    )
+    try:
+        return _genius_comments_payload_from_requests_response(
+            alternate_response,
+            "Genius browser-session alternate-format comments request failed with",
+        )
+    except Exception as alternate_error:
+        if first_error:
+            raise RuntimeError(f"{first_error} {alternate_error}") from alternate_error
+        raise
+
+
 def genius_comments_page_request(song_id: int, page: int, per_page: int = GENIUS_COMMENTS_PER_PAGE) -> dict[str, Any]:
     """Fetch one comments page using the best currently available Genius route.
 
     Genius OAuth is validated separately with /account. In practice Genius may
-    still return HTTP 403 specifically for /songs/{id}/comments even when the
-    user token is valid. A comments-only 403 must therefore NOT erase the saved
-    OAuth token or send the browser through an endless reconnect loop.
+    return HTTP 403 specifically for /songs/{id}/comments even when the user token
+    is valid. A comments-only 403 must therefore NOT erase the saved OAuth token.
     """
     params = {
         "per_page": max(1, min(50, int(per_page))),
@@ -2102,7 +2247,7 @@ def genius_comments_page_request(song_id: int, page: int, per_page: int = GENIUS
             headers={
                 "Accept": "application/json",
                 "Authorization": f"Bearer {user_token}",
-                "User-Agent": "NavincitronLyrics/1.4 (+https://www.navincitron.com)",
+                "User-Agent": "NavincitronLyrics/1.5 (+https://www.navincitron.com)",
             },
         )
         try:
@@ -2113,15 +2258,14 @@ def genius_comments_page_request(song_id: int, page: int, per_page: int = GENIUS
         except Exception as error:
             errors.append(str(error))
 
-        # Genius also supports access_token as a GET query parameter. This is
-        # useful because some Genius endpoints/proxies have historically treated
-        # Authorization headers differently from query-string authentication.
+        # Historical Genius clients have sometimes behaved differently with an
+        # access_token query parameter, so retain this compatibility attempt.
         query_with_token = urlencode({**params, "access_token": user_token})
         token_query_request = Request(
             f"https://api.genius.com/songs/{int(song_id)}/comments?{query_with_token}",
             headers={
                 "Accept": "application/json",
-                "User-Agent": "NavincitronLyrics/1.4 (+https://www.navincitron.com)",
+                "User-Agent": "NavincitronLyrics/1.5 (+https://www.navincitron.com)",
             },
         )
         try:
@@ -2132,29 +2276,27 @@ def genius_comments_page_request(song_id: int, page: int, per_page: int = GENIUS
         except Exception as error:
             errors.append(str(error))
 
-    # Genius's own site exposes comments from genius.com/api. This route does not
-    # require an API token, but hosted-server IPs can be challenged by Genius.
-    # Use a normal browser request profile rather than the former bot-style UA.
+    # Genius's internal site API is where song comments are normally exposed.
+    # First retry it with a minimal browser document profile, without the former
+    # custom bot UA / X-Requested-With combination.
     public_query = urlencode(params)
     public_request = Request(
         f"https://genius.com/api/songs/{int(song_id)}/comments?{public_query}",
-        headers={
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": f"https://genius.com/songs/{int(song_id)}",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/140.0.0.0 Safari/537.36"
-            ),
-            "X-Requested-With": "XMLHttpRequest",
-        },
+        headers=_genius_public_browser_headers(),
     )
     try:
         return _genius_comments_payload_from_request(
             public_request,
-            "Genius public comments request failed with",
+            "Genius public browser-profile comments request failed with",
         )
+    except Exception as error:
+        errors.append(str(error))
+
+    # Final Render/VPS compatibility attempt: establish a normal Genius browsing
+    # session first, retain cookies, then call the same-origin internal API with
+    # the real song-page Referer and browser fetch metadata.
+    try:
+        return _genius_public_comments_browser_session(song_id, params)
     except Exception as error:
         errors.append(str(error))
 
@@ -2164,11 +2306,11 @@ def genius_comments_page_request(song_id: int, page: int, per_page: int = GENIUS
         )
 
     # The OAuth token was already proven valid against /account during callback.
-    # Do not clear it merely because the comments endpoint itself returned 403.
-    detail = " ".join(errors[-3:])
+    # Do not clear it merely because the comments resource itself returned 403.
+    detail = " ".join(errors[-4:])
     raise GeniusCommentsEndpointUnavailable(
-        "Genius login is connected, but Genius is refusing the song-comments "
-        "resource from the backend. " + detail
+        "Genius login is connected, but Genius is still refusing the song-comments "
+        "resource after OAuth and browser-session fallbacks. " + detail
     )
 
 
