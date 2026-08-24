@@ -1832,6 +1832,104 @@ GENIUS_COMMENTS_CACHE_LOCK = threading.Lock()
 GENIUS_COMMENTS_TTL_SECONDS = 15 * 60
 GENIUS_COMMENTS_MAX_PAGES = 100
 GENIUS_COMMENTS_PER_PAGE = 50
+GENIUS_USER_AUTH_REDIS_KEY_PREFIX = (
+    os.getenv("GENIUS_USER_AUTH_REDIS_KEY_PREFIX", "navincitron:genius-user-auth").strip(":")
+    or "navincitron:genius-user-auth"
+)
+GENIUS_OAUTH_SCOPE = (os.getenv("GENIUS_OAUTH_SCOPE", "me").strip() or "me")
+
+
+class GeniusUserAuthorizationRequired(RuntimeError):
+    """A Genius user OAuth grant is missing, expired, or no longer accepted."""
+
+
+def get_genius_client_id() -> str:
+    return normalize_secret_text(
+        os.getenv("GENIUS_CLIENT_ID")
+        or os.getenv("GENIUS_OAUTH_CLIENT_ID")
+        or ""
+    )
+
+
+def get_genius_client_secret() -> str:
+    return normalize_secret_text(
+        os.getenv("GENIUS_CLIENT_SECRET")
+        or os.getenv("GENIUS_OAUTH_CLIENT_SECRET")
+        or ""
+    )
+
+
+def get_genius_redirect_uri() -> str:
+    # Production Genius OAuth must redirect back to the public Render backend.
+    # Keep this configurable so localhost can still use a separate Genius client.
+    return normalize_secret_text(
+        os.getenv("GENIUS_REDIRECT_URI")
+        or os.getenv("GENIUS_OAUTH_REDIRECT_URI")
+        or "https://api.navincitron.com/genius/callback"
+    )
+
+
+def genius_oauth_is_configured() -> bool:
+    return bool(get_genius_client_id() and get_genius_client_secret() and get_genius_redirect_uri())
+
+
+def genius_user_auth_redis_key(device_id: str) -> str:
+    digest = hashlib.sha256(device_id.encode("utf-8", errors="ignore")).hexdigest()
+    return f"{GENIUS_USER_AUTH_REDIS_KEY_PREFIX}:{digest}"
+
+
+def load_genius_user_access_token() -> str:
+    device_id = get_spotify_device_id(create=False)
+
+    # Prefer Redis so the user token survives Render restarts without depending
+    # solely on Flask's signed session cookie. The session copy remains a fallback.
+    if device_id and topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                raw = client.get(genius_user_auth_redis_key(device_id))
+                token = normalize_secret_text(raw)
+                if token:
+                    client.expire(genius_user_auth_redis_key(device_id), SPOTIFY_DEVICE_SESSION_SECONDS)
+                    return token
+        except Exception:
+            pass
+
+    return normalize_secret_text(session.get("genius_user_access_token") or "")
+
+
+def save_genius_user_access_token(access_token: str, device_id: str | None = None) -> None:
+    token = normalize_secret_text(access_token)
+    if not token:
+        raise RuntimeError("Genius returned an invalid user access token.")
+
+    session.permanent = True
+    session["genius_user_access_token"] = token
+    device_id = valid_spotify_device_id(device_id) or get_spotify_device_id(create=True)
+
+    if device_id and topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                client.setex(
+                    genius_user_auth_redis_key(device_id),
+                    SPOTIFY_DEVICE_SESSION_SECONDS,
+                    token,
+                )
+        except Exception:
+            pass
+
+
+def clear_genius_user_access_token() -> None:
+    device_id = get_spotify_device_id(create=False)
+    session.pop("genius_user_access_token", None)
+    if device_id and topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                client.delete(genius_user_auth_redis_key(device_id))
+        except Exception:
+            pass
 
 
 def get_genius_access_token() -> str:
@@ -1906,16 +2004,55 @@ def genius_song_request(song_id: int) -> dict[str, Any]:
     )
 
 
-def genius_comments_page_request(song_id: int, page: int, per_page: int = GENIUS_COMMENTS_PER_PAGE) -> dict[str, Any]:
-    """
-    Fetches one Genius song-comment page.
+def genius_user_json_request(url: str) -> dict[str, Any]:
+    access_token = load_genius_user_access_token()
+    if not access_token:
+        raise GeniusUserAuthorizationRequired(
+            "Connect your Genius account once to authorize song comments."
+        )
 
-    Genius exposes song comments through /songs/{id}/comments. Prefer the
-    authenticated api.genius.com route; some Genius client-access tokens may not
-    be entitled to this endpoint, so fall back to the browser/public API that
-    Genius itself uses. The fallback is deliberately best-effort because Genius
-    may apply anti-bot protection to hosted servers.
-    """
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "NavincitronLyrics/1.3 (+https://www.navincitron.com)",
+    }
+    genius_request = Request(url, headers=headers)
+
+    try:
+        with urlopen(genius_request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except HTTPError as error:
+        if error.code in {401, 403}:
+            clear_genius_user_access_token()
+            raise GeniusUserAuthorizationRequired(
+                f"Genius user authorization was rejected or expired (HTTP {error.code}). Reconnect Genius to load comments."
+            ) from error
+        raise RuntimeError(f"Genius comments API request failed with HTTP {error.code}.") from error
+    except URLError as error:
+        raise RuntimeError(f"Could not reach the Genius comments API: {error.reason}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Genius comments returned an unreadable JSON response.") from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("Genius comments returned an invalid JSON response.")
+
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        status = int(meta.get("status") or 0)
+        if status in {401, 403}:
+            clear_genius_user_access_token()
+            raise GeniusUserAuthorizationRequired(
+                f"Genius user authorization was rejected or expired (API status {status}). Reconnect Genius to load comments."
+            )
+        if status and status >= 400:
+            message = str(meta.get("message") or "Genius comments API request failed.").strip()
+            raise RuntimeError(f"Genius comments API error {status}: {message}")
+
+    return payload
+
+
+def genius_comments_page_request(song_id: int, page: int, per_page: int = GENIUS_COMMENTS_PER_PAGE) -> dict[str, Any]:
+    """Fetch one comments page using a Genius *user* OAuth token."""
     query = urlencode(
         {
             "per_page": max(1, min(50, int(per_page))),
@@ -1923,40 +2060,9 @@ def genius_comments_page_request(song_id: int, page: int, per_page: int = GENIUS
             "text_format": "plain",
         }
     )
-    official_error: Exception | None = None
-    try:
-        return genius_json_request(
-            f"https://api.genius.com/songs/{int(song_id)}/comments?{query}",
-            get_genius_access_token(),
-        )
-    except Exception as error:
-        official_error = error
-
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "NavincitronLyrics/1.2 (+https://www.navincitron.com)",
-        "Referer": f"https://genius.com/songs/{int(song_id)}",
-    }
-    public_request = Request(
-        f"https://genius.com/api/songs/{int(song_id)}/comments?{query}",
-        headers=headers,
+    return genius_user_json_request(
+        f"https://api.genius.com/songs/{int(song_id)}/comments?{query}"
     )
-    try:
-        with urlopen(public_request, timeout=12) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
-    except HTTPError as error:
-        detail = f"Genius comments request failed with HTTP {error.code}."
-        if official_error:
-            detail += f" Authenticated endpoint also failed: {official_error}"
-        raise RuntimeError(detail) from error
-    except URLError as error:
-        raise RuntimeError(f"Could not reach Genius comments: {error.reason}") from error
-    except json.JSONDecodeError as error:
-        raise RuntimeError("Genius comments returned an unreadable JSON response.") from error
-
-    if not isinstance(payload, dict):
-        raise RuntimeError("Genius comments returned an invalid JSON response.")
-    return payload
 
 
 def genius_comment_body(comment: dict[str, Any]) -> str:
@@ -2001,6 +2107,8 @@ def flatten_genius_comments(raw_comments: list[Any], depth: int = 0) -> list[dic
         if not isinstance(raw, dict):
             continue
         author = raw.get("author") if isinstance(raw.get("author"), dict) else {}
+        if not author and isinstance(raw.get("user"), dict):
+            author = raw.get("user")
         body = genius_comment_body(raw)
         comment_id = raw.get("id")
         votes_value = raw.get("votes_total")
@@ -2718,6 +2826,147 @@ def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
     return result
 
 
+def genius_oauth_login_url(state: str) -> str:
+    if not genius_oauth_is_configured():
+        raise RuntimeError(
+            "Genius OAuth is not configured. Add GENIUS_CLIENT_ID, GENIUS_CLIENT_SECRET, "
+            "and GENIUS_REDIRECT_URI to the Render environment."
+        )
+    query = urlencode(
+        {
+            "client_id": get_genius_client_id(),
+            "redirect_uri": get_genius_redirect_uri(),
+            "response_type": "code",
+            "scope": GENIUS_OAUTH_SCOPE,
+            "state": state,
+        }
+    )
+    return f"https://api.genius.com/oauth/authorize?{query}"
+
+
+def exchange_genius_oauth_code(code: str) -> str:
+    if not genius_oauth_is_configured():
+        raise RuntimeError("Genius OAuth client credentials are not configured.")
+
+    form = urlencode(
+        {
+            "code": code,
+            "client_id": get_genius_client_id(),
+            "client_secret": get_genius_client_secret(),
+            "redirect_uri": get_genius_redirect_uri(),
+            "response_type": "code",
+            "grant_type": "authorization_code",
+        }
+    ).encode("utf-8")
+    token_request = Request(
+        "https://api.genius.com/oauth/token",
+        data=form,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "NavincitronLyrics/1.3 (+https://www.navincitron.com)",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(token_request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except HTTPError as error:
+        raise RuntimeError(
+            f"Genius OAuth token exchange failed with HTTP {error.code}. "
+            "Confirm that GENIUS_REDIRECT_URI exactly matches the Redirect URI in the Genius API client."
+        ) from error
+    except URLError as error:
+        raise RuntimeError(f"Could not reach Genius OAuth: {error.reason}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Genius OAuth returned an unreadable token response.") from error
+
+    access_token = normalize_secret_text(payload.get("access_token") if isinstance(payload, dict) else "")
+    if not access_token:
+        error_text = str(payload.get("error_description") or payload.get("error") or "") if isinstance(payload, dict) else ""
+        raise RuntimeError(
+            "Genius OAuth did not return a user access token." + (f" {error_text}" if error_text else "")
+        )
+    return access_token
+
+
+@app.route("/genius/login")
+def genius_login():
+    # Genius user OAuth is needed only for comments. Song lookup and embeds keep
+    # using the server-side Client Access Token.
+    if not genius_oauth_is_configured():
+        return (
+            "Genius OAuth is not configured on Render. Add GENIUS_CLIENT_ID, "
+            "GENIUS_CLIENT_SECRET, and GENIUS_REDIRECT_URI, then redeploy.",
+            503,
+        )
+
+    session.permanent = True
+    device_id = get_spotify_device_id(create=True)
+    state = secrets.token_urlsafe(32)
+    session["genius_oauth_state"] = state
+    session["genius_oauth_next"] = safe_frontend_redirect_url(
+        request.args.get("next"),
+        "/lyrics.html",
+    )
+    response = redirect(genius_oauth_login_url(state))
+    return set_spotify_device_cookie(response, device_id)
+
+
+@app.route("/genius/callback")
+def genius_callback():
+    oauth_error = str(request.args.get("error") or "").strip()
+    if oauth_error:
+        description = str(request.args.get("error_description") or oauth_error).strip()
+        return f"Genius authorization was not completed: {description}", 400
+
+    supplied_state = normalize_secret_text(request.args.get("state") or "")
+    expected_state = normalize_secret_text(session.pop("genius_oauth_state", "") or "")
+    if not supplied_state or not expected_state or not hmac.compare_digest(supplied_state, expected_state):
+        return "Genius authorization failed: invalid OAuth state. Return to lyrics.html and try again.", 400
+
+    code = normalize_secret_text(request.args.get("code") or "")
+    if not code:
+        return "Genius authorization failed: missing authorization code.", 400
+
+    try:
+        access_token = exchange_genius_oauth_code(code)
+        device_id = get_spotify_device_id(create=True)
+        save_genius_user_access_token(access_token, device_id=device_id)
+
+        # Validate that this is a user-scoped token while we still have the OAuth
+        # callback context. The 'me' scope should permit /account.
+        try:
+            genius_user_json_request("https://api.genius.com/account")
+        except GeniusUserAuthorizationRequired as error:
+            clear_genius_user_access_token()
+            return f"Genius authorization completed, but the returned user token was rejected: {error}", 403
+    except Exception as error:
+        return f"Genius authorization failed: {error}", 502
+
+    next_url = session.pop(
+        "genius_oauth_next",
+        FRONTEND_ORIGIN.rstrip("/") + "/lyrics.html",
+    )
+    separator = "&" if "?" in next_url else "?"
+    response = redirect(next_url + separator + "genius=connected")
+    return set_spotify_device_cookie(response, device_id)
+
+
+@app.route("/api/genius-auth-status", methods=["GET"])
+def genius_auth_status():
+    response = jsonify(
+        {
+            "ok": True,
+            "configured": genius_oauth_is_configured(),
+            "authenticated": bool(load_genius_user_access_token()),
+            "loginUrl": "/genius/login?next=" + quote_plus(FRONTEND_ORIGIN.rstrip("/") + "/lyrics.html"),
+        }
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/api/lyrics/comments/<int:song_id>", methods=["GET"])
 def lyrics_song_comments(song_id: int):
     try:
@@ -2746,8 +2995,56 @@ def lyrics_song_comments(song_id: int):
     if song_id <= 0:
         return jsonify({"ok": False, "authenticated": True, "error": "Invalid Genius song ID."}), 400
 
+    if not genius_oauth_is_configured():
+        response = jsonify(
+            {
+                "ok": False,
+                "authenticated": True,
+                "geniusAuthorizationRequired": True,
+                "geniusOAuthConfigured": False,
+                "error": (
+                    "Genius comments need user OAuth. Add GENIUS_CLIENT_ID, GENIUS_CLIENT_SECRET, "
+                    "and GENIUS_REDIRECT_URI to the Render environment."
+                ),
+            }
+        )
+        response.status_code = 503
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    if not load_genius_user_access_token():
+        next_url = FRONTEND_ORIGIN.rstrip("/") + "/lyrics.html"
+        response = jsonify(
+            {
+                "ok": False,
+                "authenticated": True,
+                "geniusAuthorizationRequired": True,
+                "geniusOAuthConfigured": True,
+                "geniusLoginUrl": "/genius/login?next=" + quote_plus(next_url),
+                "error": "Connect your Genius account once to authorize song comments.",
+            }
+        )
+        response.status_code = 401
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     try:
         comments = get_all_genius_song_comments(song_id)
+    except GeniusUserAuthorizationRequired as error:
+        next_url = FRONTEND_ORIGIN.rstrip("/") + "/lyrics.html"
+        response = jsonify(
+            {
+                "ok": False,
+                "authenticated": True,
+                "geniusAuthorizationRequired": True,
+                "geniusOAuthConfigured": True,
+                "geniusLoginUrl": "/genius/login?next=" + quote_plus(next_url),
+                "error": str(error),
+            }
+        )
+        response.status_code = 401
+        response.headers["Cache-Control"] = "no-store"
+        return response
     except Exception as error:
         response = jsonify(
             {
