@@ -1843,6 +1843,10 @@ class GeniusUserAuthorizationRequired(RuntimeError):
     """A Genius user OAuth grant is missing, expired, or no longer accepted."""
 
 
+class GeniusCommentsEndpointUnavailable(RuntimeError):
+    """Genius accepted the user login, but did not serve the comments resource."""
+
+
 def get_genius_client_id() -> str:
     return normalize_secret_text(
         os.getenv("GENIUS_CLIENT_ID")
@@ -2051,17 +2055,120 @@ def genius_user_json_request(url: str) -> dict[str, Any]:
     return payload
 
 
+def _genius_comments_payload_from_request(request_obj: Request, error_prefix: str) -> dict[str, Any]:
+    try:
+        with urlopen(request_obj, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except HTTPError as error:
+        raise RuntimeError(f"{error_prefix} HTTP {error.code}.") from error
+    except URLError as error:
+        raise RuntimeError(f"{error_prefix}: {error.reason}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{error_prefix}: Genius returned unreadable JSON.") from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{error_prefix}: Genius returned an invalid response.")
+
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        status = int(meta.get("status") or 0)
+        if status and status >= 400:
+            message = str(meta.get("message") or "Genius comments request failed.").strip()
+            raise RuntimeError(f"{error_prefix}: API status {status}: {message}")
+    return payload
+
+
 def genius_comments_page_request(song_id: int, page: int, per_page: int = GENIUS_COMMENTS_PER_PAGE) -> dict[str, Any]:
-    """Fetch one comments page using a Genius *user* OAuth token."""
-    query = urlencode(
-        {
-            "per_page": max(1, min(50, int(per_page))),
-            "page": max(1, int(page)),
-            "text_format": "plain",
-        }
+    """Fetch one comments page using the best currently available Genius route.
+
+    Genius OAuth is validated separately with /account. In practice Genius may
+    still return HTTP 403 specifically for /songs/{id}/comments even when the
+    user token is valid. A comments-only 403 must therefore NOT erase the saved
+    OAuth token or send the browser through an endless reconnect loop.
+    """
+    params = {
+        "per_page": max(1, min(50, int(per_page))),
+        "page": max(1, int(page)),
+        "text_format": "plain",
+    }
+    errors: list[str] = []
+    user_token = load_genius_user_access_token()
+
+    if user_token:
+        # Preferred documented OAuth request.
+        query = urlencode(params)
+        bearer_request = Request(
+            f"https://api.genius.com/songs/{int(song_id)}/comments?{query}",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {user_token}",
+                "User-Agent": "NavincitronLyrics/1.4 (+https://www.navincitron.com)",
+            },
+        )
+        try:
+            return _genius_comments_payload_from_request(
+                bearer_request,
+                "Genius OAuth comments request failed with",
+            )
+        except Exception as error:
+            errors.append(str(error))
+
+        # Genius also supports access_token as a GET query parameter. This is
+        # useful because some Genius endpoints/proxies have historically treated
+        # Authorization headers differently from query-string authentication.
+        query_with_token = urlencode({**params, "access_token": user_token})
+        token_query_request = Request(
+            f"https://api.genius.com/songs/{int(song_id)}/comments?{query_with_token}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "NavincitronLyrics/1.4 (+https://www.navincitron.com)",
+            },
+        )
+        try:
+            return _genius_comments_payload_from_request(
+                token_query_request,
+                "Genius OAuth query-token comments request failed with",
+            )
+        except Exception as error:
+            errors.append(str(error))
+
+    # Genius's own site exposes comments from genius.com/api. This route does not
+    # require an API token, but hosted-server IPs can be challenged by Genius.
+    # Use a normal browser request profile rather than the former bot-style UA.
+    public_query = urlencode(params)
+    public_request = Request(
+        f"https://genius.com/api/songs/{int(song_id)}/comments?{public_query}",
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"https://genius.com/songs/{int(song_id)}",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            ),
+            "X-Requested-With": "XMLHttpRequest",
+        },
     )
-    return genius_user_json_request(
-        f"https://api.genius.com/songs/{int(song_id)}/comments?{query}"
+    try:
+        return _genius_comments_payload_from_request(
+            public_request,
+            "Genius public comments request failed with",
+        )
+    except Exception as error:
+        errors.append(str(error))
+
+    if not user_token:
+        raise GeniusUserAuthorizationRequired(
+            "Connect your Genius account once to authorize song comments."
+        )
+
+    # The OAuth token was already proven valid against /account during callback.
+    # Do not clear it merely because the comments endpoint itself returned 403.
+    detail = " ".join(errors[-3:])
+    raise GeniusCommentsEndpointUnavailable(
+        "Genius login is connected, but Genius is refusing the song-comments "
+        "resource from the backend. " + detail
     )
 
 
@@ -3012,22 +3119,6 @@ def lyrics_song_comments(song_id: int):
         response.headers["Cache-Control"] = "no-store"
         return response
 
-    if not load_genius_user_access_token():
-        next_url = FRONTEND_ORIGIN.rstrip("/") + "/lyrics.html"
-        response = jsonify(
-            {
-                "ok": False,
-                "authenticated": True,
-                "geniusAuthorizationRequired": True,
-                "geniusOAuthConfigured": True,
-                "geniusLoginUrl": "/genius/login?next=" + quote_plus(next_url),
-                "error": "Connect your Genius account once to authorize song comments.",
-            }
-        )
-        response.status_code = 401
-        response.headers["Cache-Control"] = "no-store"
-        return response
-
     try:
         comments = get_all_genius_song_comments(song_id)
     except GeniusUserAuthorizationRequired as error:
@@ -3043,6 +3134,19 @@ def lyrics_song_comments(song_id: int):
             }
         )
         response.status_code = 401
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except GeniusCommentsEndpointUnavailable as error:
+        response = jsonify(
+            {
+                "ok": False,
+                "authenticated": True,
+                "geniusConnected": bool(load_genius_user_access_token()),
+                "geniusAuthorizationRequired": False,
+                "error": str(error),
+            }
+        )
+        response.status_code = 502
         response.headers["Cache-Control"] = "no-store"
         return response
     except Exception as error:
