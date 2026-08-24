@@ -1827,6 +1827,11 @@ GENIUS_LOOKUP_CACHE_LOCK = threading.Lock()
 GENIUS_LOOKUP_CACHE_MAX_ITEMS = 500
 GENIUS_MATCH_TTL_SECONDS = 7 * 24 * 60 * 60
 GENIUS_MISS_TTL_SECONDS = 60 * 60
+GENIUS_COMMENTS_CACHE: dict[int, dict[str, Any]] = {}
+GENIUS_COMMENTS_CACHE_LOCK = threading.Lock()
+GENIUS_COMMENTS_TTL_SECONDS = 15 * 60
+GENIUS_COMMENTS_MAX_PAGES = 100
+GENIUS_COMMENTS_PER_PAGE = 50
 
 
 def get_genius_access_token() -> str:
@@ -1899,6 +1904,204 @@ def genius_song_request(song_id: int) -> dict[str, Any]:
         f"https://api.genius.com/songs/{song_id}?text_format=plain",
         access_token,
     )
+
+
+def genius_comments_page_request(song_id: int, page: int, per_page: int = GENIUS_COMMENTS_PER_PAGE) -> dict[str, Any]:
+    """
+    Fetches one Genius song-comment page.
+
+    Genius exposes song comments through /songs/{id}/comments. Prefer the
+    authenticated api.genius.com route; some Genius client-access tokens may not
+    be entitled to this endpoint, so fall back to the browser/public API that
+    Genius itself uses. The fallback is deliberately best-effort because Genius
+    may apply anti-bot protection to hosted servers.
+    """
+    query = urlencode(
+        {
+            "per_page": max(1, min(50, int(per_page))),
+            "page": max(1, int(page)),
+            "text_format": "plain",
+        }
+    )
+    official_error: Exception | None = None
+    try:
+        return genius_json_request(
+            f"https://api.genius.com/songs/{int(song_id)}/comments?{query}",
+            get_genius_access_token(),
+        )
+    except Exception as error:
+        official_error = error
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "NavincitronLyrics/1.2 (+https://www.navincitron.com)",
+        "Referer": f"https://genius.com/songs/{int(song_id)}",
+    }
+    public_request = Request(
+        f"https://genius.com/api/songs/{int(song_id)}/comments?{query}",
+        headers=headers,
+    )
+    try:
+        with urlopen(public_request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except HTTPError as error:
+        detail = f"Genius comments request failed with HTTP {error.code}."
+        if official_error:
+            detail += f" Authenticated endpoint also failed: {official_error}"
+        raise RuntimeError(detail) from error
+    except URLError as error:
+        raise RuntimeError(f"Could not reach Genius comments: {error.reason}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Genius comments returned an unreadable JSON response.") from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("Genius comments returned an invalid JSON response.")
+    return payload
+
+
+def genius_comment_body(comment: dict[str, Any]) -> str:
+    body = comment.get("body")
+    if isinstance(body, dict):
+        for key in ("plain", "markdown", "html"):
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value
+                if key == "html":
+                    text = re.sub(r"<br\\s*/?>", "\\n", text, flags=re.IGNORECASE)
+                    text = re.sub(r"<[^>]+>", "", text)
+                return text.strip()
+    if isinstance(body, str):
+        return body.strip()
+    for key in ("text", "content"):
+        value = comment.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def genius_comment_avatar(author: dict[str, Any]) -> str:
+    avatar = author.get("avatar")
+    if isinstance(avatar, dict):
+        for size in ("medium", "small", "tiny"):
+            value = avatar.get(size)
+            if isinstance(value, dict) and value.get("url"):
+                return str(value.get("url") or "").strip()
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for key in ("avatar_url", "header_image_url", "image_url"):
+        value = author.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def flatten_genius_comments(raw_comments: list[Any], depth: int = 0) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for raw in raw_comments or []:
+        if not isinstance(raw, dict):
+            continue
+        author = raw.get("author") if isinstance(raw.get("author"), dict) else {}
+        body = genius_comment_body(raw)
+        comment_id = raw.get("id")
+        votes_value = raw.get("votes_total")
+        if votes_value is None:
+            votes_value = raw.get("votes")
+        try:
+            votes = int(votes_value) if votes_value is not None else None
+        except (TypeError, ValueError):
+            votes = None
+
+        normalized.append(
+            {
+                "id": comment_id,
+                "body": body,
+                "author": str(author.get("name") or author.get("login") or author.get("user_name") or "Genius user").strip(),
+                "avatarUrl": genius_comment_avatar(author),
+                "votes": votes,
+                "createdAt": str(raw.get("created_at") or raw.get("createdAt") or "").strip(),
+                "url": str(raw.get("url") or "").strip(),
+                "depth": max(0, int(depth)),
+            }
+        )
+
+        children = None
+        for key in ("children", "replies", "responses"):
+            candidate = raw.get(key)
+            if isinstance(candidate, list):
+                children = candidate
+                break
+            if isinstance(candidate, dict) and isinstance(candidate.get("comments"), list):
+                children = candidate.get("comments")
+                break
+        if children:
+            normalized.extend(flatten_genius_comments(children, depth + 1))
+    return normalized
+
+
+def get_all_genius_song_comments(song_id: int) -> list[dict[str, Any]]:
+    song_id = int(song_id)
+    now = time.time()
+    with GENIUS_COMMENTS_CACHE_LOCK:
+        cached = GENIUS_COMMENTS_CACHE.get(song_id)
+        if isinstance(cached, dict) and now - float(cached.get("timestamp") or 0) < GENIUS_COMMENTS_TTL_SECONDS:
+            value = cached.get("value")
+            if isinstance(value, list):
+                return value
+
+    all_comments: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    page = 1
+
+    while page <= GENIUS_COMMENTS_MAX_PAGES:
+        payload = genius_comments_page_request(song_id, page, GENIUS_COMMENTS_PER_PAGE)
+        response = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+        raw_comments = response.get("comments") if isinstance(response, dict) else None
+        if not isinstance(raw_comments, list):
+            raw_comments = []
+
+        normalized_page = flatten_genius_comments(raw_comments)
+        added = 0
+        for comment in normalized_page:
+            identity = str(comment.get("id") or "").strip()
+            if not identity:
+                identity = hashlib.sha256(
+                    (str(comment.get("author")) + "\\n" + str(comment.get("body"))).encode("utf-8", errors="ignore")
+                ).hexdigest()
+            if identity in seen_ids:
+                continue
+            seen_ids.add(identity)
+            all_comments.append(comment)
+            added += 1
+
+        next_page = response.get("next_page") if isinstance(response, dict) else None
+        if next_page in (None, False, ""):
+            pagination = response.get("pagination") if isinstance(response, dict) and isinstance(response.get("pagination"), dict) else {}
+            next_page = pagination.get("next_page") or pagination.get("next")
+
+        if next_page not in (None, False, ""):
+            try:
+                next_page_number = int(next_page)
+            except (TypeError, ValueError):
+                next_page_number = page + 1
+            if next_page_number <= page:
+                break
+            page = next_page_number
+            continue
+
+        if len(raw_comments) < GENIUS_COMMENTS_PER_PAGE or not raw_comments or added == 0:
+            break
+        page += 1
+
+    with GENIUS_COMMENTS_CACHE_LOCK:
+        GENIUS_COMMENTS_CACHE[song_id] = {"timestamp": now, "value": all_comments}
+        if len(GENIUS_COMMENTS_CACHE) > GENIUS_LOOKUP_CACHE_MAX_ITEMS:
+            oldest_key = min(
+                GENIUS_COMMENTS_CACHE,
+                key=lambda key: float(GENIUS_COMMENTS_CACHE[key].get("timestamp") or 0),
+            )
+            GENIUS_COMMENTS_CACHE.pop(oldest_key, None)
+
+    return all_comments
 
 def genius_song_hits(payload: dict[str, Any]) -> list[dict[str, Any]]:
     response = payload.get("response")
@@ -2515,6 +2718,61 @@ def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
     return result
 
 
+@app.route("/api/lyrics/comments/<int:song_id>", methods=["GET"])
+def lyrics_song_comments(song_id: int):
+    try:
+        # Keep comments behind the same Spotify-authenticated browser session as
+        # lyrics.html rather than exposing a generic Genius proxy endpoint.
+        get_session_token_info()
+    except SpotifyLoginRequired as error:
+        response = jsonify({"ok": False, "authenticated": False, "error": str(error)})
+        response.status_code = 401
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except SpotifyTokenRefreshTemporarilyUnavailable as error:
+        response = jsonify(
+            {
+                "ok": False,
+                "authenticated": True,
+                "temporarilyUnavailable": True,
+                "error": str(error),
+            }
+        )
+        response.status_code = 503
+        response.headers["Retry-After"] = "6"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    if song_id <= 0:
+        return jsonify({"ok": False, "authenticated": True, "error": "Invalid Genius song ID."}), 400
+
+    try:
+        comments = get_all_genius_song_comments(song_id)
+    except Exception as error:
+        response = jsonify(
+            {
+                "ok": False,
+                "authenticated": True,
+                "error": str(error),
+            }
+        )
+        response.status_code = 502
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    response = jsonify(
+        {
+            "ok": True,
+            "authenticated": True,
+            "songId": song_id,
+            "count": len(comments),
+            "comments": comments,
+        }
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/api/lyrics/current", methods=["GET"])
 def current_lyrics():
     try:
@@ -2638,7 +2896,7 @@ def current_lyrics():
 @app.route("/api/lyrics/control/<action>", methods=["POST"])
 def lyrics_playback_control(action: str):
     action = str(action or "").strip().lower()
-    allowed_actions = {"previous", "pause", "play", "next"}
+    allowed_actions = {"restart", "previous", "pause", "play", "next"}
     if action not in allowed_actions:
         return jsonify(
             {
@@ -2678,7 +2936,16 @@ def lyrics_playback_control(action: str):
     sampler_running = process_is_running()
 
     try:
-        if action == "pause":
+        if action == "restart":
+            # Spotify's native Previous button restarts the current song before
+            # skipping back. lyrics.js handles the short double-press window;
+            # this endpoint performs only the restart-to-zero operation.
+            spotify_client.seek_track(0)
+            if sampler_running:
+                append_log("[lyrics page requested: restart current track at 0:00]")
+            message = "Restarted the current Spotify track at 0:00."
+
+        elif action == "pause":
             if sampler_running:
                 write_sampler_control("pause", paused=True)
             spotify_client.pause_playback()
