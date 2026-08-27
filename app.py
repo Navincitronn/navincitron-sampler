@@ -992,6 +992,78 @@ def get_discogs_token() -> str:
     return normalize_secret_text(os.getenv("DISCOGS_TOKEN") or read_env_file_value("DISCOGS_TOKEN") or "")
 
 
+WIKIPEDIA_MOVIE_TITLE_ALIASES = {
+    "3 WOMEN": "3 Women",
+    "TRAINSPOTTING": "Trainspotting (film)",
+    "ALL THE PRESIDENT'S MEN": "All the President's Men (film)",
+    "CRIA!": "Cría cuervos",
+}
+
+
+def fetch_wikipedia_movie_poster_url(title: str) -> str:
+    requested_title = str(title or "").strip()
+    if not requested_title:
+        return ""
+
+    mapped = WIKIPEDIA_MOVIE_TITLE_ALIASES.get(requested_title.upper())
+    candidates = list(dict.fromkeys(filter(None, [mapped, f"{requested_title} (film)", requested_title])))
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Navincitron/1.0 +https://www.navincitron.com",
+    }
+
+    for candidate in candidates:
+        params = urlencode(
+            {
+                "action": "query",
+                "format": "json",
+                "formatversion": "2",
+                "redirects": "1",
+                "prop": "pageimages",
+                "piprop": "thumbnail|original",
+                "pithumbsize": "330",
+                "titles": candidate,
+            }
+        )
+        url = f"https://en.wikipedia.org/w/api.php?{params}"
+        try:
+            with urlopen(Request(url, headers=headers), timeout=8) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+            continue
+
+        query = payload.get("query") if isinstance(payload, dict) else None
+        pages = query.get("pages") if isinstance(query, dict) else None
+        if not isinstance(pages, list):
+            continue
+
+        for page in pages:
+            if not isinstance(page, dict) or page.get("missing") is not None:
+                continue
+            thumbnail = page.get("thumbnail") if isinstance(page.get("thumbnail"), dict) else {}
+            original = page.get("original") if isinstance(page.get("original"), dict) else {}
+            image_url = str(thumbnail.get("source") or original.get("source") or "").strip()
+            if image_url.startswith(("https://", "http://")):
+                return image_url
+
+    return ""
+
+
+@app.route("/api/movie-poster", methods=["GET"])
+def api_movie_poster():
+    title = str(request.args.get("title") or "").strip()
+    if not title:
+        return "Movie title is required.", 400
+
+    poster_url = fetch_wikipedia_movie_poster_url(title)
+    if not poster_url:
+        return "Movie poster was not found.", 404
+
+    response = redirect(poster_url, code=302)
+    response.headers["Cache-Control"] = "public, max-age=86400"
+    return response
+
+
 def discogs_collection_redis_key(username: str) -> str:
     safe_username = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(username or DISCOGS_COLLECTION_USERNAME))
     return f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:discogs-collection:{safe_username}"
