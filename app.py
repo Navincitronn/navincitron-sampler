@@ -999,6 +999,60 @@ WIKIPEDIA_MOVIE_TITLE_ALIASES = {
     "CRIA!": "Cría cuervos",
 }
 
+MOVIE_POSTER_ALLOWED_HOST_SUFFIXES = (
+    "media-amazon.com",
+    "filmaffinity.com",
+    "wikimedia.org",
+    "tmdb.org",
+    "ltrbxd.com",
+    "letterboxd.com",
+    "impawards.com",
+)
+
+
+def movie_poster_host_is_allowed(raw_url: str) -> bool:
+    try:
+        parsed = urlparse(str(raw_url or "").strip())
+    except Exception:
+        return False
+    if parsed.scheme.lower() != "https":
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    return any(host == suffix or host.endswith("." + suffix) for suffix in MOVIE_POSTER_ALLOWED_HOST_SUFFIXES)
+
+
+def fetch_remote_movie_poster(raw_url: str) -> tuple[bytes, str] | None:
+    url = str(raw_url or "").strip()
+    if not movie_poster_host_is_allowed(url):
+        return None
+
+    parsed = urlparse(url)
+    referer = f"{parsed.scheme}://{parsed.netloc}/" if parsed.scheme and parsed.netloc else ""
+    headers = {
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (compatible; Navincitron/1.0; +https://www.navincitron.com)",
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    try:
+        with urlopen(Request(url, headers=headers), timeout=10) as response:
+            final_url = response.geturl()
+            if not movie_poster_host_is_allowed(final_url):
+                return None
+            content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if not content_type.startswith("image/"):
+                return None
+            data = response.read(8 * 1024 * 1024 + 1)
+    except (HTTPError, URLError, TimeoutError):
+        return None
+
+    if not data or len(data) > 8 * 1024 * 1024:
+        return None
+    return data, content_type or "image/jpeg"
+
 
 def fetch_wikipedia_movie_poster_url(title: str) -> str:
     requested_title = str(title or "").strip()
@@ -1051,16 +1105,26 @@ def fetch_wikipedia_movie_poster_url(title: str) -> str:
 
 @app.route("/api/movie-poster", methods=["GET"])
 def api_movie_poster():
+    direct_url = str(request.args.get("url") or "").strip()
     title = str(request.args.get("title") or "").strip()
-    if not title:
-        return "Movie title is required.", 400
 
-    poster_url = fetch_wikipedia_movie_poster_url(title)
+    poster_url = direct_url
+    if not poster_url and title:
+        poster_url = fetch_wikipedia_movie_poster_url(title)
+
     if not poster_url:
         return "Movie poster was not found.", 404
 
-    response = redirect(poster_url, code=302)
+    fetched = fetch_remote_movie_poster(poster_url)
+    if not fetched:
+        if direct_url and not movie_poster_host_is_allowed(direct_url):
+            return "Movie poster host is not allowed.", 400
+        return "Movie poster could not be loaded.", 502
+
+    image_bytes, content_type = fetched
+    response = app.response_class(image_bytes, status=200, mimetype=content_type)
     response.headers["Cache-Control"] = "public, max-age=86400"
+    response.headers["X-Content-Type-Options"] = "nosniff"
     return response
 
 
