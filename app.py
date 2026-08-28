@@ -3030,7 +3030,12 @@ def songguesser_candidate_from_album_track(album: dict[str, Any], track: dict[st
     return {"prepared": prepared, "answer": songguesser_track_answer(prepared)}
 
 
-def songguesser_candidate_from_playlist_item(playlist_bundle: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+def songguesser_candidate_from_playlist_item(
+    playlist_bundle: dict[str, Any],
+    item: dict[str, Any],
+    cache: dict[str, Any] | None = None,
+    use_lastfm_local_cover: bool = False,
+) -> dict[str, Any]:
     configure_sampler_tools()
 
     prepared = sampler_tools.prepare_playlist_item_clip(
@@ -3039,6 +3044,8 @@ def songguesser_candidate_from_playlist_item(playlist_bundle: dict[str, Any], it
         clip_seconds=SONGGUESSER_CLIP_SECONDS,
         random_start=True,
         assumed_duration_seconds=SONGGUESSER_ASSUMED_DURATION_SECONDS,
+        cache=cache,
+        use_lastfm_local_cover=use_lastfm_local_cover,
     )
 
     return {"prepared": prepared, "answer": songguesser_track_answer(prepared)}
@@ -3214,6 +3221,7 @@ def songguesser_build_playlist_candidates(
     playlist_link: str,
     used_by_source: dict[str, set[str]],
     maximum: int,
+    use_lastfm_local_cover: bool = False,
 ) -> list[dict[str, Any]]:
     configure_sampler_tools()
 
@@ -3237,7 +3245,14 @@ def songguesser_build_playlist_candidates(
         if item_key in used_keys:
             continue
         used_keys.add(item_key)
-        candidates.append(songguesser_candidate_from_playlist_item(playlist_bundle, item))
+        candidates.append(
+            songguesser_candidate_from_playlist_item(
+                playlist_bundle=playlist_bundle,
+                item=item,
+                cache=cache,
+                use_lastfm_local_cover=use_lastfm_local_cover,
+            )
+        )
         if len(candidates) >= maximum:
             break
 
@@ -3307,6 +3322,7 @@ def songguesser_build_candidates_from_single_link(sp: Any, cache: dict[str, Any]
             playlist_link=link,
             used_by_source=used_by_source,
             maximum=SONGGUESSER_SONG_COUNT,
+            use_lastfm_local_cover=True,
         )
     else:
         raise RuntimeError("Invalid Spotify album or playlist link/URI.")
