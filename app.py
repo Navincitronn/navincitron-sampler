@@ -15,6 +15,8 @@ import sys
 import time
 import threading
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from html import unescape as html_unescape
 from collections import deque
 from datetime import timedelta
 from pathlib import Path
@@ -2360,6 +2362,238 @@ def lastfm_json_request(params: dict[str, Any]) -> dict[str, Any]:
 LASTFM_PROFILE_USERNAME = (os.getenv("LASTFM_PROFILE_USERNAME", "Navincitron").strip() or "Navincitron")
 LASTFM_CHART_MAX_ITEMS = 250
 LASTFM_RECENT_MAX_SCROBBLES = 50_000
+LASTFM_WEB_IMAGE_CACHE: dict[str, dict[str, Any]] = {}
+LASTFM_WEB_IMAGE_CACHE_LOCK = threading.Lock()
+LASTFM_WEB_IMAGE_MATCH_TTL_SECONDS = 30 * 24 * 60 * 60
+LASTFM_WEB_IMAGE_MISS_TTL_SECONDS = 6 * 60 * 60
+LASTFM_WEB_IMAGE_CACHE_MAX_ITEMS = 1500
+
+
+def lastfm_music_path_component(value: str) -> str:
+    # Last.fm uses '+' for spaces in music paths, while a literal plus sign in
+    # an artist name needs to survive that convention. Double-encode literal
+    # plus signs so Florence + the Machine resolves to the same canonical page
+    # Last.fm itself emits.
+    encoded = quote_plus(str(value or "").strip(), safe="")
+    return encoded.replace("%2B", "%252B").replace("%2b", "%252B")
+
+
+def lastfm_web_image_cache_get(key: str) -> str | None:
+    now = time.time()
+    with LASTFM_WEB_IMAGE_CACHE_LOCK:
+        cached = LASTFM_WEB_IMAGE_CACHE.get(key)
+        if not isinstance(cached, dict):
+            return None
+        value = str(cached.get("value") or "")
+        age = now - float(cached.get("timestamp") or 0)
+        ttl = LASTFM_WEB_IMAGE_MATCH_TTL_SECONDS if value else LASTFM_WEB_IMAGE_MISS_TTL_SECONDS
+        if age > ttl:
+            LASTFM_WEB_IMAGE_CACHE.pop(key, None)
+            return None
+        return value
+
+
+def lastfm_web_image_cache_put(key: str, value: str) -> str:
+    now = time.time()
+    with LASTFM_WEB_IMAGE_CACHE_LOCK:
+        LASTFM_WEB_IMAGE_CACHE[key] = {"timestamp": now, "value": value}
+        if len(LASTFM_WEB_IMAGE_CACHE) > LASTFM_WEB_IMAGE_CACHE_MAX_ITEMS:
+            oldest_key = min(
+                LASTFM_WEB_IMAGE_CACHE,
+                key=lambda item_key: float(LASTFM_WEB_IMAGE_CACHE[item_key].get("timestamp") or 0),
+            )
+            LASTFM_WEB_IMAGE_CACHE.pop(oldest_key, None)
+    return value
+
+
+def fetch_lastfm_html(url: str) -> str:
+    target = str(url or "").strip()
+    if not target.startswith("https://www.last.fm/"):
+        return ""
+    request_obj = Request(
+        target,
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": "Mozilla/5.0 (compatible; Navincitron/1.0; +https://www.navincitron.com)",
+        },
+    )
+    try:
+        with urlopen(request_obj, timeout=10) as response:
+            return response.read(3 * 1024 * 1024).decode("utf-8", errors="replace")
+    except (HTTPError, URLError, TimeoutError):
+        return ""
+
+
+def extract_lastfm_header_image(html_text: str) -> str:
+    if not html_text:
+        return ""
+    decoded = html_unescape(html_text)
+
+    # The large image shown on Last.fm music pages is stored as a CSS
+    # background on .header-new-background-image. This is also used on artist
+    # pages and provides a much better fallback than the historical API star
+    # placeholder.
+    for tag in re.findall(r"<[^>]*header-new-background-image[^>]*>", decoded, flags=re.IGNORECASE):
+        style_match = re.search(r"style\s*=\s*([\"'])(.*?)\1", tag, flags=re.IGNORECASE | re.DOTALL)
+        if not style_match:
+            continue
+        image_match = re.search(
+            r"background-image\s*:\s*url\(\s*([\"']?)(https?://[^)\"']+)\1\s*\)",
+            style_match.group(2),
+            flags=re.IGNORECASE,
+        )
+        if image_match:
+            image_url = useful_lastfm_image_url(image_match.group(2))
+            if image_url:
+                return image_url
+
+    # Some page variants expose an ordinary image instead of the CSS header.
+    for tag in re.findall(r"<img\b[^>]*>", decoded, flags=re.IGNORECASE):
+        if "header-new-background-image" not in tag and "avatar" not in tag.lower():
+            continue
+        src_match = re.search(r"(?:src|data-src)\s*=\s*([\"'])(https?://.*?)\1", tag, flags=re.IGNORECASE)
+        if src_match:
+            image_url = useful_lastfm_image_url(src_match.group(2))
+            if image_url:
+                return image_url
+
+    # Final non-personalized fallback for page variants that use metadata.
+    meta_match = re.search(
+        r"<meta[^>]+(?:property|name)=[\"'](?:og:image|twitter:image)[\"'][^>]+content=[\"'](https?://[^\"']+)[\"']",
+        decoded,
+        flags=re.IGNORECASE,
+    )
+    if meta_match:
+        return useful_lastfm_image_url(meta_match.group(1))
+    return ""
+
+
+def lastfm_artist_image_url(username: str, artist: str, artist_url: str = "") -> str:
+    artist_name = str(artist or "").strip()
+    if not artist_name:
+        return ""
+    cache_key = f"artist::{str(username or '').casefold()}::{artist_name.casefold()}"
+    cached = lastfm_web_image_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    encoded_artist = lastfm_music_path_component(artist_name)
+    encoded_user = quote_plus(str(username or LASTFM_PROFILE_USERNAME).strip(), safe="")
+    candidates = [
+        # Try the user's public library page first. When Last.fm exposes a Pro
+        # preferred image publicly for that user's library, this is the route
+        # most likely to carry it.
+        f"https://www.last.fm/user/{encoded_user}/library/music/{encoded_artist}",
+    ]
+    canonical_url = str(artist_url or "").strip()
+    if canonical_url.startswith("http://www.last.fm/"):
+        canonical_url = "https://www.last.fm/" + canonical_url[len("http://www.last.fm/"):]
+    if canonical_url.startswith("https://www.last.fm/"):
+        candidates.append(canonical_url)
+    candidates.append(f"https://www.last.fm/music/{encoded_artist}")
+
+    for candidate in dict.fromkeys(candidates):
+        image_url = extract_lastfm_header_image(fetch_lastfm_html(candidate))
+        if image_url:
+            return lastfm_web_image_cache_put(cache_key, image_url)
+    return lastfm_web_image_cache_put(cache_key, "")
+
+
+def lastfm_track_album_image_url(artist: str, track: str, track_url: str = "") -> tuple[str, str]:
+    artist_name = str(artist or "").strip()
+    track_name = str(track or "").strip()
+    if not artist_name or not track_name:
+        return "", ""
+    cache_key = f"track::{artist_name.casefold()}::{track_name.casefold()}"
+    cached = lastfm_web_image_cache_get(cache_key)
+    if cached is not None:
+        if "\u241f" in cached:
+            image_url, album_name = cached.split("\u241f", 1)
+            return image_url, album_name
+        return cached, ""
+
+    image_url = ""
+    album_name = ""
+    try:
+        payload = lastfm_json_request(
+            {
+                "method": "track.getInfo",
+                "artist": artist_name,
+                "track": track_name,
+                "username": LASTFM_PROFILE_USERNAME,
+            }
+        )
+        track_info = payload.get("track") if isinstance(payload.get("track"), dict) else {}
+        album_info = track_info.get("album") if isinstance(track_info.get("album"), dict) else {}
+        image_url = best_lastfm_image_url(album_info.get("image"))
+        album_name = str(album_info.get("title") or "").strip()
+    except Exception:
+        pass
+
+    if not image_url:
+        candidate = str(track_url or "").strip()
+        if candidate.startswith("http://www.last.fm/"):
+            candidate = "https://www.last.fm/" + candidate[len("http://www.last.fm/"):]
+        if not candidate.startswith("https://www.last.fm/"):
+            encoded_artist = lastfm_music_path_component(artist_name)
+            encoded_track = lastfm_music_path_component(track_name)
+            candidate = f"https://www.last.fm/music/{encoded_artist}/_/{encoded_track}"
+        image_url = extract_lastfm_header_image(fetch_lastfm_html(candidate))
+
+    lastfm_web_image_cache_put(cache_key, f"{image_url}\u241f{album_name}")
+    return image_url, album_name
+
+
+def enrich_lastfm_chart_images(username: str, mode: str, items: list[dict[str, Any]]) -> None:
+    if not items:
+        return
+
+    if mode == "artists":
+        def resolve_artist(item: dict[str, Any]) -> str:
+            return lastfm_artist_image_url(username, str(item.get("artist") or item.get("title") or ""), str(item.get("url") or ""))
+
+        workers = min(8, len(items))
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = [(item, pool.submit(resolve_artist, item)) for item in items]
+            for item, future in futures:
+                try:
+                    image_url = useful_lastfm_image_url(future.result())
+                except Exception:
+                    image_url = ""
+                if image_url:
+                    item["image"] = image_url
+                    item["imageSource"] = "Last.fm artist page"
+        return
+
+    if mode not in {"songs", "recent"}:
+        return
+
+    missing = [item for item in items if not useful_lastfm_image_url(item.get("image"))]
+    if not missing:
+        return
+
+    def resolve_song(item: dict[str, Any]) -> tuple[str, str]:
+        return lastfm_track_album_image_url(
+            str(item.get("artist") or ""),
+            str(item.get("title") or ""),
+            str(item.get("url") or ""),
+        )
+
+    workers = min(8, len(missing))
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [(item, pool.submit(resolve_song, item)) for item in missing]
+        for item, future in futures:
+            try:
+                image_url, album_name = future.result()
+            except Exception:
+                image_url, album_name = "", ""
+            if image_url:
+                item["image"] = image_url
+                item["imageSource"] = "Last.fm album/release page"
+            if album_name and not str(item.get("album") or "").strip():
+                item["album"] = album_name
+
 
 
 def lastfm_text_value(value: Any) -> str:
@@ -2647,6 +2881,8 @@ def api_lastfm_chart():
             else:
                 items = lastfm_aggregate_recent(rows, mode, limit)
                 source = "Last.fm recent-track aggregation"
+
+        enrich_lastfm_chart_images(username, mode, items)
 
         return jsonify(
             {
