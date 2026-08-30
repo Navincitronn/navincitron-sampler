@@ -309,7 +309,7 @@ def submitted_topster_credentials_are_valid(submitted_username: str, submitted_p
 
 def is_topster_admin_protected_page(filename: str) -> bool:
     name = str(filename or "").strip().lower()
-    if name in {"hub.html", "grid.html", "ranked_grid.html", "draft_album_list.html", "lyrics.html"}:
+    if name in {"hub.html", "grid.html", "ranked_grid.html", "draft_album_list.html", "lyrics.html", "last_fm.html"}:
         return True
     if name.startswith("draft_") and name.endswith(".html"):
         return True
@@ -532,6 +532,11 @@ def redirect_hub_html():
 @app.route("/lyrics.html")
 def redirect_lyrics_html():
     return redirect_topster_frontend_page("lyrics.html")
+
+
+@app.route("/last_fm.html")
+def redirect_last_fm_html():
+    return redirect_topster_frontend_page("last_fm.html")
 
 
 @app.route("/grid.html")
@@ -2350,6 +2355,317 @@ def lastfm_json_request(params: dict[str, Any]) -> dict[str, Any]:
             f"{str(payload.get('message') or 'lookup failed').strip()}"
         )
     return payload
+
+
+LASTFM_PROFILE_USERNAME = (os.getenv("LASTFM_PROFILE_USERNAME", "Navincitron").strip() or "Navincitron")
+LASTFM_CHART_MAX_ITEMS = 250
+LASTFM_RECENT_MAX_SCROBBLES = 50_000
+
+
+def lastfm_text_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("name") or value.get("#text") or "").strip()
+    return str(value or "").strip()
+
+
+def lastfm_int_value(value: Any, fallback: int = 0) -> int:
+    try:
+        return int(str(value or fallback).strip())
+    except (TypeError, ValueError):
+        return fallback
+
+
+def lastfm_recent_track_rows(
+    username: str,
+    from_ts: int | None = None,
+    to_ts: int | None = None,
+    max_scrobbles: int = LASTFM_RECENT_MAX_SCROBBLES,
+) -> tuple[list[dict[str, Any]], bool]:
+    rows: list[dict[str, Any]] = []
+    page = 1
+    truncated = False
+
+    while len(rows) < max_scrobbles:
+        params: dict[str, Any] = {
+            "method": "user.getRecentTracks",
+            "user": username,
+            "limit": 200,
+            "page": page,
+            "extended": 0,
+        }
+        if from_ts is not None:
+            params["from"] = int(from_ts)
+        if to_ts is not None:
+            params["to"] = int(to_ts)
+
+        payload = lastfm_json_request(params)
+        recent = payload.get("recenttracks") if isinstance(payload.get("recenttracks"), dict) else {}
+        raw_tracks = recent.get("track")
+        if isinstance(raw_tracks, dict):
+            raw_tracks = [raw_tracks]
+        if not isinstance(raw_tracks, list):
+            raw_tracks = []
+
+        for raw in raw_tracks:
+            if not isinstance(raw, dict):
+                continue
+            attrs = raw.get("@attr") if isinstance(raw.get("@attr"), dict) else {}
+            now_playing = str(attrs.get("nowplaying") or "").lower() == "true"
+            date_data = raw.get("date") if isinstance(raw.get("date"), dict) else {}
+            uts = lastfm_int_value(date_data.get("uts"), 0)
+            artist = lastfm_text_value(raw.get("artist"))
+            track_name = str(raw.get("name") or "").strip()
+            album = lastfm_text_value(raw.get("album"))
+            if not artist or not track_name:
+                continue
+            rows.append(
+                {
+                    "artist": artist,
+                    "track": track_name,
+                    "album": album,
+                    "image": best_lastfm_image_url(raw.get("image")),
+                    "url": str(raw.get("url") or "").strip(),
+                    "timestamp": uts,
+                    "nowPlaying": now_playing,
+                }
+            )
+            if len(rows) >= max_scrobbles:
+                truncated = True
+                break
+
+        attrs = recent.get("@attr") if isinstance(recent.get("@attr"), dict) else {}
+        total_pages = max(1, lastfm_int_value(attrs.get("totalPages"), 1))
+        if page >= total_pages or not raw_tracks or truncated:
+            break
+        page += 1
+
+    return rows, truncated
+
+
+def lastfm_period_bounds(period: str, custom_from: int | None = None, custom_to: int | None = None) -> tuple[int | None, int | None]:
+    now_ts = int(time.time())
+    if period == "1day":
+        return now_ts - 24 * 60 * 60, now_ts
+    if period == "14day":
+        return now_ts - 14 * 24 * 60 * 60, now_ts
+    if period == "custom":
+        return custom_from, custom_to
+    return None, None
+
+
+def lastfm_direct_period(period: str) -> str | None:
+    return {
+        "7day": "7day",
+        "1month": "1month",
+        "3month": "3month",
+        "6month": "6month",
+        "12month": "12month",
+        "overall": "overall",
+    }.get(period)
+
+
+def lastfm_direct_chart(username: str, mode: str, period: str, limit: int) -> list[dict[str, Any]]:
+    method_map = {
+        "albums": ("user.getTopAlbums", "topalbums", "album"),
+        "songs": ("user.getTopTracks", "toptracks", "track"),
+        "artists": ("user.getTopArtists", "topartists", "artist"),
+    }
+    method, root_key, item_key = method_map[mode]
+    payload = lastfm_json_request(
+        {
+            "method": method,
+            "user": username,
+            "period": period,
+            "limit": limit,
+            "page": 1,
+        }
+    )
+    root = payload.get(root_key) if isinstance(payload.get(root_key), dict) else {}
+    raw_items = root.get(item_key)
+    if isinstance(raw_items, dict):
+        raw_items = [raw_items]
+    if not isinstance(raw_items, list):
+        return []
+
+    items: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_items[:limit], start=1):
+        if not isinstance(raw, dict):
+            continue
+        playcount = max(0, lastfm_int_value(raw.get("playcount"), 0))
+        image = best_lastfm_image_url(raw.get("image"))
+        if mode == "albums":
+            title = str(raw.get("name") or "").strip()
+            artist = lastfm_text_value(raw.get("artist"))
+            album = title
+        elif mode == "songs":
+            title = str(raw.get("name") or "").strip()
+            artist = lastfm_text_value(raw.get("artist"))
+            album = ""
+        else:
+            artist = str(raw.get("name") or "").strip()
+            title = artist
+            album = ""
+        if not title:
+            continue
+        items.append(
+            {
+                "rank": index,
+                "artist": artist,
+                "title": title,
+                "album": album,
+                "playcount": playcount,
+                "image": image,
+                "url": str(raw.get("url") or "").strip(),
+                "timestamp": 0,
+                "nowPlaying": False,
+            }
+        )
+    return items
+
+
+def lastfm_aggregate_recent(rows: list[dict[str, Any]], mode: str, limit: int) -> list[dict[str, Any]]:
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row.get("nowPlaying"):
+            # Current playback has not been scrobbled yet, so it should not add to
+            # a most-listened count.
+            continue
+        artist = str(row.get("artist") or "").strip()
+        track = str(row.get("track") or "").strip()
+        album = str(row.get("album") or "").strip()
+        if mode == "albums":
+            if not album:
+                continue
+            key = f"{artist.casefold()}\u241f{album.casefold()}"
+            title = album
+        elif mode == "songs":
+            key = f"{artist.casefold()}\u241f{track.casefold()}"
+            title = track
+        else:
+            key = artist.casefold()
+            title = artist
+        if not key or not title:
+            continue
+        item = buckets.setdefault(
+            key,
+            {
+                "artist": artist,
+                "title": title,
+                "album": album if mode != "artists" else "",
+                "playcount": 0,
+                "image": str(row.get("image") or ""),
+                "url": str(row.get("url") or ""),
+                "timestamp": lastfm_int_value(row.get("timestamp"), 0),
+                "nowPlaying": False,
+            },
+        )
+        item["playcount"] += 1
+        row_ts = lastfm_int_value(row.get("timestamp"), 0)
+        if row_ts >= lastfm_int_value(item.get("timestamp"), 0):
+            item["timestamp"] = row_ts
+            if row.get("image"):
+                item["image"] = str(row.get("image") or "")
+            if row.get("url"):
+                item["url"] = str(row.get("url") or "")
+            if mode == "artists" and album:
+                item["album"] = album
+
+    ordered = sorted(
+        buckets.values(),
+        key=lambda item: (-lastfm_int_value(item.get("playcount"), 0), -lastfm_int_value(item.get("timestamp"), 0), str(item.get("title") or "").casefold()),
+    )
+    for index, item in enumerate(ordered[:limit], start=1):
+        item["rank"] = index
+    return ordered[:limit]
+
+
+def lastfm_recent_items(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for raw in rows[:limit]:
+        artist = str(raw.get("artist") or "").strip()
+        track = str(raw.get("track") or "").strip()
+        if not artist or not track:
+            continue
+        items.append(
+            {
+                "rank": len(items) + 1,
+                "artist": artist,
+                "title": track,
+                "album": str(raw.get("album") or "").strip(),
+                "playcount": 1,
+                "image": str(raw.get("image") or ""),
+                "url": str(raw.get("url") or ""),
+                "timestamp": lastfm_int_value(raw.get("timestamp"), 0),
+                "nowPlaying": bool(raw.get("nowPlaying")),
+            }
+        )
+    return items
+
+
+@app.route("/api/lastfm-chart", methods=["GET"])
+def api_lastfm_chart():
+    restricted = require_topster_admin_response()
+    if restricted is not None:
+        return restricted
+
+    username = str(request.args.get("user") or LASTFM_PROFILE_USERNAME).strip() or LASTFM_PROFILE_USERNAME
+    if username.casefold() != LASTFM_PROFILE_USERNAME.casefold():
+        return jsonify({"ok": False, "error": "Only the configured Last.fm profile is available."}), 400
+
+    mode = str(request.args.get("mode") or "albums").strip().lower()
+    period = str(request.args.get("period") or "7day").strip().lower()
+    if mode not in {"albums", "songs", "artists", "recent"}:
+        return jsonify({"ok": False, "error": "Unknown Last.fm chart mode."}), 400
+    if period not in {"1day", "7day", "14day", "1month", "3month", "6month", "12month", "overall", "custom"}:
+        return jsonify({"ok": False, "error": "Unknown Last.fm period."}), 400
+
+    limit = min(LASTFM_CHART_MAX_ITEMS, max(1, lastfm_int_value(request.args.get("limit"), 100)))
+    custom_from = lastfm_int_value(request.args.get("from"), 0) or None
+    custom_to = lastfm_int_value(request.args.get("to"), 0) or None
+    if period == "custom":
+        if custom_from is None or custom_to is None or custom_from >= custom_to:
+            return jsonify({"ok": False, "error": "Custom Last.fm windows require a valid start and end time."}), 400
+
+    try:
+        direct_period = lastfm_direct_period(period)
+        truncated = False
+        sampled_scrobbles = 0
+        if mode != "recent" and direct_period:
+            items = lastfm_direct_chart(username, mode, direct_period, limit)
+            source = "Last.fm top chart"
+        else:
+            from_ts, to_ts = lastfm_period_bounds(period, custom_from, custom_to)
+            recent_cap = limit if mode == "recent" else LASTFM_RECENT_MAX_SCROBBLES
+            rows, truncated = lastfm_recent_track_rows(username, from_ts, to_ts, max_scrobbles=recent_cap)
+            sampled_scrobbles = len(rows)
+            if mode == "recent":
+                items = lastfm_recent_items(rows, limit)
+                # Reaching the requested display limit is normal for Recently Played;
+                # only aggregate modes need to report the 50k safety cap.
+                truncated = False
+                source = "Last.fm recent tracks"
+            else:
+                items = lastfm_aggregate_recent(rows, mode, limit)
+                source = "Last.fm recent-track aggregation"
+
+        return jsonify(
+            {
+                "ok": True,
+                "user": username,
+                "mode": mode,
+                "period": period,
+                "from": custom_from if period == "custom" else lastfm_period_bounds(period)[0],
+                "to": custom_to if period == "custom" else lastfm_period_bounds(period)[1],
+                "items": items,
+                "itemCount": len(items),
+                "sampledScrobbles": sampled_scrobbles,
+                "truncated": truncated,
+                "source": source,
+                "generatedAt": int(time.time()),
+            }
+        )
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 502
 
 
 def lookup_lastfm_local_album_art(track: dict[str, Any]) -> dict[str, str] | None:
