@@ -76,6 +76,11 @@ try:
 except (TypeError, ValueError):
     DISCOGS_COLLECTION_CACHE_SECONDS = 604800
 
+# Increment this whenever the collection payload/matching contract changes. The
+# version is part of the Redis key, so a deploy cannot silently keep serving a
+# week-old collection snapshot produced by an older matcher revision.
+DISCOGS_COLLECTION_CACHE_VERSION = 8
+
 
 SCOPE = (
     "user-read-playback-state "
@@ -1139,7 +1144,10 @@ def api_movie_poster():
 
 def discogs_collection_redis_key(username: str) -> str:
     safe_username = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(username or DISCOGS_COLLECTION_USERNAME))
-    return f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:discogs-collection:{safe_username}"
+    return (
+        f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:"
+        f"discogs-collection-v{DISCOGS_COLLECTION_CACHE_VERSION}:{safe_username}"
+    )
 
 
 def read_discogs_collection_cache(username: str) -> dict[str, Any] | None:
@@ -1289,6 +1297,8 @@ def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
         "uniqueAlbumCount": len(unique),
         "albums": list(unique.values()),
         "cachedSeconds": DISCOGS_COLLECTION_CACHE_SECONDS,
+        "cacheVersion": DISCOGS_COLLECTION_CACHE_VERSION,
+        "fetchedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "authenticatedToDiscogs": bool(get_discogs_token()),
     }
     return payload
@@ -1301,9 +1311,18 @@ def api_discogs_collection():
         return jsonify({"ok": False, "error": "Only the configured Navincitron Discogs collection is available."}), 400
 
     force_refresh = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes"}
-    if not force_refresh:
+    if force_refresh:
+        DISCOGS_COLLECTION_MEMORY_CACHE.pop(username, None)
+        if topster_redis_is_configured():
+            try:
+                client = get_topster_redis_client()
+                if client is not None:
+                    client.delete(discogs_collection_redis_key(username))
+            except Exception:
+                pass
+    else:
         cached = read_discogs_collection_cache(username)
-        if cached:
+        if cached and int(cached.get("cacheVersion") or 0) == DISCOGS_COLLECTION_CACHE_VERSION:
             return jsonify(cached)
 
     try:
@@ -2494,6 +2513,93 @@ def extract_lastfm_artist_page_image(html_text: str) -> str:
     return extract_lastfm_artist_gallery_image(html_text) or extract_lastfm_header_image(html_text)
 
 
+def extract_lastfm_page_image_candidates(html_text: str, include_artist_gallery: bool = False, limit: int = 24) -> list[str]:
+    """Extract page-specific Last.fm artwork without accepting account/profile avatars."""
+    if not html_text:
+        return []
+
+    decoded = html_unescape(html_text)
+    candidates: list[str] = []
+
+    def add(raw_url: Any) -> None:
+        url = useful_lastfm_image_url(raw_url)
+        if not url or url in candidates:
+            return
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        # Keep automatic picker results on Last.fm's image infrastructure. A
+        # user may still paste any http(s) image URL explicitly in the UI.
+        if not (host.endswith("last.fm") or "lastfm" in host or "audioscrobbler" in host):
+            return
+        candidates.append(url)
+
+    # Page hero / metadata image is the safest album/track candidate and also a
+    # useful artist fallback. This helper deliberately never scans arbitrary img
+    # tags, because Last.fm user/library pages contain account avatars.
+    add(extract_lastfm_header_image(decoded))
+
+    if include_artist_gallery:
+        patterns = (
+            r"href\s*=\s*['\"][^'\"]*/\+images/([0-9a-f]{32})(?:[^'\"]*)['\"]",
+            r"href\s*=\s*['\"][^'\"]*/%2Bimages(?:/|%2F)([0-9a-f]{32})(?:[^'\"]*)['\"]",
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, decoded, flags=re.IGNORECASE):
+                add(f"https://lastfm-img.freetls.fastly.net/i/u/770x0/{match.group(1).lower()}.jpg")
+                if len(candidates) >= limit:
+                    break
+            if len(candidates) >= limit:
+                break
+
+    return candidates[: max(1, int(limit))]
+
+
+def normalize_lastfm_music_url(raw_url: str) -> str:
+    candidate = str(raw_url or "").strip()
+    if candidate.startswith("http://www.last.fm/"):
+        candidate = "https://www.last.fm/" + candidate[len("http://www.last.fm/"):]
+    if not candidate.startswith("https://www.last.fm/"):
+        return ""
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return ""
+    if (parsed.hostname or "").lower() != "www.last.fm" or not parsed.path.startswith("/music/"):
+        return ""
+    return candidate
+
+
+def lastfm_cover_option_pages(mode: str, artist: str, title: str, album: str, item_url: str = "") -> list[str]:
+    artist_name = str(artist or "").strip()
+    title_name = str(title or "").strip()
+    album_name = str(album or "").strip()
+    pages: list[str] = []
+
+    direct = normalize_lastfm_music_url(item_url)
+    if direct:
+        pages.append(direct)
+
+    if not artist_name:
+        return list(dict.fromkeys(pages))
+
+    encoded_artist = lastfm_music_path_component(artist_name)
+    if mode == "artists":
+        pages.append(f"https://www.last.fm/music/{encoded_artist}")
+    elif mode == "albums":
+        release_name = album_name or title_name
+        if release_name:
+            pages.append(f"https://www.last.fm/music/{encoded_artist}/{lastfm_music_path_component(release_name)}")
+    else:
+        # Songs/recently-played entries may expose both a track page and a known
+        # release page. Both are legitimate Last.fm-only artwork sources.
+        if title_name:
+            pages.append(f"https://www.last.fm/music/{encoded_artist}/_/{lastfm_music_path_component(title_name)}")
+        if album_name:
+            pages.append(f"https://www.last.fm/music/{encoded_artist}/{lastfm_music_path_component(album_name)}")
+
+    return list(dict.fromkeys(filter(None, pages)))
+
+
 def lastfm_artist_image_url(username: str, artist: str, artist_url: str = "") -> str:
     artist_name = str(artist or "").strip()
     if not artist_name:
@@ -2910,6 +3016,100 @@ def api_lastfm_artist_image():
     response.headers["Cache-Control"] = "no-store, max-age=0"
     response.headers["Pragma"] = "no-cache"
     return response
+
+
+@app.route("/api/lastfm-cover-options", methods=["GET"])
+def api_lastfm_cover_options():
+    admin_error = require_topster_admin_response()
+    if admin_error is not None:
+        return admin_error
+
+    username = str(request.args.get("user") or LASTFM_PROFILE_USERNAME).strip() or LASTFM_PROFILE_USERNAME
+    if username.casefold() != LASTFM_PROFILE_USERNAME.casefold():
+        return jsonify({"ok": False, "error": "Unknown Last.fm profile."}), 400
+
+    mode = str(request.args.get("mode") or "albums").strip().lower()
+    if mode not in {"albums", "songs", "artists", "recent"}:
+        return jsonify({"ok": False, "error": "Unsupported Last.fm display mode."}), 400
+
+    artist = str(request.args.get("artist") or "").strip()
+    title = str(request.args.get("title") or "").strip()
+    album = str(request.args.get("album") or "").strip()
+    item_url = str(request.args.get("url") or "").strip()
+    if not artist and not title:
+        return jsonify({"ok": False, "error": "Artist or title is required."}), 400
+
+    # Top-track responses do not always include the album name. Resolve it with
+    # Last.fm's own API so the picker can also inspect the corresponding release
+    # page; no non-Last.fm image provider is queried here.
+    if mode in {"songs", "recent"} and artist and title and not album:
+        try:
+            payload = lastfm_json_request(
+                {
+                    "method": "track.getInfo",
+                    "artist": artist,
+                    "track": title,
+                    "username": username,
+                }
+            )
+            track_info = payload.get("track") if isinstance(payload.get("track"), dict) else {}
+            album_info = track_info.get("album") if isinstance(track_info.get("album"), dict) else {}
+            album = str(album_info.get("title") or "").strip()
+        except Exception:
+            pass
+
+    source_pages = lastfm_cover_option_pages(mode, artist, title, album, item_url)
+    image_urls: list[str] = []
+    for page_url in source_pages:
+        html_text = fetch_lastfm_html(page_url)
+        for image_url in extract_lastfm_page_image_candidates(
+            html_text,
+            include_artist_gallery=(mode == "artists"),
+            limit=24,
+        ):
+            if image_url not in image_urls:
+                image_urls.append(image_url)
+        if len(image_urls) >= 24:
+            break
+
+    # Last.fm API image arrays are a legitimate final Last.fm-only fallback when
+    # the public page markup exposes no usable hero image.
+    if not image_urls:
+        try:
+            if mode == "artists":
+                payload = lastfm_json_request({"method": "artist.getInfo", "artist": artist or title, "username": username})
+                info = payload.get("artist") if isinstance(payload.get("artist"), dict) else {}
+                fallback = best_lastfm_image_url(info.get("image"))
+            elif mode == "albums":
+                release = album or title
+                payload = lastfm_json_request({"method": "album.getInfo", "artist": artist, "album": release, "username": username})
+                info = payload.get("album") if isinstance(payload.get("album"), dict) else {}
+                fallback = best_lastfm_image_url(info.get("image"))
+            else:
+                payload = lastfm_json_request({"method": "track.getInfo", "artist": artist, "track": title, "username": username})
+                track_info = payload.get("track") if isinstance(payload.get("track"), dict) else {}
+                album_info = track_info.get("album") if isinstance(track_info.get("album"), dict) else {}
+                fallback = best_lastfm_image_url(album_info.get("image"))
+            fallback = useful_lastfm_image_url(fallback)
+            if fallback:
+                image_urls.append(fallback)
+        except Exception:
+            pass
+
+    return jsonify(
+        {
+            "ok": True,
+            "mode": mode,
+            "artist": artist,
+            "title": title,
+            "album": album,
+            "sourcePages": source_pages,
+            "candidates": [
+                {"imageSrc": url, "source": "Last.fm", "href": source_pages[0] if source_pages else ""}
+                for url in image_urls[:24]
+            ],
+        }
+    )
 
 
 @app.route("/api/lastfm-chart", methods=["GET"])
