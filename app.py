@@ -2360,7 +2360,7 @@ def lastfm_json_request(params: dict[str, Any]) -> dict[str, Any]:
 
 
 LASTFM_PROFILE_USERNAME = (os.getenv("LASTFM_PROFILE_USERNAME", "Navincitron").strip() or "Navincitron")
-LASTFM_CHART_MAX_ITEMS = 250
+LASTFM_CHART_MAX_ITEMS = 1000
 LASTFM_RECENT_MAX_SCROBBLES = 50_000
 LASTFM_WEB_IMAGE_CACHE: dict[str, dict[str, Any]] = {}
 LASTFM_WEB_IMAGE_CACHE_LOCK = threading.Lock()
@@ -2469,11 +2469,41 @@ def extract_lastfm_header_image(html_text: str) -> str:
     return ""
 
 
+def extract_lastfm_artist_gallery_image(html_text: str) -> str:
+    """Return the large CDN form of the first artist-gallery image hash on a Last.fm page."""
+    if not html_text:
+        return ""
+    decoded = html_unescape(html_text)
+
+    # Last.fm's artist hero / preferred image links point at
+    # /music/<artist>/+images/<32-hex-image-id>. The same id is accepted by
+    # Last.fm's public image CDN, which avoids depending on CSS background
+    # markup that changes between page variants.
+    patterns = (
+        r"href\s*=\s*['\"][^'\"]*/\+images/([0-9a-f]{32})(?:[^'\"]*)['\"]",
+        r"href\s*=\s*['\"][^'\"]*/%2Bimages(?:/|%2F)([0-9a-f]{32})(?:[^'\"]*)['\"]",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, decoded, flags=re.IGNORECASE)
+        if match:
+            return f"https://lastfm-img.freetls.fastly.net/i/u/770x0/{match.group(1).lower()}.jpg"
+    return ""
+
+
+def extract_lastfm_artist_page_image(html_text: str) -> str:
+    # Prefer the gallery id because Pro preferred images are represented by the
+    # artist image/gallery selection. Fall back to the page's hero/meta image.
+    return extract_lastfm_artist_gallery_image(html_text) or extract_lastfm_header_image(html_text)
+
+
 def lastfm_artist_image_url(username: str, artist: str, artist_url: str = "") -> str:
     artist_name = str(artist or "").strip()
     if not artist_name:
         return ""
-    cache_key = f"artist::{str(username or '').casefold()}::{artist_name.casefold()}"
+
+    # v2 invalidates old cached misses from the first implementation, which
+    # only understood one Last.fm page-image representation.
+    cache_key = f"artist-v2::{str(username or '').casefold()}::{artist_name.casefold()}"
     cached = lastfm_web_image_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -2481,9 +2511,9 @@ def lastfm_artist_image_url(username: str, artist: str, artist_url: str = "") ->
     encoded_artist = lastfm_music_path_component(artist_name)
     encoded_user = quote_plus(str(username or LASTFM_PROFILE_USERNAME).strip(), safe="")
     candidates = [
-        # Try the user's public library page first. When Last.fm exposes a Pro
-        # preferred image publicly for that user's library, this is the route
-        # most likely to carry it.
+        # Pro preferred images are a per-user visual preference. The user's
+        # public library page is checked first because it is the public page
+        # most likely to render that preference.
         f"https://www.last.fm/user/{encoded_user}/library/music/{encoded_artist}",
     ]
     canonical_url = str(artist_url or "").strip()
@@ -2494,9 +2524,30 @@ def lastfm_artist_image_url(username: str, artist: str, artist_url: str = "") ->
     candidates.append(f"https://www.last.fm/music/{encoded_artist}")
 
     for candidate in dict.fromkeys(candidates):
-        image_url = extract_lastfm_header_image(fetch_lastfm_html(candidate))
+        html_text = fetch_lastfm_html(candidate)
+        image_url = useful_lastfm_image_url(extract_lastfm_artist_page_image(html_text))
         if image_url:
             return lastfm_web_image_cache_put(cache_key, image_url)
+
+    # Documented API fallback. Supplying username gives user-context playcount;
+    # Last.fm does not document a preferred-image field here, but the ordinary
+    # image array is still useful when it is not the historical placeholder.
+    try:
+        payload = lastfm_json_request(
+            {
+                "method": "artist.getInfo",
+                "artist": artist_name,
+                "username": str(username or LASTFM_PROFILE_USERNAME).strip(),
+                "autocorrect": 1,
+            }
+        )
+        artist_info = payload.get("artist") if isinstance(payload.get("artist"), dict) else {}
+        image_url = useful_lastfm_image_url(best_lastfm_image_url(artist_info.get("image")))
+        if image_url:
+            return lastfm_web_image_cache_put(cache_key, image_url)
+    except Exception:
+        pass
+
     return lastfm_web_image_cache_put(cache_key, "")
 
 
@@ -2550,23 +2601,12 @@ def enrich_lastfm_chart_images(username: str, mode: str, items: list[dict[str, A
         return
 
     if mode == "artists":
-        def resolve_artist(item: dict[str, Any]) -> str:
-            return lastfm_artist_image_url(username, str(item.get("artist") or item.get("title") or ""), str(item.get("url") or ""))
-
-        workers = min(8, len(items))
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            futures = [(item, pool.submit(resolve_artist, item)) for item in items]
-            for item, future in futures:
-                try:
-                    image_url = useful_lastfm_image_url(future.result())
-                except Exception:
-                    image_url = ""
-                if image_url:
-                    item["image"] = image_url
-                    item["imageSource"] = "Last.fm artist page"
-        return
-
-    if mode not in {"songs", "recent"}:
+        # Artist photos are deliberately resolved lazily by /api/lastfm-artist-image
+        # as their tiles enter the browser viewport. Resolving hundreds or 1,000
+        # public Last.fm artist pages here would make the chart request block for
+        # far too long.
+        for item in items:
+            item["image"] = ""
         return
 
     missing = [item for item in items if not useful_lastfm_image_url(item.get("image"))]
@@ -2705,55 +2745,72 @@ def lastfm_direct_chart(username: str, mode: str, period: str, limit: int) -> li
         "artists": ("user.getTopArtists", "topartists", "artist"),
     }
     method, root_key, item_key = method_map[mode]
-    payload = lastfm_json_request(
-        {
-            "method": method,
-            "user": username,
-            "period": period,
-            "limit": limit,
-            "page": 1,
-        }
-    )
-    root = payload.get(root_key) if isinstance(payload.get(root_key), dict) else {}
-    raw_items = root.get(item_key)
-    if isinstance(raw_items, dict):
-        raw_items = [raw_items]
-    if not isinstance(raw_items, list):
-        return []
-
+    requested = min(LASTFM_CHART_MAX_ITEMS, max(1, int(limit)))
     items: list[dict[str, Any]] = []
-    for index, raw in enumerate(raw_items[:limit], start=1):
-        if not isinstance(raw, dict):
-            continue
-        playcount = max(0, lastfm_int_value(raw.get("playcount"), 0))
-        image = best_lastfm_image_url(raw.get("image"))
-        if mode == "albums":
-            title = str(raw.get("name") or "").strip()
-            artist = lastfm_text_value(raw.get("artist"))
-            album = title
-        elif mode == "songs":
-            title = str(raw.get("name") or "").strip()
-            artist = lastfm_text_value(raw.get("artist"))
-            album = ""
-        else:
-            artist = str(raw.get("name") or "").strip()
-            title = artist
-            album = ""
-        if not title:
-            continue
-        items.append(
+    page = 1
+
+    # The top-chart methods expose page + limit. Use conservative 100-item pages
+    # rather than relying on an undocumented very-large per-page limit.
+    while len(items) < requested:
+        per_page = min(100, requested - len(items))
+        payload = lastfm_json_request(
             {
-                "rank": index,
-                "artist": artist,
-                "title": title,
-                "album": album,
-                "playcount": playcount,
-                "image": image,
-                "url": str(raw.get("url") or "").strip(),
-                "timestamp": 0,
-                "nowPlaying": False,
+                "method": method,
+                "user": username,
+                "period": period,
+                "limit": per_page,
+                "page": page,
             }
         )
+        root = payload.get(root_key) if isinstance(payload.get(root_key), dict) else {}
+        raw_items = root.get(item_key)
+        if isinstance(raw_items, dict):
+            raw_items = [raw_items]
+        if not isinstance(raw_items, list) or not raw_items:
+            break
+
+        before = len(items)
+        for raw in raw_items:
+            if len(items) >= requested:
+                break
+            if not isinstance(raw, dict):
+                continue
+            playcount = max(0, lastfm_int_value(raw.get("playcount"), 0))
+            image = best_lastfm_image_url(raw.get("image"))
+            if mode == "albums":
+                title = str(raw.get("name") or "").strip()
+                artist = lastfm_text_value(raw.get("artist"))
+                album = title
+            elif mode == "songs":
+                title = str(raw.get("name") or "").strip()
+                artist = lastfm_text_value(raw.get("artist"))
+                album = ""
+            else:
+                artist = str(raw.get("name") or "").strip()
+                title = artist
+                album = ""
+            if not title:
+                continue
+            items.append(
+                {
+                    "rank": len(items) + 1,
+                    "artist": artist,
+                    "title": title,
+                    "album": album,
+                    "playcount": playcount,
+                    "image": image,
+                    "url": str(raw.get("url") or "").strip(),
+                    "timestamp": 0,
+                    "nowPlaying": False,
+                }
+            )
+
+        attrs = root.get("@attr") if isinstance(root.get("@attr"), dict) else {}
+        total_pages = max(1, lastfm_int_value(attrs.get("totalPages"), page))
+        if page >= total_pages or len(items) == before or len(raw_items) < per_page:
+            break
+        page += 1
+
     return items
 
 
@@ -2834,6 +2891,26 @@ def lastfm_recent_items(rows: list[dict[str, Any]], limit: int) -> list[dict[str
             }
         )
     return items
+
+
+@app.route("/api/lastfm-artist-image", methods=["GET"])
+def api_lastfm_artist_image():
+    username = str(request.args.get("user") or LASTFM_PROFILE_USERNAME).strip() or LASTFM_PROFILE_USERNAME
+    if username.casefold() != LASTFM_PROFILE_USERNAME.casefold():
+        return "Unknown Last.fm profile.", 400
+
+    artist = str(request.args.get("artist") or "").strip()
+    artist_url = str(request.args.get("url") or "").strip()
+    if not artist:
+        return "Artist is required.", 400
+
+    image_url = lastfm_artist_image_url(username, artist, artist_url)
+    if not image_url:
+        return "Artist image was not found.", 404
+
+    response = redirect(image_url, code=302)
+    response.headers["Cache-Control"] = "public, max-age=86400"
+    return response
 
 
 @app.route("/api/lastfm-chart", methods=["GET"])
