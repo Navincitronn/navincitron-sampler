@@ -2448,15 +2448,11 @@ def extract_lastfm_header_image(html_text: str) -> str:
             if image_url:
                 return image_url
 
-    # Some page variants expose an ordinary image instead of the CSS header.
-    for tag in re.findall(r"<img\b[^>]*>", decoded, flags=re.IGNORECASE):
-        if "header-new-background-image" not in tag and "avatar" not in tag.lower():
-            continue
-        src_match = re.search(r"(?:src|data-src)\s*=\s*([\"'])(https?://.*?)\1", tag, flags=re.IGNORECASE)
-        if src_match:
-            image_url = useful_lastfm_image_url(src_match.group(2))
-            if image_url:
-                return image_url
+    # Do not fall back to arbitrary <img> / avatar elements here. User-library
+    # pages contain the Last.fm account avatar, and treating that as an artist
+    # image caused every artist tile to resolve to the Navincitron profile photo.
+    # Artist pages are handled by extract_lastfm_artist_gallery_image() first;
+    # music pages that lack a CSS hero can still use their page metadata below.
 
     # Final non-personalized fallback for page variants that use metadata.
     meta_match = re.search(
@@ -2501,26 +2497,24 @@ def lastfm_artist_image_url(username: str, artist: str, artist_url: str = "") ->
     if not artist_name:
         return ""
 
-    # v2 invalidates old cached misses from the first implementation, which
-    # only understood one Last.fm page-image representation.
-    cache_key = f"artist-v2::{str(username or '').casefold()}::{artist_name.casefold()}"
+    # v3 invalidates the v2 artist-image cache. v2 checked the user's public
+    # library page first; that page exposes the user's account avatar and can
+    # therefore return the same Navincitron profile picture for every artist.
+    cache_key = f"artist-v3::{str(username or '').casefold()}::{artist_name.casefold()}"
     cached = lastfm_web_image_cache_get(cache_key)
     if cached is not None:
         return cached
 
     encoded_artist = lastfm_music_path_component(artist_name)
-    encoded_user = quote_plus(str(username or LASTFM_PROFILE_USERNAME).strip(), safe="")
-    candidates = [
-        # Pro preferred images are a per-user visual preference. The user's
-        # public library page is checked first because it is the public page
-        # most likely to render that preference.
-        f"https://www.last.fm/user/{encoded_user}/library/music/{encoded_artist}",
-    ]
+    candidates = []
     canonical_url = str(artist_url or "").strip()
     if canonical_url.startswith("http://www.last.fm/"):
         canonical_url = "https://www.last.fm/" + canonical_url[len("http://www.last.fm/"):]
-    if canonical_url.startswith("https://www.last.fm/"):
+    if canonical_url.startswith("https://www.last.fm/") and "/music/" in canonical_url:
         candidates.append(canonical_url)
+    # Always include the canonical public artist page. Unlike /user/.../library,
+    # this page's +images hero belongs to the requested artist rather than the
+    # account whose library is being viewed.
     candidates.append(f"https://www.last.fm/music/{encoded_artist}")
 
     for candidate in dict.fromkeys(candidates):
@@ -2909,7 +2903,10 @@ def api_lastfm_artist_image():
         return "Artist image was not found.", 404
 
     response = redirect(image_url, code=302)
-    response.headers["Cache-Control"] = "public, max-age=86400"
+    # Artist-image choice may change independently of the chart. Avoid pinning a
+    # bad redirect (such as the former profile-avatar result) in the browser.
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     return response
 
 
