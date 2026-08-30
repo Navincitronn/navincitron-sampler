@@ -973,6 +973,8 @@ def normalize_topster_settings(value: Any) -> dict[str, Any]:
             "width": clamp_int(raw.get("width"), 1, 25, 10),
             "height": clamp_int(raw.get("height"), 1, 10, 10),
             "sidebarMode": raw.get("sidebarMode") if raw.get("sidebarMode") in allowed_sidebar_modes else "artist-title",
+            "sidebarWidth": clamp_int(raw.get("sidebarWidth"), 10, 50, 20),
+            "sidebarTextScale": clamp_int(raw.get("sidebarTextScale"), 50, 200, 100),
             "roundCorners": clamp_int(raw.get("roundCorners"), 0, 24, 0),
             "albumGap": clamp_int(raw.get("albumGap"), 0, 100, 4),
             "font": raw.get("font") if raw.get("font") in allowed_fonts else "Arial",
