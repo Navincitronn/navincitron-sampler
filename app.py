@@ -70,9 +70,9 @@ TOPSTER_REDIS_CLIENT_ERROR = ""
 DISCOGS_COLLECTION_USERNAME = (os.getenv("DISCOGS_COLLECTION_USERNAME", "NNavincitron").strip() or "NNavincitron")
 DISCOGS_COLLECTION_MEMORY_CACHE: dict[str, Any] = {}
 try:
-    DISCOGS_COLLECTION_CACHE_SECONDS = max(60, int(os.getenv("DISCOGS_COLLECTION_CACHE_SECONDS", "1800") or 1800))
+    DISCOGS_COLLECTION_CACHE_SECONDS = max(60, int(os.getenv("DISCOGS_COLLECTION_CACHE_SECONDS", "604800") or 604800))
 except (TypeError, ValueError):
-    DISCOGS_COLLECTION_CACHE_SECONDS = 1800
+    DISCOGS_COLLECTION_CACHE_SECONDS = 604800
 
 
 SCOPE = (
@@ -1348,7 +1348,7 @@ def topster_admin_login():
             body {{ background:#333; color:#fff; font-family:Arial,sans-serif; display:grid; place-items:center; min-height:100vh; margin:0; }}
             form {{ background:#444; border-radius:10px; padding:24px; width:min(420px, calc(100vw - 32px)); }}
             input {{ box-sizing:border-box; width:100%; padding:10px; margin:10px 0 16px; }}
-            button {{ background:#1974D2; border:0; border-radius:5px; color:white; cursor:pointer; padding:10px 18px; }}
+            button {{ background:#40bcf4; border:0; border-radius:5px; color:white; cursor:pointer; padding:10px 18px; }}
         </style>
     </head>
     <body>
