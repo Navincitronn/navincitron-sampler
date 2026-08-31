@@ -79,7 +79,7 @@ except (TypeError, ValueError):
 # Increment this whenever the collection payload/matching contract changes. The
 # version is part of the Redis key, so a deploy cannot silently keep serving a
 # week-old collection snapshot produced by an older matcher revision.
-DISCOGS_COLLECTION_CACHE_VERSION = 8
+DISCOGS_COLLECTION_CACHE_VERSION = 9
 
 
 SCOPE = (
@@ -1304,11 +1304,23 @@ def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
     return payload
 
 
+def discogs_collection_json_response(payload: dict[str, Any], status_code: int = 200):
+    response = jsonify(payload)
+    response.status_code = status_code
+    # The application already maintains its own versioned Redis/browser cache.
+    # Do not let a browser, proxy, or CDN pin an older collection payload on top
+    # of that cache contract.
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 @app.route("/api/discogs-collection", methods=["GET"])
 def api_discogs_collection():
     username = str(request.args.get("username") or DISCOGS_COLLECTION_USERNAME).strip() or DISCOGS_COLLECTION_USERNAME
     if username.casefold() != DISCOGS_COLLECTION_USERNAME.casefold():
-        return jsonify({"ok": False, "error": "Only the configured Navincitron Discogs collection is available."}), 400
+        return discogs_collection_json_response({"ok": False, "error": "Only the configured Navincitron Discogs collection is available."}, 400)
 
     force_refresh = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes"}
     if force_refresh:
@@ -1323,20 +1335,20 @@ def api_discogs_collection():
     else:
         cached = read_discogs_collection_cache(username)
         if cached and int(cached.get("cacheVersion") or 0) == DISCOGS_COLLECTION_CACHE_VERSION:
-            return jsonify(cached)
+            return discogs_collection_json_response(cached)
 
     try:
         payload = fetch_full_discogs_collection(username)
         write_discogs_collection_cache(username, payload)
-        return jsonify(payload)
+        return discogs_collection_json_response(payload)
     except Exception as error:
         cached = read_discogs_collection_cache(username)
         if cached:
             cached = dict(cached)
             cached["stale"] = True
             cached["warning"] = str(error)
-            return jsonify(cached)
-        return jsonify({"ok": False, "error": str(error)}), 502
+            return discogs_collection_json_response(cached)
+        return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
 
 
 @app.route("/topster-admin-login", methods=["GET", "POST"])
