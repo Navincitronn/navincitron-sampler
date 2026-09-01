@@ -2372,29 +2372,72 @@ def lastfm_json_request(params: dict[str, Any]) -> dict[str, Any]:
         },
     )
 
-    try:
-        with urlopen(lastfm_request, timeout=10) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
-    except HTTPError as error:
-        raise RuntimeError(f"Last.fm request failed with HTTP {error.code}.") from error
-    except URLError as error:
-        raise RuntimeError(f"Could not reach Last.fm: {error.reason}") from error
-    except json.JSONDecodeError as error:
-        raise RuntimeError("Last.fm returned an unreadable JSON response.") from error
+    # Long custom-range charts can require many Last.fm calls. A single
+    # transient 500/502/503/504 (or Last.fm's temporary-error/rate-limit
+    # response) should not abort the entire chart.
+    max_attempts = 4
+    transient_http_codes = {429, 500, 502, 503, 504}
+    transient_lastfm_codes = {11, 16, 29}
+    last_error: Exception | None = None
 
-    if not isinstance(payload, dict):
-        raise RuntimeError("Last.fm returned an invalid JSON response.")
-    if payload.get("error"):
-        raise RuntimeError(
-            f"Last.fm API error {payload.get('error')}: "
-            f"{str(payload.get('message') or 'lookup failed').strip()}"
-        )
-    return payload
+    for attempt in range(max_attempts):
+        payload: Any = None
+        try:
+            with urlopen(lastfm_request, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        except HTTPError as error:
+            last_error = error
+            if error.code in transient_http_codes and attempt < max_attempts - 1:
+                retry_after = error.headers.get("Retry-After") if error.headers else None
+                try:
+                    wait_seconds = float(retry_after) if retry_after is not None else 0.0
+                except (TypeError, ValueError):
+                    wait_seconds = 0.0
+                if wait_seconds <= 0:
+                    wait_seconds = min(4.0, 0.6 * (2 ** attempt))
+                time.sleep(max(0.25, min(8.0, wait_seconds)))
+                continue
+            raise RuntimeError(f"Last.fm request failed with HTTP {error.code}.") from error
+        except URLError as error:
+            last_error = error
+            if attempt < max_attempts - 1:
+                time.sleep(min(4.0, 0.6 * (2 ** attempt)))
+                continue
+            raise RuntimeError(f"Could not reach Last.fm: {error.reason}") from error
+        except json.JSONDecodeError as error:
+            last_error = error
+            if attempt < max_attempts - 1:
+                time.sleep(min(2.0, 0.4 * (2 ** attempt)))
+                continue
+            raise RuntimeError("Last.fm returned an unreadable JSON response.") from error
+
+        if not isinstance(payload, dict):
+            last_error = RuntimeError("Last.fm returned an invalid JSON response.")
+            if attempt < max_attempts - 1:
+                time.sleep(min(2.0, 0.4 * (2 ** attempt)))
+                continue
+            raise last_error
+
+        if payload.get("error"):
+            error_code = lastfm_int_value(payload.get("error"), 0)
+            message = str(payload.get("message") or "lookup failed").strip()
+            if error_code in transient_lastfm_codes and attempt < max_attempts - 1:
+                time.sleep(min(5.0, 0.75 * (2 ** attempt)))
+                continue
+            raise RuntimeError(f"Last.fm API error {payload.get('error')}: {message}")
+
+        return payload
+
+    raise RuntimeError(f"Last.fm request failed after retries: {last_error}")
 
 
 LASTFM_PROFILE_USERNAME = (os.getenv("LASTFM_PROFILE_USERNAME", "Navincitron").strip() or "Navincitron")
 LASTFM_CHART_MAX_ITEMS = 1000
 LASTFM_RECENT_MAX_SCROBBLES = 50_000
+LASTFM_WEEKLY_CHART_CACHE: dict[str, dict[str, Any]] = {}
+LASTFM_WEEKLY_CHART_CACHE_LOCK = threading.Lock()
+LASTFM_WEEKLY_CHART_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
+LASTFM_WEEKLY_CHART_CACHE_MAX_ITEMS = 1200
 LASTFM_WEB_IMAGE_CACHE: dict[str, dict[str, Any]] = {}
 LASTFM_WEB_IMAGE_CACHE_LOCK = threading.Lock()
 LASTFM_WEB_IMAGE_MATCH_TTL_SECONDS = 30 * 24 * 60 * 60
@@ -2928,6 +2971,394 @@ def lastfm_direct_chart(username: str, mode: str, period: str, limit: int) -> li
     return items
 
 
+
+def lastfm_weekly_chart_cache_key(username: str, mode: str, from_ts: int, to_ts: int) -> str:
+    return f"{username.casefold()}\u241f{mode}\u241f{int(from_ts)}\u241f{int(to_ts)}"
+
+
+def lastfm_weekly_chart_cache_get(username: str, mode: str, from_ts: int, to_ts: int) -> list[dict[str, Any]] | None:
+    key = lastfm_weekly_chart_cache_key(username, mode, from_ts, to_ts)
+    now = time.time()
+    with LASTFM_WEEKLY_CHART_CACHE_LOCK:
+        cached = LASTFM_WEEKLY_CHART_CACHE.get(key)
+        if not isinstance(cached, dict):
+            return None
+        if now - float(cached.get("timestamp") or 0) >= LASTFM_WEEKLY_CHART_CACHE_TTL_SECONDS:
+            LASTFM_WEEKLY_CHART_CACHE.pop(key, None)
+            return None
+        items = cached.get("items")
+        if not isinstance(items, list):
+            return None
+        return [dict(item) for item in items if isinstance(item, dict)]
+
+
+def lastfm_weekly_chart_cache_put(
+    username: str,
+    mode: str,
+    from_ts: int,
+    to_ts: int,
+    items: list[dict[str, Any]],
+) -> None:
+    key = lastfm_weekly_chart_cache_key(username, mode, from_ts, to_ts)
+    with LASTFM_WEEKLY_CHART_CACHE_LOCK:
+        LASTFM_WEEKLY_CHART_CACHE[key] = {
+            "timestamp": time.time(),
+            "items": [dict(item) for item in items if isinstance(item, dict)],
+        }
+        if len(LASTFM_WEEKLY_CHART_CACHE) > LASTFM_WEEKLY_CHART_CACHE_MAX_ITEMS:
+            oldest_keys = sorted(
+                LASTFM_WEEKLY_CHART_CACHE,
+                key=lambda cache_key: float(
+                    (LASTFM_WEEKLY_CHART_CACHE.get(cache_key) or {}).get("timestamp") or 0
+                ),
+            )
+            remove_count = max(
+                1,
+                len(LASTFM_WEEKLY_CHART_CACHE) - LASTFM_WEEKLY_CHART_CACHE_MAX_ITEMS,
+            )
+            for cache_key in oldest_keys[:remove_count]:
+                LASTFM_WEEKLY_CHART_CACHE.pop(cache_key, None)
+
+
+def lastfm_weekly_chart_ranges(username: str) -> list[tuple[int, int]]:
+    payload = lastfm_json_request(
+        {
+            "method": "user.getWeeklyChartList",
+            "user": username,
+        }
+    )
+    root = payload.get("weeklychartlist") if isinstance(payload.get("weeklychartlist"), dict) else {}
+    raw_charts = root.get("chart")
+    if isinstance(raw_charts, dict):
+        raw_charts = [raw_charts]
+    if not isinstance(raw_charts, list):
+        return []
+
+    ranges: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for raw in raw_charts:
+        if not isinstance(raw, dict):
+            continue
+        start = lastfm_int_value(raw.get("from"), 0)
+        end = lastfm_int_value(raw.get("to"), 0)
+        if start <= 0 or end <= start:
+            continue
+        pair = (start, end)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        ranges.append(pair)
+
+    ranges.sort(key=lambda pair: (pair[0], pair[1]))
+    return ranges
+
+
+def lastfm_weekly_chart_items(
+    username: str,
+    mode: str,
+    from_ts: int,
+    to_ts: int,
+) -> list[dict[str, Any]]:
+    cached = lastfm_weekly_chart_cache_get(username, mode, from_ts, to_ts)
+    if cached is not None:
+        return cached
+
+    method_map = {
+        "albums": ("user.getWeeklyAlbumChart", "weeklyalbumchart", "album"),
+        "songs": ("user.getWeeklyTrackChart", "weeklytrackchart", "track"),
+        "artists": ("user.getWeeklyArtistChart", "weeklyartistchart", "artist"),
+    }
+    method, root_key, item_key = method_map[mode]
+    payload = lastfm_json_request(
+        {
+            "method": method,
+            "user": username,
+            "from": int(from_ts),
+            "to": int(to_ts),
+        }
+    )
+    root = payload.get(root_key) if isinstance(payload.get(root_key), dict) else {}
+    raw_items = root.get(item_key)
+    if isinstance(raw_items, dict):
+        raw_items = [raw_items]
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    items: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        playcount = max(0, lastfm_int_value(raw.get("playcount"), 0))
+        if playcount <= 0:
+            continue
+
+        image = best_lastfm_image_url(raw.get("image"))
+        if mode == "artists":
+            artist = str(raw.get("name") or "").strip()
+            title = artist
+            album = ""
+        elif mode == "albums":
+            title = str(raw.get("name") or "").strip()
+            artist = lastfm_text_value(raw.get("artist"))
+            album = title
+        else:
+            title = str(raw.get("name") or "").strip()
+            artist = lastfm_text_value(raw.get("artist"))
+            album = ""
+
+        if not title:
+            continue
+        items.append(
+            {
+                "artist": artist,
+                "title": title,
+                "album": album,
+                "playcount": playcount,
+                "image": image,
+                "url": str(raw.get("url") or "").strip(),
+                "timestamp": int(to_ts),
+                "nowPlaying": False,
+            }
+        )
+
+    lastfm_weekly_chart_cache_put(username, mode, from_ts, to_ts, items)
+    return items
+
+
+def lastfm_merge_counted_items(
+    buckets: dict[str, dict[str, Any]],
+    items: list[dict[str, Any]],
+    mode: str,
+) -> None:
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        artist = str(raw.get("artist") or "").strip()
+        title = str(raw.get("title") or "").strip()
+        album = str(raw.get("album") or "").strip()
+        playcount = max(0, lastfm_int_value(raw.get("playcount"), 0))
+        if playcount <= 0:
+            continue
+
+        if mode == "artists":
+            key = artist.casefold()
+            display_title = artist
+        else:
+            key = f"{artist.casefold()}\u241f{title.casefold()}"
+            display_title = title
+        if not key or not display_title:
+            continue
+
+        item = buckets.setdefault(
+            key,
+            {
+                "artist": artist,
+                "title": display_title,
+                "album": album if mode != "artists" else "",
+                "playcount": 0,
+                "image": str(raw.get("image") or ""),
+                "url": str(raw.get("url") or ""),
+                "timestamp": lastfm_int_value(raw.get("timestamp"), 0),
+                "nowPlaying": False,
+            },
+        )
+        item["playcount"] += playcount
+
+        raw_ts = lastfm_int_value(raw.get("timestamp"), 0)
+        if raw_ts >= lastfm_int_value(item.get("timestamp"), 0):
+            item["timestamp"] = raw_ts
+            if raw.get("image"):
+                item["image"] = str(raw.get("image") or "")
+            if raw.get("url"):
+                item["url"] = str(raw.get("url") or "")
+            if mode != "artists" and album:
+                item["album"] = album
+
+
+def lastfm_recent_rows_as_counted_items(rows: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
+    counted: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("nowPlaying"):
+            continue
+        artist = str(row.get("artist") or "").strip()
+        track = str(row.get("track") or "").strip()
+        album = str(row.get("album") or "").strip()
+
+        if mode == "albums":
+            if not album:
+                continue
+            title = album
+        elif mode == "songs":
+            if not track:
+                continue
+            title = track
+        else:
+            if not artist:
+                continue
+            title = artist
+
+        counted.append(
+            {
+                "artist": artist,
+                "title": title,
+                "album": album if mode != "artists" else "",
+                "playcount": 1,
+                "image": str(row.get("image") or ""),
+                "url": str(row.get("url") or ""),
+                "timestamp": lastfm_int_value(row.get("timestamp"), 0),
+                "nowPlaying": False,
+            }
+        )
+    return counted
+
+
+def lastfm_uncovered_ranges(
+    from_ts: int,
+    to_ts: int,
+    covered_ranges: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    cursor = int(from_ts)
+    end_limit = int(to_ts)
+    gaps: list[tuple[int, int]] = []
+
+    for start, end in sorted(covered_ranges, key=lambda pair: (pair[0], pair[1])):
+        if end < cursor:
+            continue
+        if start > end_limit:
+            break
+        if start > cursor:
+            gaps.append((cursor, min(end_limit, start - 1)))
+        cursor = max(cursor, end + 1)
+        if cursor > end_limit:
+            break
+
+    if cursor <= end_limit:
+        gaps.append((cursor, end_limit))
+
+    return [(start, end) for start, end in gaps if end >= start]
+
+
+def lastfm_custom_aggregate_weekly(
+    username: str,
+    mode: str,
+    from_ts: int,
+    to_ts: int,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int, bool, int, int]:
+    """
+    Build a long custom-range chart without paging through every raw scrobble.
+
+    Last.fm exposes historical weekly chart ranges explicitly. For complete weeks
+    inside the requested custom interval, fetch the already-aggregated weekly
+    artist/album/track chart. Only the partial edge ranges (and any week whose
+    weekly-chart request ultimately fails) fall back to recent-track pagination.
+
+    Returns:
+        items,
+        sampled_recent_scrobbles,
+        recent_fallback_truncated,
+        weekly_ranges_used,
+        weekly_ranges_failed
+    """
+    available_ranges = lastfm_weekly_chart_ranges(username)
+    complete_ranges = [
+        (start, end)
+        for start, end in available_ranges
+        if start >= int(from_ts) and end <= int(to_ts)
+    ]
+
+    # If there is no complete historical week in the requested window, the
+    # existing recent-track path is simpler and exact.
+    if not complete_ranges:
+        rows, truncated = lastfm_recent_track_rows(
+            username,
+            int(from_ts),
+            int(to_ts),
+            max_scrobbles=LASTFM_RECENT_MAX_SCROBBLES,
+        )
+        return (
+            lastfm_aggregate_recent(rows, mode, limit),
+            len(rows),
+            truncated,
+            0,
+            0,
+        )
+
+    buckets: dict[str, dict[str, Any]] = {}
+    failed_ranges: list[tuple[int, int]] = []
+
+    # Fetch the historical weekly aggregates concurrently, but keep the worker
+    # count deliberately modest to remain friendly to Last.fm's API.
+    max_workers = min(4, max(1, len(complete_ranges)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_rows = [
+            (
+                date_range,
+                pool.submit(
+                    lastfm_weekly_chart_items,
+                    username,
+                    mode,
+                    date_range[0],
+                    date_range[1],
+                ),
+            )
+            for date_range in complete_ranges
+        ]
+        for date_range, future in future_rows:
+            try:
+                weekly_items = future.result()
+            except Exception:
+                failed_ranges.append(date_range)
+                continue
+            lastfm_merge_counted_items(buckets, weekly_items, mode)
+
+    successful_ranges = [
+        date_range for date_range in complete_ranges if date_range not in set(failed_ranges)
+    ]
+    fallback_ranges = lastfm_uncovered_ranges(
+        int(from_ts),
+        int(to_ts),
+        successful_ranges,
+    )
+
+    sampled_recent = 0
+    truncated = False
+    for gap_from, gap_to in fallback_ranges:
+        rows, gap_truncated = lastfm_recent_track_rows(
+            username,
+            gap_from,
+            gap_to,
+            max_scrobbles=LASTFM_RECENT_MAX_SCROBBLES,
+        )
+        sampled_recent += len(rows)
+        truncated = truncated or gap_truncated
+        lastfm_merge_counted_items(
+            buckets,
+            lastfm_recent_rows_as_counted_items(rows, mode),
+            mode,
+        )
+
+    ordered = sorted(
+        buckets.values(),
+        key=lambda item: (
+            -lastfm_int_value(item.get("playcount"), 0),
+            -lastfm_int_value(item.get("timestamp"), 0),
+            str(item.get("title") or "").casefold(),
+        ),
+    )
+    final_items = ordered[:limit]
+    for index, item in enumerate(final_items, start=1):
+        item["rank"] = index
+
+    return (
+        final_items,
+        sampled_recent,
+        truncated,
+        len(successful_ranges),
+        len(failed_ranges),
+    )
+
+
 def lastfm_aggregate_recent(rows: list[dict[str, Any]], mode: str, limit: int) -> list[dict[str, Any]]:
     buckets: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -3152,9 +3583,27 @@ def api_lastfm_chart():
         direct_period = lastfm_direct_period(period)
         truncated = False
         sampled_scrobbles = 0
+        weekly_ranges_used = 0
+        weekly_ranges_failed = 0
+
         if mode != "recent" and direct_period:
             items = lastfm_direct_chart(username, mode, direct_period, limit)
             source = "Last.fm top chart"
+        elif mode != "recent" and period == "custom":
+            (
+                items,
+                sampled_scrobbles,
+                truncated,
+                weekly_ranges_used,
+                weekly_ranges_failed,
+            ) = lastfm_custom_aggregate_weekly(
+                username,
+                mode,
+                int(custom_from),
+                int(custom_to),
+                limit,
+            )
+            source = "Last.fm weekly-chart aggregation"
         else:
             from_ts, to_ts = lastfm_period_bounds(period, custom_from, custom_to)
             recent_cap = limit if mode == "recent" else LASTFM_RECENT_MAX_SCROBBLES
@@ -3184,6 +3633,8 @@ def api_lastfm_chart():
                 "itemCount": len(items),
                 "sampledScrobbles": sampled_scrobbles,
                 "truncated": truncated,
+                "weeklyRangesUsed": weekly_ranges_used,
+                "weeklyRangesFailed": weekly_ranges_failed,
                 "source": source,
                 "generatedAt": int(time.time()),
             }
