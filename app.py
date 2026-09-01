@@ -1685,8 +1685,36 @@ def lyrics_discogs_vinyl_tracklist():
     source_album = str(request.args.get("album") or "").strip()
     current_track_title = str(request.args.get("track") or "").strip()
 
-    if not collection_title:
-        return discogs_collection_json_response({"ok": False, "error": "A matched Discogs collection title is required."}, 400)
+    requested_collection_matches: list[dict[str, str]] = []
+    raw_collection_matches = str(request.args.get("collection_matches") or "").strip()
+    if raw_collection_matches:
+        try:
+            parsed_matches = json.loads(raw_collection_matches)
+            if isinstance(parsed_matches, list):
+                for item in parsed_matches[:16]:
+                    if not isinstance(item, dict):
+                        continue
+                    title = str(item.get("title") or "").strip()
+                    artist = str(item.get("artist") or "").strip()
+                    if title:
+                        requested_collection_matches.append({"title": title, "artist": artist})
+        except json.JSONDecodeError:
+            requested_collection_matches = []
+
+    if collection_title:
+        requested_collection_matches.insert(0, {"title": collection_title, "artist": collection_artist})
+
+    deduped_requests: list[dict[str, str]] = []
+    seen_request_keys: set[str] = set()
+    for item in requested_collection_matches:
+        key = f"{normalize_discogs_artist_for_lookup(item.get('artist'))}::{normalize_lyrics_match_text(item.get('title'))}"
+        if not key or key in seen_request_keys:
+            continue
+        seen_request_keys.add(key)
+        deduped_requests.append(item)
+
+    if not deduped_requests:
+        return discogs_collection_json_response({"ok": False, "error": "At least one matched Discogs collection title is required."}, 400)
 
     username = DISCOGS_COLLECTION_USERNAME
     try:
@@ -1694,54 +1722,79 @@ def lyrics_discogs_vinyl_tracklist():
     except Exception as error:
         return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
 
-    matched_album = find_discogs_collection_album_record(collection_payload, collection_title, collection_artist)
-    if not matched_album:
+    matched_albums: list[dict[str, Any]] = []
+    seen_album_keys: set[str] = set()
+    for requested_match in deduped_requests:
+        album = find_discogs_collection_album_record(
+            collection_payload,
+            requested_match.get("title", ""),
+            requested_match.get("artist", ""),
+        )
+        if not album:
+            continue
+        album_key = f"{normalize_discogs_artist_for_lookup((album.get('artists') or [''])[0] if isinstance(album.get('artists'), list) and album.get('artists') else album.get('artist'))}::{normalize_lyrics_match_text(album.get('title'))}"
+        if album_key in seen_album_keys:
+            continue
+        seen_album_keys.add(album_key)
+        matched_albums.append(album)
+
+    if not matched_albums:
         return discogs_collection_json_response(
             {
                 "ok": True,
                 "matched": False,
                 "vinylFound": False,
-                "message": "The matched album was not found in the current Discogs collection snapshot.",
+                "message": "Album not owned.",
             }
         )
 
-    candidate_release_ids: list[int] = []
+    candidate_releases: list[tuple[int, dict[str, Any], bool]] = []
     seen_release_ids: set[int] = set()
 
-    def add_album_vinyl_release_ids(album: dict[str, Any]) -> None:
+    def add_album_vinyl_release_ids(album: dict[str, Any], primary: bool) -> None:
         owned_releases = album.get("ownedReleases") if isinstance(album.get("ownedReleases"), list) else []
         for owned_release in owned_releases:
             if not isinstance(owned_release, dict) or not owned_release.get("vinyl"):
                 continue
             release_id = owned_release.get("releaseId")
-            if str(release_id or "").isdigit():
-                release_id_int = int(release_id)
-                if release_id_int not in seen_release_ids:
-                    seen_release_ids.add(release_id_int)
-                    candidate_release_ids.append(release_id_int)
+            if not str(release_id or "").isdigit():
+                continue
+            release_id_int = int(release_id)
+            if release_id_int in seen_release_ids:
+                continue
+            seen_release_ids.add(release_id_int)
+            candidate_releases.append((release_id_int, album, primary))
 
-    add_album_vinyl_release_ids(matched_album)
+    for album in matched_albums:
+        add_album_vinyl_release_ids(album, True)
 
-    # Multi-release/container cases in the Topster ownership matcher can point at a
-    # larger owned package or a related physical release. If the exact album record
-    # does not provide the current song, allow other owned vinyl releases by the
-    # same artist to be considered after the primary match.
-    source_artist_key = normalize_discogs_artist_for_lookup(source_artist or collection_artist)
+    # Related releases remain a fallback for container/multi-release ownership
+    # cases. They are considered only when none of the exact collection matches
+    # contains the currently playing song.
     related_albums: list[dict[str, Any]] = []
-    if source_artist_key:
+    related_artist_keys = {
+        normalize_discogs_artist_for_lookup(source_artist),
+        *{
+            normalize_discogs_artist_for_lookup(artist)
+            for album in matched_albums
+            for artist in (album.get("artists") if isinstance(album.get("artists"), list) else [album.get("artist")])
+        },
+    }
+    related_artist_keys.discard("")
+    if related_artist_keys:
         for album in collection_payload.get("albums") if isinstance(collection_payload.get("albums"), list) else []:
-            if not isinstance(album, dict) or album is matched_album:
+            if not isinstance(album, dict) or album in matched_albums:
                 continue
             album_artists = album.get("artists") if isinstance(album.get("artists"), list) else [album.get("artist")]
-            if any(normalize_discogs_artist_for_lookup(value) == source_artist_key for value in album_artists):
+            if any(normalize_discogs_artist_for_lookup(value) in related_artist_keys for value in album_artists):
                 related_albums.append(album)
 
-    loaded_releases: list[tuple[float, int, dict[str, Any]]] = []
+    loaded_releases: list[tuple[float, float, int, dict[str, Any], dict[str, Any]]] = []
     errors: list[str] = []
 
-    def load_candidate_ids(ids: list[int], primary: bool) -> None:
-        for release_id in ids:
-            if len(loaded_releases) >= 12:
+    def load_candidates(candidates: list[tuple[int, dict[str, Any], bool]]) -> None:
+        for release_id, album, primary in candidates:
+            if len(loaded_releases) >= 20:
                 break
             try:
                 release = fetch_discogs_release(release_id)
@@ -1753,51 +1806,60 @@ def lyrics_discogs_vinyl_tracklist():
                     score += 15.0
                 if discogs_release_has_side_positions(release):
                     score += 5.0
-                loaded_releases.append((score, release_id, release))
+                loaded_releases.append((score, track_score, release_id, release, album))
             except Exception as error:
                 errors.append(f"Release {release_id}: {error}")
 
-    primary_ids = list(candidate_release_ids)
-    load_candidate_ids(primary_ids, True)
+    load_candidates(list(candidate_releases))
 
-    primary_has_track = any(score >= 75.0 for score, _release_id, _release in loaded_releases)
+    primary_has_track = any(track_score >= 0.75 for _score, track_score, _release_id, _release, _album in loaded_releases)
     if current_track_title and not primary_has_track:
-        related_ids: list[int] = []
+        related_candidates: list[tuple[int, dict[str, Any], bool]] = []
+        before_ids = set(seen_release_ids)
         for album in related_albums:
-            before = len(candidate_release_ids)
-            add_album_vinyl_release_ids(album)
-            if len(candidate_release_ids) > before:
-                related_ids.extend(candidate_release_ids[before:])
-        load_candidate_ids(related_ids, False)
+            add_album_vinyl_release_ids(album, False)
+        for candidate in candidate_releases:
+            if candidate[0] not in before_ids:
+                related_candidates.append(candidate)
+        load_candidates(related_candidates)
 
     if not loaded_releases:
+        primary_album = matched_albums[0]
         return discogs_collection_json_response(
             {
                 "ok": True,
                 "matched": True,
                 "vinylFound": False,
                 "collectionAlbum": {
-                    "title": matched_album.get("title"),
-                    "artists": matched_album.get("artists") or [],
-                    "year": matched_album.get("year"),
+                    "title": primary_album.get("title"),
+                    "artists": primary_album.get("artists") or [],
+                    "year": primary_album.get("year"),
                 },
-                "message": "This album is in the Discogs collection, but no owned vinyl release tracklist could be loaded.",
+                "message": "Album owned, but no owned vinyl release tracklist could be loaded.",
                 "errors": errors[:5],
             }
         )
 
     loaded_releases.sort(key=lambda item: item[0], reverse=True)
-    _score, _release_id, selected_release = loaded_releases[0]
+    _score, _track_score, _release_id, selected_release, selected_album = loaded_releases[0]
 
     response_payload = {
         "ok": True,
         "matched": True,
         "vinylFound": True,
         "collectionAlbum": {
-            "title": matched_album.get("title"),
-            "artists": matched_album.get("artists") or [],
-            "year": matched_album.get("year"),
+            "title": selected_album.get("title"),
+            "artists": selected_album.get("artists") or [],
+            "year": selected_album.get("year"),
         },
+        "matchedCollectionAlbums": [
+            {
+                "title": album.get("title"),
+                "artists": album.get("artists") or [],
+                "year": album.get("year"),
+            }
+            for album in matched_albums
+        ],
         "sourceAlbum": source_album,
         "sourceArtist": source_artist,
         "release": selected_release,
