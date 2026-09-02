@@ -66,6 +66,7 @@ CONTROL_FILE = BASE_DIR / "sampler_control.json"
 TOPSTER_COVER_CACHE_FILE = BASE_DIR / "topster_cover_cache.json"
 TOPSTER_SETTINGS_FILE = BASE_DIR / "topster_settings.json"
 TOPSTER_SOURCE_TEXT_FILE = BASE_DIR / "topster_source_text.json"
+LYRICS_DISCOGS_COVER_OVERRIDES_FILE = BASE_DIR / "lyrics_discogs_cover_overrides.json"
 TOPSTER_REDIS_KEY_PREFIX = os.getenv("TOPSTER_REDIS_KEY_PREFIX", "navincitron:topster").strip() or "navincitron:topster"
 TOPSTER_REDIS_CLIENT: Any | None = None
 TOPSTER_REDIS_CLIENT_ERROR = ""
@@ -1570,6 +1571,121 @@ def fetch_discogs_release(release_id: int) -> dict[str, Any]:
     raise RuntimeError(f"Discogs release request failed: {last_error}")
 
 
+def lyrics_discogs_cover_redis_key(release_id: int) -> str:
+    return (
+        f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:"
+        f"lyrics-discogs-cover:{int(release_id)}"
+    )
+
+
+def normalize_lyrics_discogs_cover_override(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    image_url = str(value.get("imageUrl") or value.get("imageSrc") or "").strip()
+    if not image_url.startswith(("http://", "https://")):
+        return None
+    source = str(value.get("source") or "Manual").strip()[:120]
+    href = str(value.get("href") or "").strip()
+    if href and not href.startswith(("http://", "https://")):
+        href = ""
+    saved_at = str(value.get("savedAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())).strip()
+    return {
+        "imageUrl": image_url,
+        "source": source or "Manual",
+        "href": href,
+        "savedAt": saved_at,
+    }
+
+
+def read_lyrics_discogs_cover_override(release_id: int) -> dict[str, Any] | None:
+    release_id = int(release_id)
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                raw = client.get(lyrics_discogs_cover_redis_key(release_id))
+                if raw:
+                    return normalize_lyrics_discogs_cover_override(json.loads(raw))
+        except Exception:
+            pass
+
+    data = read_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, {})
+    if not isinstance(data, dict):
+        return None
+    return normalize_lyrics_discogs_cover_override(data.get(str(release_id)))
+
+
+def write_lyrics_discogs_cover_override(release_id: int, value: dict[str, Any]) -> dict[str, Any]:
+    release_id = int(release_id)
+    normalized = normalize_lyrics_discogs_cover_override(value)
+    if not normalized:
+        raise ValueError("A valid http:// or https:// image URL is required.")
+
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        client.set(lyrics_discogs_cover_redis_key(release_id), json.dumps(normalized, ensure_ascii=False))
+        return normalized
+
+    data = read_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data[str(release_id)] = normalized
+    write_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, data)
+    return normalized
+
+
+def delete_lyrics_discogs_cover_override(release_id: int) -> None:
+    release_id = int(release_id)
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        client.delete(lyrics_discogs_cover_redis_key(release_id))
+        return
+
+    data = read_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, {})
+    if not isinstance(data, dict):
+        return
+    if str(release_id) in data:
+        data.pop(str(release_id), None)
+        write_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, data)
+
+
+@app.route("/api/lyrics/discogs-cover", methods=["POST", "DELETE"])
+def lyrics_discogs_cover_override():
+    admin_error = require_topster_admin_response()
+    if admin_error is not None:
+        return admin_error
+
+    payload = request.get_json(silent=True) or {}
+    release_id_raw = payload.get("releaseId") or request.args.get("release_id")
+    if not str(release_id_raw or "").isdigit():
+        return jsonify({"ok": False, "error": "A valid Discogs releaseId is required."}), 400
+    release_id = int(release_id_raw)
+
+    try:
+        if request.method == "DELETE" or bool(payload.get("reset")):
+            delete_lyrics_discogs_cover_override(release_id)
+            return jsonify({"ok": True, "releaseId": release_id, "coverOverride": None})
+
+        override = write_lyrics_discogs_cover_override(
+            release_id,
+            {
+                "imageUrl": payload.get("imageUrl") or payload.get("imageSrc"),
+                "source": payload.get("source") or "Manual",
+                "href": payload.get("href") or "",
+                "savedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        )
+        return jsonify({"ok": True, "releaseId": release_id, "coverOverride": override})
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except Exception as error:
+        return jsonify({"ok": False, "error": f"Could not save the Lyrics cover override: {error}"}), 500
+
+
 def normalize_discogs_artist_for_lookup(value: Any) -> str:
     text = str(value or "").strip()
     text = re.sub(r"\s*\*+\s*$", "", text)
@@ -1977,6 +2093,9 @@ def lyrics_discogs_vinyl_tracklist():
         "sourceAlbum": source_album,
         "sourceArtist": source_artist,
         "release": selected_release,
+        "coverOverride": read_lyrics_discogs_cover_override(int(selected_release.get("releaseId") or 0))
+        if str(selected_release.get("releaseId") or "").isdigit()
+        else None,
     }
     return discogs_collection_json_response(response_payload)
 
