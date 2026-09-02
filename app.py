@@ -1604,45 +1604,159 @@ def find_discogs_collection_album_record(
     return title_matches[0] if len(title_matches) == 1 else None
 
 
+def discogs_composite_position_from_subtracks(sub_tracks: Any) -> str:
+    positions = [
+        str(entry.get("position") or "").strip().upper()
+        for entry in (sub_tracks if isinstance(sub_tracks, list) else [])
+        if isinstance(entry, dict) and str(entry.get("position") or "").strip()
+    ]
+    if not positions:
+        return ""
+
+    bases = [re.sub(r"[-.]?[IVXLCDM]+$", "", position, flags=re.IGNORECASE) for position in positions]
+    if bases[0] and all(base == bases[0] for base in bases):
+        return bases[0]
+
+    sides = []
+    for position in positions:
+        match = re.match(r"^([A-Z]{1,3})(?=\d|$|[-.])", position)
+        if match:
+            sides.append(match.group(1))
+    if sides and len(sides) == len(positions) and all(side == sides[0] for side in sides):
+        return sides[0]
+    return ""
+
+
 def iter_discogs_release_track_titles(tracklist: Any):
+    """Yield only song-level Discogs titles, not headings or movement sections.
+
+    Discogs uses type_=index for both structural headings and composite works. An
+    untimed index such as "Le Sacre Du Printemps" is only a heading, so recurse
+    into its A/B children. A timed index such as Rush's "Cygnus X-1 Book II:
+    Hemispheres" or "La Villa Strangiato" is the song itself; its A-I/A-II or
+    B3-I/B3-II children are sections and must not become independent songs.
+    """
     for entry in tracklist if isinstance(tracklist, list) else []:
         if not isinstance(entry, dict):
             continue
         title = str(entry.get("title") or "").strip()
         entry_type = str(entry.get("type") or "track").strip().lower()
-        if title and entry_type in {"track", "index"}:
+        duration = str(entry.get("duration") or "").strip()
+        sub_tracks = entry.get("subTracks") if isinstance(entry.get("subTracks"), list) else []
+
+        if entry_type == "index":
+            if title and duration:
+                yield title
+            elif sub_tracks:
+                yield from iter_discogs_release_track_titles(sub_tracks)
+            continue
+
+        if title and entry_type == "track":
             yield title
-        sub_tracks = entry.get("subTracks")
-        if isinstance(sub_tracks, list):
+        if sub_tracks and not duration:
             yield from iter_discogs_release_track_titles(sub_tracks)
 
 
+def lyrics_discogs_track_title_variants(value: Any) -> list[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: Any) -> None:
+        text = re.sub(r"\s+", " ", str(candidate or "")).strip()
+        key = normalize_lyrics_match_text(text)
+        if not text or not key or key in seen:
+            return
+        seen.add(key)
+        variants.append(text)
+
+    add(raw)
+    add(clean_lyrics_track_title(raw))
+    add(re.sub(r"\s*[\[(][^\])]*[\])]\s*$", "", raw))
+    add(re.sub(r"\s+(?:feat\.?|featuring)\s+.+$", "", raw, flags=re.IGNORECASE))
+
+    dash_index = raw.find(" - ")
+    if dash_index >= 3:
+        add(raw[:dash_index])
+    return variants
+
+
+def lyrics_discogs_levenshtein_distance(left_value: Any, right_value: Any) -> int:
+    left = str(left_value or "")
+    right = str(right_value or "")
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i]
+        for j, right_char in enumerate(right, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[j] + 1,
+                    previous[j - 1] + (0 if left_char == right_char else 1),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
 def discogs_track_title_match_score(current_title: Any, discogs_title: Any) -> float:
-    current_raw = str(current_title or "").strip()
-    candidate_raw = str(discogs_title or "").strip()
-    if not current_raw or not candidate_raw:
+    current_variants = lyrics_discogs_track_title_variants(current_title)
+    candidate_variants = lyrics_discogs_track_title_variants(discogs_title)
+    if not current_variants or not candidate_variants:
         return 0.0
 
-    current_clean = clean_lyrics_track_title(current_raw)
-    candidate_clean = clean_lyrics_track_title(candidate_raw)
-    current_key = normalize_lyrics_match_text(current_clean)
-    candidate_key = normalize_lyrics_match_text(candidate_clean)
-    if current_key and current_key == candidate_key:
-        return 1.0
+    best = 0.0
+    for current_variant in current_variants:
+        for candidate_variant in candidate_variants:
+            current_key = normalize_lyrics_match_text(current_variant)
+            candidate_key = normalize_lyrics_match_text(candidate_variant)
+            if not current_key or not candidate_key:
+                continue
+            if current_key == candidate_key:
+                return 1.0
 
-    current_full_key = normalize_lyrics_match_text(current_raw)
-    candidate_full_key = normalize_lyrics_match_text(candidate_raw)
-    if current_full_key and current_full_key == candidate_full_key:
-        return 0.99
+            current_compact = current_key.replace(" ", "")
+            candidate_compact = candidate_key.replace(" ", "")
+            if current_compact and current_compact == candidate_compact:
+                return 0.99
 
-    overlap = lyrics_token_overlap(current_clean, candidate_clean)
-    if overlap >= 0.9:
-        return 0.94
-    if overlap >= 0.75 and min(len(current_key), len(candidate_key)) >= 8:
-        return 0.82
-    if min(len(current_key), len(candidate_key)) >= 10 and (current_key in candidate_key or candidate_key in current_key):
-        return 0.78
-    return 0.0
+            shorter = current_compact if len(current_compact) <= len(candidate_compact) else candidate_compact
+            longer = candidate_compact if len(current_compact) <= len(candidate_compact) else current_compact
+            if len(shorter) >= 4 and longer.startswith(shorter):
+                best = max(best, 0.93)
+
+            left_tokens = set(current_key.split())
+            right_tokens = set(candidate_key.split())
+            if left_tokens and right_tokens:
+                intersection = len(left_tokens & right_tokens)
+                containment = intersection / max(1, min(len(left_tokens), len(right_tokens)))
+                overlap = intersection / max(len(left_tokens), len(right_tokens))
+                if containment == 1 and min(len(left_tokens), len(right_tokens)) >= 2:
+                    best = max(best, 0.91)
+                elif containment >= 0.8:
+                    best = max(best, 0.84)
+                elif overlap >= 0.6:
+                    best = max(best, 0.72)
+
+            if min(len(current_compact), len(candidate_compact)) >= 4:
+                distance = lyrics_discogs_levenshtein_distance(current_compact, candidate_compact)
+                max_length = max(len(current_compact), len(candidate_compact))
+                if distance <= 1:
+                    best = max(best, 0.90)
+                elif distance <= 2 and max_length >= 8:
+                    best = max(best, 0.78)
+
+    return best
 
 
 def discogs_release_track_match_score(release: dict[str, Any], current_track_title: str) -> float:
@@ -1812,7 +1926,7 @@ def lyrics_discogs_vinyl_tracklist():
 
     load_candidates(list(candidate_releases))
 
-    primary_has_track = any(track_score >= 0.75 for _score, track_score, _release_id, _release, _album in loaded_releases)
+    primary_has_track = any(track_score >= 0.55 for _score, track_score, _release_id, _release, _album in loaded_releases)
     if current_track_title and not primary_has_track:
         related_candidates: list[tuple[int, dict[str, Any], bool]] = []
         before_ids = set(seen_release_ids)
