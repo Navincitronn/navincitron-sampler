@@ -1589,12 +1589,22 @@ def normalize_lyrics_discogs_cover_override(value: Any) -> dict[str, Any] | None
     if href and not href.startswith(("http://", "https://")):
         href = ""
     saved_at = str(value.get("savedAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())).strip()
-    return {
+    normalized = {
         "imageUrl": image_url,
         "source": source or "Manual",
         "href": href,
         "savedAt": saved_at,
     }
+    release_id_raw = value.get("releaseId")
+    if str(release_id_raw or "").isdigit() and int(release_id_raw) > 0:
+        normalized["releaseId"] = int(release_id_raw)
+    artist = str(value.get("artist") or "").strip()
+    album = str(value.get("album") or "").strip()
+    if artist:
+        normalized["artist"] = artist
+    if album:
+        normalized["album"] = album
+    return normalized
 
 
 def read_lyrics_discogs_cover_override(release_id: int) -> dict[str, Any] | None:
@@ -1653,37 +1663,205 @@ def delete_lyrics_discogs_cover_override(release_id: int) -> None:
         write_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, data)
 
 
-@app.route("/api/lyrics/discogs-cover", methods=["POST", "DELETE"])
+def lyrics_album_cover_identity(artist: Any, album: Any) -> str:
+    artist_key = normalize_lyrics_match_text(artist)
+    album_key = normalize_lyrics_match_text(album)
+    if not album_key or album_key in {"unknown album", "none", "null"}:
+        return ""
+    return f"{artist_key}::{album_key}"
+
+
+def lyrics_album_cover_json_key(artist: Any, album: Any) -> str:
+    identity = lyrics_album_cover_identity(artist, album)
+    return f"album::{identity}" if identity else ""
+
+
+def lyrics_album_cover_redis_key(artist: Any, album: Any) -> str:
+    identity = lyrics_album_cover_identity(artist, album)
+    if not identity:
+        return ""
+    digest = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()
+    return (
+        f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:"
+        f"lyrics-album-cover:{digest}"
+    )
+
+
+def read_lyrics_album_cover_override(artist: Any, album: Any) -> dict[str, Any] | None:
+    json_key = lyrics_album_cover_json_key(artist, album)
+    if not json_key:
+        return None
+
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            redis_key = lyrics_album_cover_redis_key(artist, album)
+            if client is not None and redis_key:
+                raw = client.get(redis_key)
+                if raw:
+                    return normalize_lyrics_discogs_cover_override(json.loads(raw))
+        except Exception:
+            pass
+
+    data = read_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, {})
+    if not isinstance(data, dict):
+        return None
+    return normalize_lyrics_discogs_cover_override(data.get(json_key))
+
+
+def write_lyrics_album_cover_override(artist: Any, album: Any, value: dict[str, Any]) -> dict[str, Any]:
+    json_key = lyrics_album_cover_json_key(artist, album)
+    if not json_key:
+        raise ValueError("A valid artist and album name are required for a non-Discogs cover override.")
+
+    normalized = normalize_lyrics_discogs_cover_override(value)
+    if not normalized:
+        raise ValueError("A valid http:// or https:// image URL is required.")
+
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        redis_key = lyrics_album_cover_redis_key(artist, album)
+        if client is None or not redis_key:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        client.set(redis_key, json.dumps(normalized, ensure_ascii=False))
+        return normalized
+
+    data = read_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data[json_key] = normalized
+    write_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, data)
+    return normalized
+
+
+def delete_lyrics_album_cover_override(artist: Any, album: Any) -> None:
+    json_key = lyrics_album_cover_json_key(artist, album)
+    if not json_key:
+        return
+
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        redis_key = lyrics_album_cover_redis_key(artist, album)
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        if redis_key:
+            client.delete(redis_key)
+        return
+
+    data = read_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, {})
+    if not isinstance(data, dict):
+        return
+    if json_key in data:
+        data.pop(json_key, None)
+        write_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, data)
+
+
+def read_saved_cover_override(release_id: Any = None, artist: Any = "", album: Any = "") -> dict[str, Any] | None:
+    if str(release_id or "").isdigit() and int(release_id) > 0:
+        release_override = read_lyrics_discogs_cover_override(int(release_id))
+        if release_override:
+            return release_override
+    return read_lyrics_album_cover_override(artist, album)
+
+
+def write_saved_cover_override(
+    value: dict[str, Any],
+    release_id: Any = None,
+    artist: Any = "",
+    album: Any = "",
+) -> dict[str, Any]:
+    saved: dict[str, Any] | None = None
+    release_id_int = int(release_id) if str(release_id or "").isdigit() and int(release_id) > 0 else None
+    enriched_value = dict(value)
+    if release_id_int:
+        enriched_value["releaseId"] = release_id_int
+    if str(artist or "").strip():
+        enriched_value["artist"] = str(artist).strip()
+    if str(album or "").strip():
+        enriched_value["album"] = str(album).strip()
+
+    if release_id_int:
+        saved = write_lyrics_discogs_cover_override(release_id_int, enriched_value)
+
+    # Mirror every manually chosen cover to the Spotify-facing artist/album identity.
+    # This is what lets shuffle.html reuse a cover without needing to rerun the
+    # Discogs ownership matcher. For albums that are not owned, this identity is
+    # the primary persistent key.
+    if lyrics_album_cover_identity(artist, album):
+        saved = write_lyrics_album_cover_override(artist, album, enriched_value)
+
+    if not saved:
+        raise ValueError("Provide either a Discogs releaseId or a valid artist/album identity.")
+    return saved
+
+
+def delete_saved_cover_override(release_id: Any = None, artist: Any = "", album: Any = "") -> None:
+    deleted_any = False
+    if str(release_id or "").isdigit() and int(release_id) > 0:
+        delete_lyrics_discogs_cover_override(int(release_id))
+        deleted_any = True
+    if lyrics_album_cover_identity(artist, album):
+        delete_lyrics_album_cover_override(artist, album)
+        deleted_any = True
+    if not deleted_any:
+        raise ValueError("Provide either a Discogs releaseId or a valid artist/album identity.")
+
+
+@app.route("/api/manual-cover", methods=["GET", "POST", "DELETE"])
+@app.route("/api/lyrics/discogs-cover", methods=["GET", "POST", "DELETE"])
 def lyrics_discogs_cover_override():
     admin_error = require_topster_admin_response()
     if admin_error is not None:
         return admin_error
 
     payload = request.get_json(silent=True) or {}
-    release_id_raw = payload.get("releaseId") or request.args.get("release_id")
-    if not str(release_id_raw or "").isdigit():
-        return jsonify({"ok": False, "error": "A valid Discogs releaseId is required."}), 400
-    release_id = int(release_id_raw)
+    release_id_raw = payload.get("releaseId") or request.args.get("release_id") or request.args.get("releaseId")
+    artist = str(payload.get("artist") or request.args.get("artist") or "").strip()
+    album = str(payload.get("album") or request.args.get("album") or "").strip()
+    release_id = int(release_id_raw) if str(release_id_raw or "").isdigit() and int(release_id_raw) > 0 else None
+
+    if release_id is None and not lyrics_album_cover_identity(artist, album):
+        return jsonify({"ok": False, "error": "A valid Discogs releaseId or artist/album identity is required."}), 400
 
     try:
-        if request.method == "DELETE" or bool(payload.get("reset")):
-            delete_lyrics_discogs_cover_override(release_id)
-            return jsonify({"ok": True, "releaseId": release_id, "coverOverride": None})
+        if request.method == "GET":
+            override = read_saved_cover_override(release_id, artist, album)
+            return jsonify({
+                "ok": True,
+                "releaseId": release_id,
+                "artist": artist,
+                "album": album,
+                "coverOverride": override,
+            })
 
-        override = write_lyrics_discogs_cover_override(
-            release_id,
-            {
-                "imageUrl": payload.get("imageUrl") or payload.get("imageSrc"),
-                "source": payload.get("source") or "Manual",
-                "href": payload.get("href") or "",
-                "savedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            },
-        )
-        return jsonify({"ok": True, "releaseId": release_id, "coverOverride": override})
+        if request.method == "DELETE" or bool(payload.get("reset")):
+            delete_saved_cover_override(release_id, artist, album)
+            return jsonify({
+                "ok": True,
+                "releaseId": release_id,
+                "artist": artist,
+                "album": album,
+                "coverOverride": None,
+            })
+
+        value = {
+            "imageUrl": payload.get("imageUrl") or payload.get("imageSrc"),
+            "source": payload.get("source") or "Manual",
+            "href": payload.get("href") or "",
+            "savedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        override = write_saved_cover_override(value, release_id, artist, album)
+        return jsonify({
+            "ok": True,
+            "releaseId": release_id,
+            "artist": artist,
+            "album": album,
+            "coverOverride": override,
+        })
     except ValueError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
     except Exception as error:
-        return jsonify({"ok": False, "error": f"Could not save the Lyrics cover override: {error}"}), 500
+        return jsonify({"ok": False, "error": f"Could not save the cover override: {error}"}), 500
 
 
 def normalize_discogs_artist_for_lookup(value: Any) -> str:
@@ -1912,6 +2090,7 @@ def lyrics_discogs_vinyl_tracklist():
     collection_title = str(request.args.get("collection_title") or "").strip()
     collection_artist = str(request.args.get("collection_artist") or "").strip()
     source_artist = str(request.args.get("artist") or "").strip()
+    source_track_artist = str(request.args.get("track_artist") or "").strip()
     source_album = str(request.args.get("album") or "").strip()
     current_track_title = str(request.args.get("track") or "").strip()
 
@@ -2073,6 +2252,26 @@ def lyrics_discogs_vinyl_tracklist():
     loaded_releases.sort(key=lambda item: item[0], reverse=True)
     _score, _track_score, _release_id, selected_release, selected_album = loaded_releases[0]
 
+    selected_release_id = int(selected_release.get("releaseId") or 0) if str(selected_release.get("releaseId") or "").isdigit() else 0
+    release_cover_override = read_lyrics_discogs_cover_override(selected_release_id) if selected_release_id > 0 else None
+    if release_cover_override:
+        # Existing v4 release-specific overrides predate the shared artist/album
+        # cache. Mirror them lazily to both album-artist and track-artist Spotify
+        # identities so shuffle.html can immediately reuse them.
+        for mirror_artist in dict.fromkeys([source_track_artist, source_artist]):
+            if not lyrics_album_cover_identity(mirror_artist, source_album):
+                continue
+            try:
+                if not read_lyrics_album_cover_override(mirror_artist, source_album):
+                    mirror_value = dict(release_cover_override)
+                    if selected_release_id > 0:
+                        mirror_value["releaseId"] = selected_release_id
+                    mirror_value["artist"] = mirror_artist
+                    mirror_value["album"] = source_album
+                    write_lyrics_album_cover_override(mirror_artist, source_album, mirror_value)
+            except Exception:
+                pass
+
     response_payload = {
         "ok": True,
         "matched": True,
@@ -2093,9 +2292,7 @@ def lyrics_discogs_vinyl_tracklist():
         "sourceAlbum": source_album,
         "sourceArtist": source_artist,
         "release": selected_release,
-        "coverOverride": read_lyrics_discogs_cover_override(int(selected_release.get("releaseId") or 0))
-        if str(selected_release.get("releaseId") or "").isdigit()
-        else None,
+        "coverOverride": release_cover_override or read_lyrics_album_cover_override(source_artist, source_album),
     }
     return discogs_collection_json_response(response_payload)
 
@@ -4778,6 +4975,11 @@ def current_lyrics():
             if canonical_album and str(track.get("album") or "").strip().lower() in {"", "unknown album"}:
                 track["album"] = canonical_album
 
+    track["manualCoverOverride"] = read_lyrics_album_cover_override(
+        track.get("artist") or "",
+        track.get("album") or "",
+    )
+
     genius_song = None
     genius_error = ""
     genius_error_code = ""
@@ -5107,11 +5309,13 @@ def songguesser_answer_has_unknown_album(answer: dict[str, Any]) -> bool:
 
 
 def songguesser_should_lookup_answer(answer: dict[str, Any], hints_enabled: dict[str, Any]) -> bool:
-    if not any(hints_enabled.get(key) for key in ("releaseYear", "releaseDecade", "album")):
-        return False
-
+    # Manual cover overrides are keyed by artist + album, so resolve a missing
+    # album even when the user did not enable album/year hints.
     if songguesser_answer_has_unknown_album(answer):
         return True
+
+    if not any(hints_enabled.get(key) for key in ("releaseYear", "releaseDecade", "album")):
+        return False
 
     if (hints_enabled.get("releaseYear") or hints_enabled.get("releaseDecade")) and not answer.get("releaseYear"):
         return True
@@ -5216,7 +5420,7 @@ def songguesser_summary_payload(game: dict[str, Any]) -> list[dict[str, Any]]:
     summary = []
 
     for index, candidate in enumerate(game.get("queue") or [], start=1):
-        answer = candidate.get("answer") or {}
+        answer = songguesser_answer_with_saved_cover(candidate.get("answer") or {})
         summary.append(
             {
                 "index": index,
@@ -5384,8 +5588,25 @@ def songguesser_build_candidates_from_single_link(sp: Any, cache: dict[str, Any]
     return candidates[:SONGGUESSER_SONG_COUNT]
 
 
+def songguesser_answer_with_saved_cover(answer: dict[str, Any]) -> dict[str, Any]:
+    public_answer = dict(answer or {})
+    default_cover_url = str(public_answer.get("coverUrl") or "").strip()
+    public_answer["defaultCoverUrl"] = default_cover_url
+    override = read_lyrics_album_cover_override(
+        public_answer.get("artist") or "",
+        public_answer.get("album") or "",
+    )
+    if override and override.get("imageUrl"):
+        public_answer["coverUrl"] = override["imageUrl"]
+        public_answer["manualCoverOverride"] = override
+    else:
+        public_answer["manualCoverOverride"] = None
+    return public_answer
+
+
 def songguesser_public_payload(game: dict[str, Any], candidate: dict[str, Any], position_ms: int) -> dict[str, Any]:
     answer = candidate.get("answer") or {}
+    public_answer = songguesser_answer_with_saved_cover(answer)
     hints_enabled = game.get("hints") or {}
     release_year = answer.get("releaseYear") or ""
     release_decade = answer.get("releaseDecade") or ""
@@ -5407,8 +5628,9 @@ def songguesser_public_payload(game: dict[str, Any], candidate: dict[str, Any], 
         "positionMs": position_ms,
         "startedAt": now,
         "endsAt": now + SONGGUESSER_CLIP_SECONDS,
-        "answer": answer,
+        "answer": public_answer,
         "hints": hints,
+        "paused": bool(game.get("paused")),
     }
 
 
@@ -5453,6 +5675,7 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
 
     game["started_at"] = time.time()
     game["position_ms"] = position_ms
+    game["paused"] = False
     return songguesser_public_payload(game, candidate, position_ms)
 
 
@@ -5555,6 +5778,31 @@ def songguesser_next():
         return jsonify(songguesser_start_current(game))
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
+
+
+@app.route("/api/songguesser/pause", methods=["POST"])
+def songguesser_pause():
+    game = get_current_songguesser_game()
+    if game is None:
+        return jsonify({"ok": False, "error": "No active Songguesser game."}), 404
+    pause_spotify()
+    game["paused"] = True
+    return jsonify({"ok": True, "paused": True})
+
+
+@app.route("/api/songguesser/play", methods=["POST"])
+def songguesser_play():
+    game = get_current_songguesser_game()
+    if game is None:
+        return jsonify({"ok": False, "error": "No active Songguesser game."}), 404
+    try:
+        sp = get_spotify_client()
+        sp.start_playback()
+        append_log("[Spotify Songguesser playback resumed]")
+    except Exception as error:
+        return jsonify({"ok": False, "error": f"Could not resume Songguesser playback: {error}"}), 502
+    game["paused"] = False
+    return jsonify({"ok": True, "paused": False})
 
 
 @app.route("/api/songguesser/stop", methods=["POST"])
@@ -5860,7 +6108,19 @@ def get_current_cover_art() -> dict[str, Any] | None:
 
     cover_art = state.get("coverArt")
     if isinstance(cover_art, dict):
-        return cover_art
+        result = dict(cover_art)
+        default_url = str(result.get("url") or "").strip()
+        result["defaultUrl"] = default_url
+        override = read_lyrics_album_cover_override(
+            result.get("artist") or "",
+            result.get("album") or "",
+        )
+        if override and override.get("imageUrl"):
+            result["url"] = override["imageUrl"]
+            result["manualCoverOverride"] = override
+        else:
+            result["manualCoverOverride"] = None
+        return result
 
     return None
 
