@@ -85,7 +85,7 @@ except (TypeError, ValueError):
 # Increment this whenever the collection payload/matching contract changes. The
 # version is part of the Redis key, so a deploy cannot silently keep serving a
 # week-old collection snapshot produced by an older matcher revision.
-DISCOGS_COLLECTION_CACHE_VERSION = 11
+DISCOGS_COLLECTION_CACHE_VERSION = 12
 DISCOGS_RELEASE_CACHE_VERSION = 1
 
 
@@ -1149,17 +1149,30 @@ def api_movie_poster():
     return response
 
 
+def discogs_collection_cache_scope(username: str) -> str:
+    token = get_discogs_token()
+    auth_scope = "public"
+    if token:
+        # Changing/removing the Discogs token must never leave a week-old public or
+        # differently-authenticated collection snapshot active. Only a short hash is
+        # used in internal cache keys; the token itself is never stored there.
+        auth_scope = "token-" + hashlib.sha256(token.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return f"{username}::{auth_scope}"
+
+
 def discogs_collection_redis_key(username: str) -> str:
     safe_username = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(username or DISCOGS_COLLECTION_USERNAME))
+    scope = discogs_collection_cache_scope(username).rsplit("::", 1)[-1]
     return (
         f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:"
-        f"discogs-collection-v{DISCOGS_COLLECTION_CACHE_VERSION}:{safe_username}"
+        f"discogs-collection-v{DISCOGS_COLLECTION_CACHE_VERSION}:{safe_username}:{scope}"
     )
 
 
 def read_discogs_collection_cache(username: str) -> dict[str, Any] | None:
     now = time.time()
-    memory = DISCOGS_COLLECTION_MEMORY_CACHE.get(username)
+    memory_key = discogs_collection_cache_scope(username)
+    memory = DISCOGS_COLLECTION_MEMORY_CACHE.get(memory_key)
     if isinstance(memory, dict) and (now - float(memory.get("cachedAtEpoch", 0))) < DISCOGS_COLLECTION_CACHE_SECONDS:
         return memory.get("payload") if isinstance(memory.get("payload"), dict) else None
 
@@ -1171,7 +1184,7 @@ def read_discogs_collection_cache(username: str) -> dict[str, Any] | None:
                 if raw:
                     parsed = json.loads(raw)
                     if isinstance(parsed, dict):
-                        DISCOGS_COLLECTION_MEMORY_CACHE[username] = {
+                        DISCOGS_COLLECTION_MEMORY_CACHE[memory_key] = {
                             "cachedAtEpoch": now,
                             "payload": parsed,
                         }
@@ -1184,7 +1197,8 @@ def read_discogs_collection_cache(username: str) -> dict[str, Any] | None:
 
 def write_discogs_collection_cache(username: str, payload: dict[str, Any]) -> None:
     now = time.time()
-    DISCOGS_COLLECTION_MEMORY_CACHE[username] = {
+    memory_key = discogs_collection_cache_scope(username)
+    DISCOGS_COLLECTION_MEMORY_CACHE[memory_key] = {
         "cachedAtEpoch": now,
         "payload": payload,
     }
@@ -1231,6 +1245,21 @@ def fetch_discogs_collection_page(username: str, page: int, per_page: int = 100)
                     wait_seconds = 2.0
                 time.sleep(wait_seconds)
                 continue
+            if error.code in {401, 403} and token:
+                # A stale/wrong personal token should not make a public collection
+                # unusable. Retry this page anonymously; owner-only collection fields
+                # will remain unavailable and the frontend will report that clearly.
+                public_headers = {
+                    "Accept": "application/json",
+                    "User-Agent": "Navincitron/1.0 +https://www.navincitron.com",
+                }
+                try:
+                    with urlopen(Request(url, headers=public_headers), timeout=20) as response:
+                        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+                    if isinstance(payload, dict):
+                        return payload
+                except Exception:
+                    pass
             if error.code in {401, 403} and not token:
                 raise RuntimeError(
                     "Discogs rejected the public collection request. Configure DISCOGS_TOKEN in Render for reliable authenticated collection access."
@@ -1284,6 +1313,24 @@ def discogs_formats_include_vinyl(formats: Any) -> bool:
         if any("vinyl" in value.casefold() for value in values):
             return True
     return False
+
+
+def fetch_discogs_authenticated_username() -> str:
+    token = get_discogs_token()
+    if not token:
+        return ""
+
+    request_headers = {
+        "Accept": "application/json",
+        "Authorization": f"Discogs token={token}",
+        "User-Agent": "Navincitron/1.0 +https://www.navincitron.com",
+    }
+    try:
+        with urlopen(Request("https://api.discogs.com/oauth/identity", headers=request_headers), timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return ""
+    return str(payload.get("username") or "").strip() if isinstance(payload, dict) else ""
 
 
 def fetch_discogs_collection_field_names(username: str) -> dict[str, str]:
@@ -1374,6 +1421,61 @@ def discogs_collection_item_conditions(
     return media_condition, sleeve_condition
 
 
+def fetch_discogs_collection_release_instances(username: str, release_id: int) -> list[dict[str, Any]]:
+    token = get_discogs_token()
+    if not token or release_id <= 0:
+        return []
+    url = f"https://api.discogs.com/users/{quote_plus(username)}/collection/releases/{release_id}"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Discogs token={token}",
+        "User-Agent": "Navincitron/1.0 +https://www.navincitron.com",
+    }
+    try:
+        with urlopen(Request(url, headers=headers), timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return []
+    releases = payload.get("releases") if isinstance(payload, dict) else None
+    return [item for item in releases if isinstance(item, dict)] if isinstance(releases, list) else []
+
+
+def refresh_discogs_owned_release_conditions(
+    username: str,
+    owned_release: dict[str, Any],
+    field_names: dict[str, str],
+) -> dict[str, Any]:
+    refreshed = dict(owned_release)
+    if refreshed.get("mediaCondition") and refreshed.get("sleeveCondition"):
+        return refreshed
+    release_id_raw = refreshed.get("releaseId")
+    if not str(release_id_raw or "").isdigit() or not get_discogs_token():
+        return refreshed
+    release_id = int(release_id_raw)
+    instance_id = refreshed.get("instanceId")
+    folder_id = refreshed.get("folderId")
+    instances = fetch_discogs_collection_release_instances(username, release_id)
+    if not instances:
+        return refreshed
+
+    selected = None
+    if instance_id is not None:
+        selected = next((item for item in instances if str(item.get("instance_id")) == str(instance_id)), None)
+    if selected is None and folder_id is not None:
+        selected = next((item for item in instances if str(item.get("folder_id")) == str(folder_id)), None)
+    if selected is None and len(instances) == 1:
+        selected = instances[0]
+    if selected is None:
+        return refreshed
+
+    media_condition, sleeve_condition = discogs_collection_item_conditions(selected, field_names)
+    if media_condition and not refreshed.get("mediaCondition"):
+        refreshed["mediaCondition"] = media_condition
+    if sleeve_condition and not refreshed.get("sleeveCondition"):
+        refreshed["sleeveCondition"] = sleeve_condition
+    return refreshed
+
+
 def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
     first = fetch_discogs_collection_page(username, 1, 100)
     pagination = first.get("pagination") if isinstance(first.get("pagination"), dict) else {}
@@ -1392,10 +1494,12 @@ def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
         if isinstance(page_releases, list):
             releases.extend(item for item in page_releases if isinstance(item, dict))
 
+    authenticated_username = fetch_discogs_authenticated_username()
+    authenticated_owner = bool(authenticated_username and authenticated_username.casefold() == username.casefold())
     collection_field_names = fetch_discogs_collection_field_names(username)
 
     unique: dict[str, dict[str, Any]] = {}
-    release_ids_by_key: dict[str, set[int]] = {}
+    release_instances_by_key: dict[str, set[tuple[int, int]]] = {}
     for item in releases:
         basic = item.get("basic_information") if isinstance(item.get("basic_information"), dict) else {}
         title = str(basic.get("title") or "").strip()
@@ -1439,22 +1543,28 @@ def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
                 "ownedReleases": [],
                 "vinylReleaseIds": [],
             }
-            release_ids_by_key[key] = set()
+            release_instances_by_key[key] = set()
         else:
             if unique[key].get("year") is None and year is not None:
                 unique[key]["year"] = year
             if unique[key].get("masterId") is None and master_id is not None:
                 unique[key]["masterId"] = master_id
 
-        if release_id is None or release_id in release_ids_by_key[key]:
+        if release_id is None:
             continue
-        release_ids_by_key[key].add(release_id)
+        instance_key = (release_id, instance_id if instance_id is not None else -1)
+        if instance_key in release_instances_by_key[key]:
+            continue
+        release_instances_by_key[key].add(instance_key)
 
+        folder_id_raw = item.get("folder_id")
+        folder_id = int(folder_id_raw) if str(folder_id_raw or "").isdigit() else None
         owned_release = {
             "releaseId": release_id,
             "masterId": master_id,
             "year": year,
             "instanceId": instance_id,
+            "folderId": folder_id,
             "formats": formats,
             "vinyl": vinyl,
             "mediaCondition": media_condition,
@@ -1473,7 +1583,10 @@ def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
         "cachedSeconds": DISCOGS_COLLECTION_CACHE_SECONDS,
         "cacheVersion": DISCOGS_COLLECTION_CACHE_VERSION,
         "fetchedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "authenticatedToDiscogs": bool(get_discogs_token()),
+        "discogsTokenConfigured": bool(get_discogs_token()),
+        "authenticatedToDiscogs": authenticated_owner,
+        "authenticatedDiscogsUsername": authenticated_username,
+        "conditionFieldNames": collection_field_names,
     }
     return payload
 
@@ -2251,7 +2364,7 @@ def lyrics_discogs_vinyl_tracklist():
         )
 
     candidate_releases: list[tuple[int, dict[str, Any], bool, dict[str, Any]]] = []
-    seen_release_ids: set[int] = set()
+    seen_release_instances: set[tuple[int, int]] = set()
 
     def add_album_vinyl_release_ids(album: dict[str, Any], primary: bool) -> None:
         owned_releases = album.get("ownedReleases") if isinstance(album.get("ownedReleases"), list) else []
@@ -2262,9 +2375,12 @@ def lyrics_discogs_vinyl_tracklist():
             if not str(release_id or "").isdigit():
                 continue
             release_id_int = int(release_id)
-            if release_id_int in seen_release_ids:
+            instance_id_raw = owned_release.get("instanceId")
+            instance_id_int = int(instance_id_raw) if str(instance_id_raw or "").isdigit() else -1
+            candidate_key = (release_id_int, instance_id_int)
+            if candidate_key in seen_release_instances:
                 continue
-            seen_release_ids.add(release_id_int)
+            seen_release_instances.add(candidate_key)
             candidate_releases.append((release_id_int, album, primary, owned_release))
 
     for album in matched_albums:
@@ -2308,6 +2424,13 @@ def lyrics_discogs_vinyl_tracklist():
                     score += 15.0
                 if discogs_release_has_side_positions(release):
                     score += 5.0
+                # If the same physical Discogs release exists in the collection more
+                # than once, prefer the collection instance that actually has grading
+                # filled in. This does not outweigh release/track matching.
+                if str(owned_release.get("mediaCondition") or "").strip():
+                    score += 0.25
+                if str(owned_release.get("sleeveCondition") or "").strip():
+                    score += 0.25
                 loaded_releases.append((score, track_score, release_id, release, album, owned_release))
             except Exception as error:
                 errors.append(f"Release {release_id}: {error}")
@@ -2317,11 +2440,15 @@ def lyrics_discogs_vinyl_tracklist():
     primary_has_track = any(track_score >= 0.55 for _score, track_score, _release_id, _release, _album, _owned_release in loaded_releases)
     if current_track_title and not primary_has_track:
         related_candidates: list[tuple[int, dict[str, Any], bool, dict[str, Any]]] = []
-        before_ids = set(seen_release_ids)
+        before_instances = set(seen_release_instances)
         for album in related_albums:
             add_album_vinyl_release_ids(album, False)
         for candidate in candidate_releases:
-            if candidate[0] not in before_ids:
+            release_id = candidate[0]
+            owned_release = candidate[3]
+            instance_id_raw = owned_release.get("instanceId")
+            instance_id_int = int(instance_id_raw) if str(instance_id_raw or "").isdigit() else -1
+            if (release_id, instance_id_int) not in before_instances:
                 related_candidates.append(candidate)
         load_candidates(related_candidates)
 
@@ -2344,6 +2471,11 @@ def lyrics_discogs_vinyl_tracklist():
 
     loaded_releases.sort(key=lambda item: item[0], reverse=True)
     _score, _track_score, _release_id, selected_release, selected_album, selected_owned_release = loaded_releases[0]
+    selected_owned_release = refresh_discogs_owned_release_conditions(
+        username,
+        selected_owned_release,
+        collection_payload.get("conditionFieldNames") if isinstance(collection_payload.get("conditionFieldNames"), dict) else {},
+    )
 
     # Release database metadata is shared by every owner, whereas media/sleeve
     # grading belongs to this exact collection instance. Merge the latter only
@@ -2392,6 +2524,13 @@ def lyrics_discogs_vinyl_tracklist():
         ],
         "sourceAlbum": source_album,
         "sourceArtist": source_artist,
+        "discogsAuth": {
+            "tokenConfigured": bool(collection_payload.get("discogsTokenConfigured")),
+            "ownerAuthenticated": bool(collection_payload.get("authenticatedToDiscogs")),
+            "authenticatedUsername": str(collection_payload.get("authenticatedDiscogsUsername") or ""),
+            "collectionUsername": username,
+            "conditionFields": collection_payload.get("conditionFieldNames") if isinstance(collection_payload.get("conditionFieldNames"), dict) else {},
+        },
         "release": selected_release,
         "coverOverride": release_cover_override or read_lyrics_album_cover_override(source_artist, source_album),
     }
