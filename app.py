@@ -86,7 +86,7 @@ except (TypeError, ValueError):
 # version is part of the Redis key, so a deploy cannot silently keep serving a
 # week-old collection snapshot produced by an older matcher revision.
 DISCOGS_COLLECTION_CACHE_VERSION = 12
-DISCOGS_RELEASE_CACHE_VERSION = 1
+DISCOGS_RELEASE_CACHE_VERSION = 2
 
 
 SCOPE = (
@@ -1729,11 +1729,21 @@ def fetch_discogs_release(release_id: int) -> dict[str, Any]:
                     normalized_sub_track = normalize_track_entry(sub_track)
                     if normalized_sub_track:
                         sub_tracks.append(normalized_sub_track)
+
+                track_artists: list[str] = []
+                for artist in entry.get("artists") if isinstance(entry.get("artists"), list) else []:
+                    if not isinstance(artist, dict):
+                        continue
+                    name = str(artist.get("name") or "").strip()
+                    if name:
+                        track_artists.append(name)
+
                 return {
                     "position": str(entry.get("position") or "").strip(),
                     "title": str(entry.get("title") or "").strip(),
                     "duration": str(entry.get("duration") or "").strip(),
                     "type": str(entry.get("type_") or entry.get("type") or "track").strip().lower(),
+                    "artists": track_artists,
                     "subTracks": sub_tracks,
                 }
 
