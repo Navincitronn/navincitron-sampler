@@ -67,6 +67,7 @@ TOPSTER_COVER_CACHE_FILE = BASE_DIR / "topster_cover_cache.json"
 TOPSTER_SETTINGS_FILE = BASE_DIR / "topster_settings.json"
 TOPSTER_SOURCE_TEXT_FILE = BASE_DIR / "topster_source_text.json"
 LYRICS_DISCOGS_COVER_OVERRIDES_FILE = BASE_DIR / "lyrics_discogs_cover_overrides.json"
+LYRICS_MY_ALBUMS_FILE = BASE_DIR / "my_albums.txt"
 TOPSTER_REDIS_KEY_PREFIX = os.getenv("TOPSTER_REDIS_KEY_PREFIX", "navincitron:topster").strip() or "navincitron:topster"
 TOPSTER_REDIS_CLIENT: Any | None = None
 TOPSTER_REDIS_CLIENT_ERROR = ""
@@ -5145,6 +5146,97 @@ def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
             GENIUS_LOOKUP_CACHE.pop(oldest_key, None)
 
     return result
+
+
+
+def lyrics_my_albums_redis_key() -> str:
+    safe_prefix = TOPSTER_REDIS_KEY_PREFIX.strip(":") or "navincitron:topster"
+    return f"{safe_prefix}:lyrics:my-albums"
+
+
+def read_lyrics_my_albums_text() -> tuple[str, str]:
+    """Return the editable score source and the backing store that supplied it."""
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        try:
+            stored = client.get(lyrics_my_albums_redis_key())
+        except RedisError as error:
+            raise RuntimeError(f"Lyrics score Redis read failed: {error}") from error
+        if stored is not None:
+            return str(stored), "redis"
+
+    if LYRICS_MY_ALBUMS_FILE.exists():
+        try:
+            return LYRICS_MY_ALBUMS_FILE.read_text(encoding="utf-8"), "file"
+        except OSError as error:
+            raise RuntimeError(f"Could not read {LYRICS_MY_ALBUMS_FILE.name}: {error}") from error
+
+    # The production frontend can still bootstrap from its static my_albums.txt.
+    # On the first Save it sends the complete source text here, after which Redis
+    # (when configured) becomes the persistent editable copy.
+    return "", "none"
+
+
+def write_lyrics_my_albums_text(text: str) -> str:
+    """Persist the complete my_albums source. Redis is authoritative on Render."""
+    wrote_redis = False
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        try:
+            client.set(lyrics_my_albums_redis_key(), text)
+            wrote_redis = True
+        except RedisError as error:
+            raise RuntimeError(f"Lyrics score Redis write failed: {error}") from error
+
+    # Also keep the runtime copy in my_albums.txt synchronized when the deployment
+    # filesystem is writable. Render filesystems are ephemeral, so Redis remains
+    # the durable source across restarts/deploys.
+    try:
+        temp_path = LYRICS_MY_ALBUMS_FILE.with_suffix(LYRICS_MY_ALBUMS_FILE.suffix + ".tmp")
+        temp_path.write_text(text, encoding="utf-8")
+        temp_path.replace(LYRICS_MY_ALBUMS_FILE)
+        return "redis+file" if wrote_redis else "file"
+    except OSError as error:
+        if wrote_redis:
+            return "redis"
+        raise RuntimeError(f"Could not write {LYRICS_MY_ALBUMS_FILE.name}: {error}") from error
+
+
+@app.route("/api/lyrics/my-albums", methods=["GET", "PUT"])
+def lyrics_my_albums():
+    if request.method == "PUT":
+        admin_error = require_topster_admin_response()
+        if admin_error is not None:
+            return admin_error
+
+        payload = request.get_json(silent=True) or {}
+        text = payload.get("text")
+        if not isinstance(text, str):
+            return jsonify({"ok": False, "error": "A complete my_albums text string is required."}), 400
+        if len(text.encode("utf-8")) > 2_000_000:
+            return jsonify({"ok": False, "error": "my_albums.txt exceeds the 2 MB edit limit."}), 413
+
+        try:
+            storage = write_lyrics_my_albums_text(text)
+        except RuntimeError as error:
+            return jsonify({"ok": False, "error": str(error)}), 503
+
+        response = jsonify({"ok": True, "text": text, "storage": storage})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    try:
+        text, storage = read_lyrics_my_albums_text()
+    except RuntimeError as error:
+        return jsonify({"ok": False, "text": "", "storage": "error", "error": str(error)}), 503
+
+    response = jsonify({"ok": True, "text": text, "storage": storage, "writable": is_topster_admin()})
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/api/lyrics/current", methods=["GET"])
