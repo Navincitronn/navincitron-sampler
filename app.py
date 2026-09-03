@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import hmac
@@ -22,7 +23,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus, unquote, urlencode, urlparse
+from urllib.parse import quote, quote_plus, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -68,6 +69,9 @@ TOPSTER_SETTINGS_FILE = BASE_DIR / "topster_settings.json"
 TOPSTER_SOURCE_TEXT_FILE = BASE_DIR / "topster_source_text.json"
 LYRICS_DISCOGS_COVER_OVERRIDES_FILE = BASE_DIR / "lyrics_discogs_cover_overrides.json"
 LYRICS_MY_ALBUMS_FILE = BASE_DIR / "my_albums.txt"
+LYRICS_GITHUB_REPOSITORY = (os.getenv("LYRICS_GITHUB_REPOSITORY") or os.getenv("GITHUB_REPOSITORY") or "").strip()
+LYRICS_GITHUB_BRANCH = (os.getenv("LYRICS_GITHUB_BRANCH") or "main").strip() or "main"
+LYRICS_GITHUB_MY_ALBUMS_PATH = (os.getenv("LYRICS_GITHUB_MY_ALBUMS_PATH") or "my_albums.txt").strip().lstrip("/") or "my_albums.txt"
 TOPSTER_REDIS_KEY_PREFIX = os.getenv("TOPSTER_REDIS_KEY_PREFIX", "navincitron:topster").strip() or "navincitron:topster"
 TOPSTER_REDIS_CLIENT: Any | None = None
 TOPSTER_REDIS_CLIENT_ERROR = ""
@@ -5154,56 +5158,220 @@ def lyrics_my_albums_redis_key() -> str:
     return f"{safe_prefix}:lyrics:my-albums"
 
 
-def read_lyrics_my_albums_text() -> tuple[str, str]:
-    """Return the editable score source and the backing store that supplied it."""
+def get_lyrics_github_token() -> str:
+    return normalize_secret_text(os.getenv("LYRICS_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN"))
+
+
+def lyrics_github_repository_parts() -> tuple[str, str] | None:
+    repository = str(LYRICS_GITHUB_REPOSITORY or "").strip().strip("/")
+    if repository.startswith("https://github.com/"):
+        repository = repository[len("https://github.com/"):]
+    if repository.endswith(".git"):
+        repository = repository[:-4]
+    parts = repository.split("/", 1)
+    if len(parts) != 2 or not all(part.strip() for part in parts):
+        return None
+    return parts[0].strip(), parts[1].strip()
+
+
+def lyrics_github_is_configured() -> bool:
+    return lyrics_github_repository_parts() is not None
+
+
+def lyrics_github_contents_url() -> str:
+    parts = lyrics_github_repository_parts()
+    if parts is None:
+        raise RuntimeError(
+            "GitHub score synchronization is not configured. Set LYRICS_GITHUB_REPOSITORY to owner/repository."
+        )
+    owner, repository = parts
+    path = quote(LYRICS_GITHUB_MY_ALBUMS_PATH, safe="/")
+    return f"https://api.github.com/repos/{quote(owner)}/{quote(repository)}/contents/{path}"
+
+
+def lyrics_github_request_json(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    require_token: bool = False,
+) -> dict[str, Any]:
+    token = get_lyrics_github_token()
+    if require_token and not token:
+        raise RuntimeError(
+            "GitHub score saving requires LYRICS_GITHUB_TOKEN (or GITHUB_TOKEN) with Contents read/write access."
+        )
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "navincitron-lyrics-score-sync/1.0",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    github_request = Request(url, data=data, headers=headers, method=method)
+    try:
+        with urlopen(github_request, timeout=12) as github_response:
+            raw = github_response.read().decode("utf-8", errors="replace")
+    except HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        try:
+            detail = (json.loads(body) or {}).get("message") or body
+        except Exception:
+            detail = body
+        detail = str(detail or error.reason or f"HTTP {error.code}").strip()
+        raise RuntimeError(f"GitHub my_albums.txt request failed ({error.code}): {detail}") from error
+    except URLError as error:
+        raise RuntimeError(f"GitHub my_albums.txt request failed: {error.reason}") from error
+
+    if not raw.strip():
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("GitHub returned an invalid JSON response for my_albums.txt.") from error
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def read_lyrics_my_albums_from_github() -> tuple[str, str]:
+    if not lyrics_github_is_configured():
+        raise RuntimeError(
+            "GitHub score synchronization is not configured. Set LYRICS_GITHUB_REPOSITORY to owner/repository."
+        )
+    url = lyrics_github_contents_url() + "?" + urlencode({"ref": LYRICS_GITHUB_BRANCH})
+    payload = lyrics_github_request_json(url)
+    encoded = str(payload.get("content") or "").replace("\n", "")
+    if not encoded:
+        raise RuntimeError(
+            f"GitHub did not return {LYRICS_GITHUB_MY_ALBUMS_PATH} from branch {LYRICS_GITHUB_BRANCH}."
+        )
+    try:
+        text = base64.b64decode(encoded, validate=False).decode("utf-8")
+    except Exception as error:
+        raise RuntimeError("GitHub returned my_albums.txt in an unreadable encoding.") from error
+    return text.replace("\r\n", "\n").replace("\r", "\n"), str(payload.get("sha") or "")
+
+
+def synchronize_lyrics_my_albums_backend_text(text: str) -> tuple[list[str], list[str]]:
+    """Mirror the canonical GitHub text into Redis and the Render runtime file."""
+    written: list[str] = []
+    warnings: list[str] = []
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+
     if topster_redis_is_configured():
         client = get_topster_redis_client()
         if client is None:
-            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+            warnings.append(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        else:
+            try:
+                client.set(lyrics_my_albums_redis_key(), normalized)
+                written.append("redis")
+            except RedisError as error:
+                warnings.append(f"Lyrics score Redis write failed: {error}")
+
+    try:
+        temp_path = LYRICS_MY_ALBUMS_FILE.with_suffix(LYRICS_MY_ALBUMS_FILE.suffix + ".tmp")
+        temp_path.write_text(normalized, encoding="utf-8")
+        temp_path.replace(LYRICS_MY_ALBUMS_FILE)
+        written.append("file")
+    except OSError as error:
+        warnings.append(f"Could not write runtime {LYRICS_MY_ALBUMS_FILE.name}: {error}")
+
+    return written, warnings
+
+
+def read_lyrics_my_albums_text() -> tuple[str, str, str, list[str]]:
+    """
+    Return score text, source, GitHub revision, and warnings.
+
+    When GitHub synchronization is configured, the repository copy is canonical.
+    This means a desktop edit becomes authoritative after it is committed/pushed to
+    the configured branch; the next Lyrics score read mirrors it into Redis and the
+    Render runtime file automatically.
+    """
+    warnings: list[str] = []
+    if lyrics_github_is_configured():
         try:
-            stored = client.get(lyrics_my_albums_redis_key())
-        except RedisError as error:
-            raise RuntimeError(f"Lyrics score Redis read failed: {error}") from error
-        if stored is not None:
-            return str(stored), "redis"
+            text, revision = read_lyrics_my_albums_from_github()
+            _, sync_warnings = synchronize_lyrics_my_albums_backend_text(text)
+            warnings.extend(sync_warnings)
+            return text, "github", revision, warnings
+        except RuntimeError as error:
+            warnings.append(str(error))
+
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            warnings.append(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        else:
+            try:
+                stored = client.get(lyrics_my_albums_redis_key())
+            except RedisError as error:
+                warnings.append(f"Lyrics score Redis read failed: {error}")
+            else:
+                if stored is not None:
+                    return str(stored), "redis", "", warnings
 
     if LYRICS_MY_ALBUMS_FILE.exists():
         try:
-            return LYRICS_MY_ALBUMS_FILE.read_text(encoding="utf-8"), "file"
+            return LYRICS_MY_ALBUMS_FILE.read_text(encoding="utf-8"), "file", "", warnings
         except OSError as error:
-            raise RuntimeError(f"Could not read {LYRICS_MY_ALBUMS_FILE.name}: {error}") from error
+            warnings.append(f"Could not read {LYRICS_MY_ALBUMS_FILE.name}: {error}")
 
-    # The production frontend can still bootstrap from its static my_albums.txt.
-    # On the first Save it sends the complete source text here, after which Redis
-    # (when configured) becomes the persistent editable copy.
-    return "", "none"
+    return "", "none", "", warnings
 
 
-def write_lyrics_my_albums_text(text: str) -> str:
-    """Persist the complete my_albums source. Redis is authoritative on Render."""
-    wrote_redis = False
-    if topster_redis_is_configured():
-        client = get_topster_redis_client()
-        if client is None:
-            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
-        try:
-            client.set(lyrics_my_albums_redis_key(), text)
-            wrote_redis = True
-        except RedisError as error:
-            raise RuntimeError(f"Lyrics score Redis write failed: {error}") from error
+def write_lyrics_my_albums_text(text: str, base_revision: str = "") -> tuple[str, str, list[str]]:
+    """
+    Save score text to GitHub first, then mirror that exact committed text to the
+    Lyrics backend stores. GitHub is therefore the canonical copy shared by GitHub
+    Pages, website edits, and later desktop commits.
+    """
+    if not lyrics_github_is_configured():
+        raise RuntimeError(
+            "Score saving is configured to update both GitHub Pages and the Lyrics backend, but "
+            "LYRICS_GITHUB_REPOSITORY is not set."
+        )
+    if not get_lyrics_github_token():
+        raise RuntimeError(
+            "Score saving requires LYRICS_GITHUB_TOKEN (or GITHUB_TOKEN) with Contents read/write access."
+        )
 
-    # Also keep the runtime copy in my_albums.txt synchronized when the deployment
-    # filesystem is writable. Render filesystems are ephemeral, so Redis remains
-    # the durable source across restarts/deploys.
-    try:
-        temp_path = LYRICS_MY_ALBUMS_FILE.with_suffix(LYRICS_MY_ALBUMS_FILE.suffix + ".tmp")
-        temp_path.write_text(text, encoding="utf-8")
-        temp_path.replace(LYRICS_MY_ALBUMS_FILE)
-        return "redis+file" if wrote_redis else "file"
-    except OSError as error:
-        if wrote_redis:
-            return "redis"
-        raise RuntimeError(f"Could not write {LYRICS_MY_ALBUMS_FILE.name}: {error}") from error
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    current_text, current_revision = read_lyrics_my_albums_from_github()
+    requested_base = str(base_revision or "").strip()
+    if requested_base and current_revision and requested_base != current_revision:
+        raise RuntimeError(
+            "my_albums.txt changed on GitHub after this page loaded. Refresh the page before saving so newer desktop/GitHub edits are not overwritten."
+        )
+
+    revision = current_revision
+    if normalized != current_text:
+        body: dict[str, Any] = {
+            "message": "Update my_albums.txt from Lyrics score editor",
+            "content": base64.b64encode(normalized.encode("utf-8")).decode("ascii"),
+            "branch": LYRICS_GITHUB_BRANCH,
+        }
+        if current_revision:
+            body["sha"] = current_revision
+        result = lyrics_github_request_json(
+            lyrics_github_contents_url(),
+            method="PUT",
+            payload=body,
+            require_token=True,
+        )
+        content = result.get("content") if isinstance(result.get("content"), dict) else {}
+        revision = str(content.get("sha") or revision)
+
+    written, warnings = synchronize_lyrics_my_albums_backend_text(normalized)
+    storage_parts = ["github", *written]
+    return "+".join(dict.fromkeys(storage_parts)), revision, warnings
 
 
 @app.route("/api/lyrics/my-albums", methods=["GET", "PUT"])
@@ -5215,26 +5383,40 @@ def lyrics_my_albums():
 
         payload = request.get_json(silent=True) or {}
         text = payload.get("text")
+        base_revision = str(payload.get("baseRevision") or "").strip()
         if not isinstance(text, str):
             return jsonify({"ok": False, "error": "A complete my_albums text string is required."}), 400
         if len(text.encode("utf-8")) > 2_000_000:
             return jsonify({"ok": False, "error": "my_albums.txt exceeds the 2 MB edit limit."}), 413
 
         try:
-            storage = write_lyrics_my_albums_text(text)
+            storage, revision, warnings = write_lyrics_my_albums_text(text, base_revision=base_revision)
         except RuntimeError as error:
-            return jsonify({"ok": False, "error": str(error)}), 503
+            message = str(error)
+            status_code = 409 if "changed on GitHub after this page loaded" in message else 503
+            return jsonify({"ok": False, "error": message}), status_code
 
-        response = jsonify({"ok": True, "text": text, "storage": storage})
+        response = jsonify({
+            "ok": True,
+            "text": text.replace("\r\n", "\n").replace("\r", "\n"),
+            "storage": storage,
+            "revision": revision,
+            "warnings": warnings,
+        })
         response.headers["Cache-Control"] = "no-store"
         return response
 
-    try:
-        text, storage = read_lyrics_my_albums_text()
-    except RuntimeError as error:
-        return jsonify({"ok": False, "text": "", "storage": "error", "error": str(error)}), 503
-
-    response = jsonify({"ok": True, "text": text, "storage": storage, "writable": is_topster_admin()})
+    text, storage, revision, warnings = read_lyrics_my_albums_text()
+    response = jsonify({
+        "ok": True,
+        "text": text,
+        "storage": storage,
+        "revision": revision,
+        "warnings": warnings,
+        "githubConfigured": lyrics_github_is_configured(),
+        "githubWritable": bool(lyrics_github_is_configured() and get_lyrics_github_token()),
+        "writable": is_topster_admin(),
+    })
     response.headers["Cache-Control"] = "no-store"
     return response
 
