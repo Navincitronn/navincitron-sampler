@@ -85,7 +85,7 @@ except (TypeError, ValueError):
 # Increment this whenever the collection payload/matching contract changes. The
 # version is part of the Redis key, so a deploy cannot silently keep serving a
 # week-old collection snapshot produced by an older matcher revision.
-DISCOGS_COLLECTION_CACHE_VERSION = 10
+DISCOGS_COLLECTION_CACHE_VERSION = 11
 DISCOGS_RELEASE_CACHE_VERSION = 1
 
 
@@ -1286,6 +1286,94 @@ def discogs_formats_include_vinyl(formats: Any) -> bool:
     return False
 
 
+def fetch_discogs_collection_field_names(username: str) -> dict[str, str]:
+    """Return Discogs collection custom-field IDs mapped to their display names.
+
+    Media Condition and Sleeve Condition are collection fields rather than release-
+    database metadata. The user's authenticated Discogs token is therefore used
+    when available so private collection values can be read. A field lookup failure
+    must never prevent the collection itself from loading.
+    """
+
+    url = f"https://api.discogs.com/users/{quote_plus(username)}/collection/fields"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Navincitron/1.0 +https://www.navincitron.com",
+    }
+    token = get_discogs_token()
+    if token:
+        headers["Authorization"] = f"Discogs token={token}"
+
+    try:
+        with urlopen(Request(url, headers=headers), timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+    fields = payload.get("fields") if isinstance(payload, dict) else None
+    if not isinstance(fields, list):
+        return {}
+
+    names: dict[str, str] = {}
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        field_id = field.get("id")
+        name = str(field.get("name") or "").strip()
+        if field_id is None or not name:
+            continue
+        names[str(field_id)] = name
+    return names
+
+
+def discogs_collection_item_conditions(
+    item: dict[str, Any],
+    field_names: dict[str, str],
+) -> tuple[str, str]:
+    """Extract the owner's media/sleeve grading for one collection instance."""
+
+    media_condition = ""
+    sleeve_condition = ""
+
+    # Be tolerant of direct fields if Discogs changes/extends the collection shape.
+    for key in ("media_condition", "mediaCondition"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            media_condition = value
+            break
+    for key in ("sleeve_condition", "sleeveCondition"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            sleeve_condition = value
+            break
+
+    notes = item.get("notes")
+    if isinstance(notes, list):
+        for note in notes:
+            if not isinstance(note, dict):
+                continue
+            field_id = str(note.get("field_id") if note.get("field_id") is not None else note.get("fieldId") or "")
+            value = str(note.get("value") or "").strip()
+            if not value:
+                continue
+            field_name = str(field_names.get(field_id) or "").strip().casefold()
+            normalized_name = re.sub(r"[^a-z]+", " ", field_name).strip()
+            if "media" in normalized_name and "condition" in normalized_name:
+                media_condition = value
+            elif "sleeve" in normalized_name and "condition" in normalized_name:
+                sleeve_condition = value
+            elif not field_name:
+                # Discogs's default collection fields are historically IDs 1 and 2.
+                # Use this only as a fallback when the field-definition request was
+                # unavailable; named fields above always take precedence.
+                if field_id == "1" and not media_condition:
+                    media_condition = value
+                elif field_id == "2" and not sleeve_condition:
+                    sleeve_condition = value
+
+    return media_condition, sleeve_condition
+
+
 def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
     first = fetch_discogs_collection_page(username, 1, 100)
     pagination = first.get("pagination") if isinstance(first.get("pagination"), dict) else {}
@@ -1303,6 +1391,8 @@ def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
         page_releases = payload.get("releases")
         if isinstance(page_releases, list):
             releases.extend(item for item in page_releases if isinstance(item, dict))
+
+    collection_field_names = fetch_discogs_collection_field_names(username)
 
     unique: dict[str, dict[str, Any]] = {}
     release_ids_by_key: dict[str, set[int]] = {}
@@ -1332,6 +1422,7 @@ def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
         vinyl = discogs_formats_include_vinyl(formats)
         instance_id_raw = item.get("instance_id")
         instance_id = int(instance_id_raw) if str(instance_id_raw or "").isdigit() else None
+        media_condition, sleeve_condition = discogs_collection_item_conditions(item, collection_field_names)
 
         key = f"{' | '.join(artist_names).casefold()}::{title.casefold()}"
         if key not in unique:
@@ -1366,6 +1457,8 @@ def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
             "instanceId": instance_id,
             "formats": formats,
             "vinyl": vinyl,
+            "mediaCondition": media_condition,
+            "sleeveCondition": sleeve_condition,
         }
         unique[key]["ownedReleases"].append(owned_release)
         if vinyl:
@@ -2157,7 +2250,7 @@ def lyrics_discogs_vinyl_tracklist():
             }
         )
 
-    candidate_releases: list[tuple[int, dict[str, Any], bool]] = []
+    candidate_releases: list[tuple[int, dict[str, Any], bool, dict[str, Any]]] = []
     seen_release_ids: set[int] = set()
 
     def add_album_vinyl_release_ids(album: dict[str, Any], primary: bool) -> None:
@@ -2172,7 +2265,7 @@ def lyrics_discogs_vinyl_tracklist():
             if release_id_int in seen_release_ids:
                 continue
             seen_release_ids.add(release_id_int)
-            candidate_releases.append((release_id_int, album, primary))
+            candidate_releases.append((release_id_int, album, primary, owned_release))
 
     for album in matched_albums:
         add_album_vinyl_release_ids(album, True)
@@ -2198,11 +2291,11 @@ def lyrics_discogs_vinyl_tracklist():
             if any(normalize_discogs_artist_for_lookup(value) in related_artist_keys for value in album_artists):
                 related_albums.append(album)
 
-    loaded_releases: list[tuple[float, float, int, dict[str, Any], dict[str, Any]]] = []
+    loaded_releases: list[tuple[float, float, int, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
     errors: list[str] = []
 
-    def load_candidates(candidates: list[tuple[int, dict[str, Any], bool]]) -> None:
-        for release_id, album, primary in candidates:
+    def load_candidates(candidates: list[tuple[int, dict[str, Any], bool, dict[str, Any]]]) -> None:
+        for release_id, album, primary, owned_release in candidates:
             if len(loaded_releases) >= 20:
                 break
             try:
@@ -2215,15 +2308,15 @@ def lyrics_discogs_vinyl_tracklist():
                     score += 15.0
                 if discogs_release_has_side_positions(release):
                     score += 5.0
-                loaded_releases.append((score, track_score, release_id, release, album))
+                loaded_releases.append((score, track_score, release_id, release, album, owned_release))
             except Exception as error:
                 errors.append(f"Release {release_id}: {error}")
 
     load_candidates(list(candidate_releases))
 
-    primary_has_track = any(track_score >= 0.55 for _score, track_score, _release_id, _release, _album in loaded_releases)
+    primary_has_track = any(track_score >= 0.55 for _score, track_score, _release_id, _release, _album, _owned_release in loaded_releases)
     if current_track_title and not primary_has_track:
-        related_candidates: list[tuple[int, dict[str, Any], bool]] = []
+        related_candidates: list[tuple[int, dict[str, Any], bool, dict[str, Any]]] = []
         before_ids = set(seen_release_ids)
         for album in related_albums:
             add_album_vinyl_release_ids(album, False)
@@ -2250,7 +2343,15 @@ def lyrics_discogs_vinyl_tracklist():
         )
 
     loaded_releases.sort(key=lambda item: item[0], reverse=True)
-    _score, _track_score, _release_id, selected_release, selected_album = loaded_releases[0]
+    _score, _track_score, _release_id, selected_release, selected_album, selected_owned_release = loaded_releases[0]
+
+    # Release database metadata is shared by every owner, whereas media/sleeve
+    # grading belongs to this exact collection instance. Merge the latter only
+    # into this response; do not put private collection grading in release cache.
+    selected_release = dict(selected_release)
+    selected_release["mediaCondition"] = str(selected_owned_release.get("mediaCondition") or "").strip()
+    selected_release["sleeveCondition"] = str(selected_owned_release.get("sleeveCondition") or "").strip()
+    selected_release["collectionInstanceId"] = selected_owned_release.get("instanceId")
 
     selected_release_id = int(selected_release.get("releaseId") or 0) if str(selected_release.get("releaseId") or "").isdigit() else 0
     release_cover_override = read_lyrics_discogs_cover_override(selected_release_id) if selected_release_id > 0 else None
