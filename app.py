@@ -3203,6 +3203,7 @@ def get_spotify_client():
 GENIUS_LOOKUP_CACHE: dict[str, dict[str, Any]] = {}
 GENIUS_LOOKUP_CACHE_LOCK = threading.Lock()
 GENIUS_LOOKUP_CACHE_MAX_ITEMS = 500
+GENIUS_LOOKUP_CACHE_VERSION = 2
 GENIUS_MATCH_TTL_SECONDS = 7 * 24 * 60 * 60
 GENIUS_MISS_TTL_SECONDS = 60 * 60
 def get_genius_access_token() -> str:
@@ -3345,6 +3346,23 @@ def clean_lyrics_track_title(value: Any) -> str:
         text,
         flags=re.IGNORECASE,
     )
+
+    # Spotify commonly chains version qualifiers with multiple " - " segments,
+    # e.g. "Deuce - Live/1975 - 2025 Remaster". The previous one-shot suffix
+    # regex could not cross the second hyphen, leaving the whole version string
+    # in the Genius query. Peel qualifying suffix segments from right to left.
+    parts = re.split(r"\s+-\s+", text)
+    while len(parts) > 1:
+        suffix = parts[-1].strip()
+        if (
+            re.search(rf"(?:{qualifier_words})", suffix, flags=re.IGNORECASE)
+            or re.search(r"\b(?:19|20)\d{2}\b", suffix)
+        ):
+            parts.pop()
+            continue
+        break
+    text = " - ".join(parts)
+
     text = re.sub(
         rf"\s+-\s+[^-]*(?:{qualifier_words})[^-]*$",
         "",
@@ -3352,6 +3370,37 @@ def clean_lyrics_track_title(value: Any) -> str:
         flags=re.IGNORECASE,
     )
     return re.sub(r"\s+", " ", text).strip(" -")
+
+
+def clean_lyrics_album_title(value: Any) -> str:
+    """Remove edition/live/remaster packaging while preserving the album identity."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    qualifier_words = (
+        r"\blive\b|remaster(?:ed|ing)?|deluxe|expanded|anniversary|"
+        r"bonus track|edition|mono|stereo"
+    )
+    text = re.sub(
+        rf"\s*[\[(][^\])]*(?:{qualifier_words})[^\])]*[\])]\s*",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    parts = re.split(r"\s+-\s+", text)
+    while len(parts) > 1:
+        suffix = parts[-1].strip()
+        if (
+            re.search(rf"(?:{qualifier_words})", suffix, flags=re.IGNORECASE)
+            or re.search(r"\b(?:19|20)\d{2}\b", suffix)
+        ):
+            parts.pop()
+            continue
+        break
+
+    return re.sub(r"\s+", " ", " - ".join(parts)).strip(" -")
 
 
 def lyrics_token_overlap(left: Any, right: Any) -> float:
@@ -3430,12 +3479,36 @@ def score_genius_song_match(
         if isinstance(candidate_album, dict)
         else ""
     )
-    if album_name and candidate_album_name:
-        album_overlap = lyrics_token_overlap(album_name, candidate_album_name)
-        if normalize_lyrics_match_text(album_name) == normalize_lyrics_match_text(candidate_album_name):
-            score += 10.0
+    requested_album_clean = clean_lyrics_album_title(album_name)
+    candidate_album_clean = clean_lyrics_album_title(candidate_album_name)
+    requested_album_norm = normalize_lyrics_match_text(requested_album_clean)
+    candidate_album_norm = normalize_lyrics_match_text(candidate_album_clean)
+
+    if requested_album_norm and candidate_album_norm:
+        album_overlap = lyrics_token_overlap(requested_album_clean, candidate_album_clean)
+        if requested_album_norm == candidate_album_norm:
+            # Album-specific live pages should outrank a studio page with the same
+            # base song title and artist.
+            score += 18.0
         else:
-            score += 8.0 * album_overlap
+            score += 10.0 * album_overlap
+
+    # Genius search results do not always include an album object. Live pages often
+    # carry the album/version in the song title or URL slug instead
+    # ("Deuce (Alive!)" / "Kiss-deuce-alive-lyrics"). Use that as a secondary hint.
+    if requested_album_norm and requested_album_norm != candidate_album_norm:
+        candidate_hint = " ".join(
+            str(value or "")
+            for value in (
+                candidate_title,
+                song.get("path"),
+                song.get("url"),
+            )
+        )
+        candidate_hint_norm = normalize_lyrics_match_text(candidate_hint)
+        album_tokens = [token for token in requested_album_norm.split() if token]
+        if album_tokens and all(token in candidate_hint_norm.split() for token in album_tokens):
+            score += 12.0
 
     return score
 
@@ -5074,7 +5147,7 @@ def build_genius_song_payload(song: dict[str, Any]) -> dict[str, Any]:
 
 
 def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
-    cache_key = str(track.get("key") or "")
+    cache_key = f"v{GENIUS_LOOKUP_CACHE_VERSION}::" + str(track.get("key") or "")
     now = time.time()
 
     with GENIUS_LOOKUP_CACHE_LOCK:
@@ -5089,16 +5162,42 @@ def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
     album_name = str(track.get("album") or "").strip()
     primary_artist = artists[0] if artists else ""
 
-    queries = [" ".join(part for part in (title, primary_artist) if part).strip()]
     cleaned_title = clean_lyrics_track_title(title)
+    cleaned_album = clean_lyrics_album_title(album_name)
+    exact_query = " ".join(part for part in (title, primary_artist) if part).strip()
     cleaned_query = " ".join(part for part in (cleaned_title, primary_artist) if part).strip()
-    if cleaned_query and cleaned_query not in queries:
-        queries.append(cleaned_query)
+    album_query = " ".join(
+        part for part in (cleaned_title, primary_artist, cleaned_album) if part
+    ).strip()
+
+    title_was_simplified = (
+        normalize_lyrics_match_text(cleaned_title)
+        != normalize_lyrics_match_text(title)
+    )
+    album_was_simplified = (
+        normalize_lyrics_match_text(cleaned_album)
+        != normalize_lyrics_match_text(album_name)
+    )
+    versioned_track = title_was_simplified or album_was_simplified
+
+    queries: list[str] = []
+    def add_query(value: str) -> None:
+        query = str(value or "").strip()
+        if query and query not in queries:
+            queries.append(query)
+
+    # For live/remastered Spotify tracks, ask Genius for the base song + album
+    # identity first. This makes "Deuce ... 2025 Remaster" favor the Alive! page
+    # instead of a studio Deuce result or a remaster metadata stub.
+    if versioned_track:
+        add_query(album_query)
+    add_query(exact_query)
+    add_query(cleaned_query)
+    if not versioned_track:
+        add_query(album_query)
 
     candidates: dict[int, dict[str, Any]] = {}
-    for query in queries[:2]:
-        if not query:
-            continue
+    for query in queries[:3]:
         payload = genius_search_request(query)
         for song in genius_song_hits(payload):
             try:
@@ -5107,13 +5206,15 @@ def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
                 continue
             candidates[song_id] = song
         if candidates:
-            # A second query is useful only when the exact Spotify title did not
-            # produce plausible candidates.
             best_now = max(
                 score_genius_song_match(song, title, artists, album_name)
                 for song in candidates.values()
             )
-            if best_now >= 90:
+            # Normal tracks keep the fast one-query path. Versioned/live tracks
+            # require a stronger match before short-circuiting so a generic studio
+            # result cannot prevent the album-specific query from being considered.
+            threshold = 105.0 if versioned_track else 90.0
+            if best_now >= threshold:
                 break
 
     best_song: dict[str, Any] | None = None
