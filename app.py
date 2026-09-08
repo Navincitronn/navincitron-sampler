@@ -69,6 +69,9 @@ TOPSTER_SETTINGS_FILE = BASE_DIR / "topster_settings.json"
 TOPSTER_SOURCE_TEXT_FILE = BASE_DIR / "topster_source_text.json"
 TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE = BASE_DIR / "topster_discogs_ownership_overrides.json"
 TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_LOCK = threading.Lock()
+LYRICS_GENIUS_ALBUM_LINKS_FILE = BASE_DIR / "lyrics_genius_album_links.json"
+LYRICS_GENIUS_ALBUM_LINKS_LOCK = threading.Lock()
+LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE: dict[str, dict[str, Any] | None] = {}
 LYRICS_DISCOGS_COVER_OVERRIDES_FILE = BASE_DIR / "lyrics_discogs_cover_overrides.json"
 LYRICS_MY_ALBUMS_FILE = BASE_DIR / "my_albums.txt"
 LYRICS_GITHUB_REPOSITORY = (os.getenv("LYRICS_GITHUB_REPOSITORY") or os.getenv("GITHUB_REPOSITORY") or "").strip()
@@ -1670,13 +1673,24 @@ def normalize_topster_discogs_ownership_override(value: Any) -> dict[str, Any] |
     if not title or len(title) > 600 or len(artist) > 600:
         return None
 
-    return {
+    release_id_raw = value.get("releaseId")
+    release_id = int(release_id_raw) if str(release_id_raw or "").isdigit() and int(release_id_raw) > 0 else None
+    release_url = str(value.get("releaseUrl") or "").strip()
+    if release_url and not release_url.startswith(("http://", "https://")):
+        release_url = ""
+
+    normalized = {
         "identity": identity,
         "artist": artist,
         "title": title,
         "state": state,
         "savedAt": str(value.get("savedAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())).strip(),
     }
+    if release_id:
+        normalized["releaseId"] = release_id
+    if release_url:
+        normalized["releaseUrl"] = release_url
+    return normalized
 
 
 def topster_discogs_ownership_override_digest(identity: str) -> str:
@@ -2699,6 +2713,140 @@ def lyrics_discogs_vinyl_tracklist():
     return discogs_collection_json_response(response_payload)
 
 
+def lyrics_manual_album_relation_key(value: Any) -> str:
+    normalized = normalize_lyrics_match_text(value)
+    return re.sub(r"\s+", "", normalized)
+
+
+def lyrics_manual_album_identity(artist: Any, album: Any) -> str:
+    artist_text = str(artist or "").strip()
+    artist_text = re.sub(r"\s*\*+\s*$", "", artist_text)
+    artist_text = re.sub(r"\s*\(\d+\)\s*$", "", artist_text)
+    artist_text = re.sub(r'\s*["“][^"”]+["”]\s*', " ", artist_text)
+    artist_key = lyrics_manual_album_relation_key(artist_text)
+    album_key = lyrics_manual_album_relation_key(album)
+    return f"{artist_key}::{album_key}" if album_key else ""
+
+
+def parse_discogs_release_id_from_url(raw_url: Any) -> tuple[int, str]:
+    url = str(raw_url or "").strip()
+    try:
+        parsed = urlparse(url)
+    except Exception as error:
+        raise ValueError("Enter a valid Discogs release URL.") from error
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host not in {"discogs.com", "www.discogs.com"} and not host.endswith(".discogs.com"):
+        raise ValueError("Enter a Discogs release URL from discogs.com.")
+    match = re.search(r"/release/(\d+)(?:[-/]|$)", parsed.path, flags=re.IGNORECASE)
+    if not match:
+        raise ValueError("The Discogs link must point to a specific /release/<id> page.")
+    return int(match.group(1)), url
+
+
+def find_manual_discogs_ownership_override(artist: str, album: str) -> dict[str, Any] | None:
+    identity = lyrics_manual_album_identity(artist, album)
+    if not identity:
+        return None
+    for record in read_topster_discogs_ownership_overrides(DISCOGS_COLLECTION_USERNAME):
+        if str(record.get("identity") or "") != identity:
+            continue
+        if str(record.get("state") or "").strip().lower() != "owned":
+            return None
+        release_id = record.get("releaseId")
+        if str(release_id or "").isdigit() and int(release_id) > 0:
+            return record
+    return None
+
+
+def build_manual_discogs_tracklist_payload(artist: str, album: str, record: dict[str, Any]) -> dict[str, Any]:
+    release_id = int(record.get("releaseId") or 0)
+    if release_id <= 0:
+        raise ValueError("The saved Discogs ownership override does not contain a release ID.")
+    release = dict(fetch_discogs_release(release_id))
+    if not release.get("tracklist"):
+        raise ValueError("The linked Discogs release does not contain a tracklist.")
+    release["mediaCondition"] = ""
+    release["sleeveCondition"] = ""
+    cover_override = read_lyrics_discogs_cover_override(release_id) or read_lyrics_album_cover_override(artist, album)
+    return {
+        "ok": True,
+        "matched": True,
+        "vinylFound": True,
+        "manualOwnership": True,
+        "collectionAlbum": {
+            "title": release.get("title") or album,
+            "artists": release.get("artists") or ([artist] if artist else []),
+            "year": release.get("year"),
+        },
+        "matchedCollectionAlbums": [],
+        "sourceAlbum": album,
+        "sourceArtist": artist,
+        "release": release,
+        "coverOverride": cover_override,
+        "discogsAuth": {
+            "tokenConfigured": bool(get_discogs_token()),
+            "ownerAuthenticated": False,
+            "authenticatedUsername": "",
+            "collectionUsername": DISCOGS_COLLECTION_USERNAME,
+            "conditionFields": {},
+        },
+    }
+
+
+@app.route("/api/lyrics/discogs-manual-ownership", methods=["GET", "POST"])
+def lyrics_discogs_manual_ownership():
+    if request.method == "GET":
+        artist = str(request.args.get("artist") or "").strip()
+        album = str(request.args.get("album") or "").strip()
+        if not album:
+            return discogs_collection_json_response({"ok": False, "error": "Album is required."}, 400)
+        record = find_manual_discogs_ownership_override(artist, album)
+        if not record:
+            return discogs_collection_json_response({"ok": True, "matched": False, "manualOwnership": False})
+        try:
+            payload = build_manual_discogs_tracklist_payload(artist, album, record)
+            payload["override"] = record
+            return discogs_collection_json_response(payload)
+        except Exception as error:
+            return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
+
+    admin_error = require_topster_admin_response()
+    if admin_error is not None:
+        return admin_error
+
+    payload = request.get_json(silent=True) or {}
+    artist = str(payload.get("artist") or "").strip()
+    album = str(payload.get("album") or "").strip()
+    if not album:
+        return discogs_collection_json_response({"ok": False, "error": "The currently playing album does not have a usable title."}, 400)
+    try:
+        release_id, release_url = parse_discogs_release_id_from_url(payload.get("releaseUrl") or payload.get("url"))
+        release = fetch_discogs_release(release_id)
+        if not release.get("tracklist"):
+            raise ValueError("The linked Discogs release does not contain a tracklist.")
+        identity = lyrics_manual_album_identity(artist, album)
+        if not identity:
+            raise ValueError("The currently playing album does not have a usable identity.")
+        saved = write_topster_discogs_ownership_override(
+            DISCOGS_COLLECTION_USERNAME,
+            {
+                "identity": identity,
+                "artist": artist,
+                "title": album,
+                "state": "owned",
+                "releaseId": release_id,
+                "releaseUrl": release_url,
+            },
+        )
+        response_payload = build_manual_discogs_tracklist_payload(artist, album, saved)
+        response_payload["override"] = saved
+        return discogs_collection_json_response(response_payload)
+    except ValueError as error:
+        return discogs_collection_json_response({"ok": False, "error": str(error)}, 400)
+    except Exception as error:
+        return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
+
+
 @app.route("/topster-admin-login", methods=["GET", "POST"])
 def topster_admin_login():
     next_url = safe_frontend_redirect_url(request.values.get("next"))
@@ -3353,6 +3501,288 @@ GENIUS_LOOKUP_CACHE_MAX_ITEMS = 500
 GENIUS_LOOKUP_CACHE_VERSION = 2
 GENIUS_MATCH_TTL_SECONDS = 7 * 24 * 60 * 60
 GENIUS_MISS_TTL_SECONDS = 60 * 60
+
+
+def lyrics_genius_album_links_redis_key() -> str:
+    return f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:lyrics-genius-album-links"
+
+
+def normalize_lyrics_genius_album_link(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    artist = str(value.get("artist") or "").strip()
+    album = str(value.get("album") or "").strip()
+    identity = str(value.get("identity") or lyrics_manual_album_identity(artist, album)).strip()
+    url = str(value.get("url") or "").strip()
+    album_id_raw = value.get("albumId")
+    album_id = int(album_id_raw) if str(album_id_raw or "").isdigit() and int(album_id_raw) > 0 else None
+    if not identity or not album or not url or not album_id:
+        return None
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host not in {"genius.com", "www.genius.com"} or not parsed.path.casefold().startswith("/albums/"):
+        return None
+
+    tracks: list[dict[str, Any]] = []
+    for raw_track in value.get("tracks") if isinstance(value.get("tracks"), list) else []:
+        if not isinstance(raw_track, dict):
+            continue
+        song_id_raw = raw_track.get("songId") or raw_track.get("id")
+        song_id = int(song_id_raw) if str(song_id_raw or "").isdigit() and int(song_id_raw) > 0 else None
+        title = str(raw_track.get("title") or "").strip()
+        if not song_id or not title:
+            continue
+        tracks.append({
+            "songId": song_id,
+            "title": title,
+            "url": str(raw_track.get("url") or "").strip(),
+            "position": str(raw_track.get("position") or "").strip(),
+        })
+    if not tracks:
+        return None
+    return {
+        "identity": identity,
+        "artist": artist,
+        "album": album,
+        "url": url,
+        "albumId": album_id,
+        "tracks": tracks,
+        "savedAt": str(value.get("savedAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())).strip(),
+    }
+
+
+def read_lyrics_genius_album_link(artist: str, album: str) -> dict[str, Any] | None:
+    identity = lyrics_manual_album_identity(artist, album)
+    if not identity:
+        return None
+    with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
+        if identity in LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE:
+            cached = LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE[identity]
+            return dict(cached) if isinstance(cached, dict) else None
+
+    record = None
+    digest = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                raw = client.hget(lyrics_genius_album_links_redis_key(), digest)
+                if raw:
+                    record = normalize_lyrics_genius_album_link(json.loads(raw))
+        except Exception:
+            record = None
+    if record is None:
+        try:
+            with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
+                data = read_json_file(LYRICS_GENIUS_ALBUM_LINKS_FILE, {})
+            if isinstance(data, dict):
+                record = normalize_lyrics_genius_album_link(data.get(digest))
+        except Exception:
+            record = None
+
+    with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
+        LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE[identity] = dict(record) if isinstance(record, dict) else None
+    return record
+
+
+def write_lyrics_genius_album_link(value: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_lyrics_genius_album_link(value)
+    if not normalized:
+        raise ValueError("A valid Genius album link and tracklist are required.")
+    identity = normalized["identity"]
+    digest = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()
+    redis_saved = False
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        client.hset(lyrics_genius_album_links_redis_key(), digest, json.dumps(normalized, ensure_ascii=False))
+        redis_saved = True
+    try:
+        with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
+            data = read_json_file(LYRICS_GENIUS_ALBUM_LINKS_FILE, {})
+            if not isinstance(data, dict):
+                data = {}
+            data[digest] = normalized
+            write_json_file(LYRICS_GENIUS_ALBUM_LINKS_FILE, data)
+            LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE[identity] = dict(normalized)
+    except Exception:
+        if not redis_saved:
+            raise
+        with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
+            LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE[identity] = dict(normalized)
+    return normalized
+
+
+def validate_genius_album_url(raw_url: Any) -> str:
+    url = str(raw_url or "").strip()
+    try:
+        parsed = urlparse(url)
+    except Exception as error:
+        raise ValueError("Enter a valid Genius album URL.") from error
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host not in {"genius.com", "www.genius.com"} or not parsed.path.casefold().startswith("/albums/"):
+        raise ValueError("Enter a Genius album URL in the form https://genius.com/albums/Artist/Album.")
+    return url
+
+
+def genius_album_id_from_page_html(html: str) -> int | None:
+    decoded = html_unescape(str(html or ""))
+    patterns = (
+        r'"album_ids"\s*:\s*\[\s*(\d+)',
+        r'\\"album_ids\\"\s*:\s*\[\s*(\d+)',
+        r'"album_id"\s*:\s*(\d+)',
+        r'"albumId"\s*:\s*(\d+)',
+        r'/api/albums/(\d+)',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, decoded, flags=re.IGNORECASE)
+        if match and int(match.group(1)) > 0:
+            return int(match.group(1))
+    return None
+
+
+def fetch_genius_album_id_from_url(url: str) -> int:
+    validated_url = validate_genius_album_url(url)
+    headers = {
+        "Accept": "text/html,application/xhtml+xml",
+        "User-Agent": "Mozilla/5.0 (compatible; NavincitronLyrics/1.2; +https://www.navincitron.com)",
+    }
+    page_error = None
+    try:
+        with urlopen(Request(validated_url, headers=headers), timeout=15) as response:
+            html = response.read(6 * 1024 * 1024).decode("utf-8", errors="replace")
+        album_id = genius_album_id_from_page_html(html)
+        if album_id:
+            return album_id
+    except Exception as error:
+        page_error = error
+
+    parsed = urlparse(validated_url)
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    artist_hint = parts[1].replace("-", " ") if len(parts) > 1 else ""
+    album_hint = parts[2].replace("-", " ") if len(parts) > 2 else ""
+    query = " ".join(part for part in (artist_hint, album_hint) if part).strip()
+    if query and get_genius_access_token():
+        try:
+            search_payload = genius_search_request(query)
+            for hit in genius_song_hits(search_payload)[:10]:
+                song_id_raw = hit.get("id")
+                if not str(song_id_raw or "").isdigit():
+                    continue
+                try:
+                    details_payload = genius_song_request(int(song_id_raw))
+                    response = details_payload.get("response")
+                    song = response.get("song") if isinstance(response, dict) else None
+                    album_data = song.get("album") if isinstance(song, dict) and isinstance(song.get("album"), dict) else None
+                    if not album_data:
+                        continue
+                    album_url = str(album_data.get("url") or "").strip()
+                    album_id_raw = album_data.get("id")
+                    if album_url and urlparse(album_url).path.rstrip("/").casefold() == parsed.path.rstrip("/").casefold():
+                        if str(album_id_raw or "").isdigit() and int(album_id_raw) > 0:
+                            return int(album_id_raw)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    detail = f" ({page_error})" if page_error else ""
+    raise RuntimeError(f"Could not determine the Genius album ID from that album page{detail}.")
+
+
+def fetch_genius_album_tracks(album_id: int) -> list[dict[str, Any]]:
+    access_token = get_genius_access_token()
+    if not access_token:
+        raise RuntimeError("Genius album linking requires GENIUS_ACCESS_TOKEN on the backend.")
+    tracks: list[dict[str, Any]] = []
+    page = 1
+    while page <= 20:
+        payload = genius_json_request(
+            f"https://api.genius.com/albums/{int(album_id)}/tracks?per_page=50&page={page}&text_format=plain",
+            access_token,
+        )
+        response = payload.get("response") if isinstance(payload, dict) else None
+        raw_tracks = response.get("tracks") if isinstance(response, dict) and isinstance(response.get("tracks"), list) else []
+        for raw_track in raw_tracks:
+            if not isinstance(raw_track, dict):
+                continue
+            song = raw_track.get("song") if isinstance(raw_track.get("song"), dict) else raw_track
+            song_id_raw = song.get("id")
+            title = str(song.get("title") or song.get("title_with_featured") or "").strip()
+            if not str(song_id_raw or "").isdigit() or not title:
+                continue
+            tracks.append({
+                "songId": int(song_id_raw),
+                "title": title,
+                "url": str(song.get("url") or "").strip(),
+                "position": str(raw_track.get("number") or raw_track.get("track_number") or len(tracks) + 1),
+            })
+        next_page = response.get("next_page") if isinstance(response, dict) else None
+        if not next_page or not raw_tracks:
+            break
+        try:
+            page = int(next_page)
+        except (TypeError, ValueError):
+            page += 1
+    if not tracks:
+        raise RuntimeError("Genius returned no tracks for that album page.")
+    return tracks
+
+
+def track_album_artist_for_manual_link(track: dict[str, Any]) -> str:
+    album_artists = track.get("albumArtists") if isinstance(track.get("albumArtists"), list) else []
+    if album_artists:
+        return str(album_artists[0] or "").strip()
+    artists = track.get("artists") if isinstance(track.get("artists"), list) else []
+    if artists:
+        return str(artists[0] or "").strip()
+    return str(track.get("albumArtist") or track.get("artist") or "").split(",", 1)[0].strip()
+
+
+def lookup_genius_song_from_manual_album_link(track: dict[str, Any]) -> dict[str, Any] | None:
+    artist = track_album_artist_for_manual_link(track)
+    album = str(track.get("album") or "").strip()
+    mapping = read_lyrics_genius_album_link(artist, album)
+    if not mapping:
+        return None
+    title = str(track.get("title") or "").strip()
+    best_track = None
+    best_score = 0.0
+    for candidate in mapping.get("tracks") if isinstance(mapping.get("tracks"), list) else []:
+        score = discogs_track_title_match_score(title, candidate.get("title"))
+        if score > best_score:
+            best_score = score
+            best_track = candidate
+    if best_track is None or best_score < 0.55:
+        return None
+    song_id = int(best_track.get("songId") or 0)
+    if song_id <= 0:
+        return None
+    try:
+        details_payload = genius_song_request(song_id)
+        response = details_payload.get("response")
+        song = response.get("song") if isinstance(response, dict) else None
+        if isinstance(song, dict):
+            result = build_genius_song_payload(song)
+            result["manualAlbumUrl"] = mapping.get("url")
+            return result
+    except Exception:
+        pass
+    stub = {
+        "id": song_id,
+        "title": best_track.get("title") or title,
+        "url": best_track.get("url") or "",
+        "primary_artist": {"name": artist},
+        "album": {"name": album},
+    }
+    result = build_genius_song_payload(stub)
+    result["manualAlbumUrl"] = mapping.get("url")
+    return result
+
+
 def get_genius_access_token() -> str:
     # Genius's official API requires a Client Access Token. Accept a few common
     # environment-variable names so existing deployments can add the token
@@ -5294,6 +5724,10 @@ def build_genius_song_payload(song: dict[str, Any]) -> dict[str, Any]:
 
 
 def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
+    manual_result = lookup_genius_song_from_manual_album_link(track)
+    if manual_result is not None:
+        return manual_result
+
     cache_key = f"v{GENIUS_LOOKUP_CACHE_VERSION}::" + str(track.get("key") or "")
     now = time.time()
 
@@ -5667,6 +6101,68 @@ def lyrics_my_albums():
     })
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.route("/api/lyrics/genius-album-link", methods=["GET", "POST"])
+def lyrics_genius_album_link():
+    if request.method == "GET":
+        artist = str(request.args.get("artist") or "").strip()
+        album = str(request.args.get("album") or "").strip()
+        if not album:
+            return jsonify({"ok": False, "error": "Album is required."}), 400
+        mapping = read_lyrics_genius_album_link(artist, album)
+        return jsonify({
+            "ok": True,
+            "linked": bool(mapping),
+            "mapping": {
+                "artist": mapping.get("artist"),
+                "album": mapping.get("album"),
+                "url": mapping.get("url"),
+                "albumId": mapping.get("albumId"),
+                "trackCount": len(mapping.get("tracks") or []),
+            } if mapping else None,
+        })
+
+    admin_error = require_topster_admin_response()
+    if admin_error is not None:
+        return admin_error
+    payload = request.get_json(silent=True) or {}
+    artist = str(payload.get("artist") or "").strip()
+    album = str(payload.get("album") or "").strip()
+    if not album:
+        return jsonify({"ok": False, "error": "The currently playing album does not have a usable title."}), 400
+    try:
+        url = validate_genius_album_url(payload.get("url"))
+        album_id = fetch_genius_album_id_from_url(url)
+        tracks = fetch_genius_album_tracks(album_id)
+        identity = lyrics_manual_album_identity(artist, album)
+        if not identity:
+            raise ValueError("The currently playing album does not have a usable identity.")
+        saved = write_lyrics_genius_album_link({
+            "identity": identity,
+            "artist": artist,
+            "album": album,
+            "url": url,
+            "albumId": album_id,
+            "tracks": tracks,
+        })
+        with GENIUS_LOOKUP_CACHE_LOCK:
+            GENIUS_LOOKUP_CACHE.clear()
+        return jsonify({
+            "ok": True,
+            "linked": True,
+            "mapping": {
+                "artist": saved.get("artist"),
+                "album": saved.get("album"),
+                "url": saved.get("url"),
+                "albumId": saved.get("albumId"),
+                "trackCount": len(saved.get("tracks") or []),
+            },
+        })
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 502
 
 
 @app.route("/api/lyrics/current", methods=["GET"])
