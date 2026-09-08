@@ -67,6 +67,8 @@ CONTROL_FILE = BASE_DIR / "sampler_control.json"
 TOPSTER_COVER_CACHE_FILE = BASE_DIR / "topster_cover_cache.json"
 TOPSTER_SETTINGS_FILE = BASE_DIR / "topster_settings.json"
 TOPSTER_SOURCE_TEXT_FILE = BASE_DIR / "topster_source_text.json"
+TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE = BASE_DIR / "topster_discogs_ownership_overrides.json"
+TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_LOCK = threading.Lock()
 LYRICS_DISCOGS_COVER_OVERRIDES_FILE = BASE_DIR / "lyrics_discogs_cover_overrides.json"
 LYRICS_MY_ALBUMS_FILE = BASE_DIR / "my_albums.txt"
 LYRICS_GITHUB_REPOSITORY = (os.getenv("LYRICS_GITHUB_REPOSITORY") or os.getenv("GITHUB_REPOSITORY") or "").strip()
@@ -1640,6 +1642,151 @@ def api_discogs_collection():
             cached["stale"] = True
             cached["warning"] = str(error)
             return discogs_collection_json_response(cached)
+        return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
+
+
+
+def topster_discogs_ownership_overrides_redis_key(username: str) -> str:
+    safe_username = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(username or DISCOGS_COLLECTION_USERNAME))
+    return (
+        f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:"
+        f"discogs-ownership-overrides:{safe_username}"
+    )
+
+
+def normalize_topster_discogs_ownership_override(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+
+    identity = str(value.get("identity") or "").strip()
+    artist = str(value.get("artist") or "").strip()
+    title = str(value.get("title") or value.get("album") or "").strip()
+    state = str(value.get("state") or "").strip().lower().replace("-", "_")
+
+    if state not in {"owned", "not_owned"}:
+        return None
+    if not identity or len(identity) > 1200 or "::" not in identity:
+        return None
+    if not title or len(title) > 600 or len(artist) > 600:
+        return None
+
+    return {
+        "identity": identity,
+        "artist": artist,
+        "title": title,
+        "state": state,
+        "savedAt": str(value.get("savedAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())).strip(),
+    }
+
+
+def topster_discogs_ownership_override_digest(identity: str) -> str:
+    return hashlib.sha256(str(identity or "").encode("utf-8", errors="ignore")).hexdigest()
+
+
+def read_topster_discogs_ownership_overrides(username: str) -> list[dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+
+    # JSON is a no-Redis fallback and also a best-effort mirror. Merge it first so
+    # a Redis value with the same identity remains authoritative.
+    with TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_LOCK:
+        json_data = read_json_file(TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE, {})
+    if isinstance(json_data, dict):
+        for raw in json_data.values():
+            normalized = normalize_topster_discogs_ownership_override(raw)
+            if normalized:
+                records[normalized["identity"]] = normalized
+
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                raw_values = client.hgetall(topster_discogs_ownership_overrides_redis_key(username)) or {}
+                for raw in raw_values.values():
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        continue
+                    normalized = normalize_topster_discogs_ownership_override(parsed)
+                    if normalized:
+                        records[normalized["identity"]] = normalized
+        except Exception:
+            # The JSON mirror/fallback can still make previously saved flags readable.
+            pass
+
+    return sorted(records.values(), key=lambda item: (str(item.get("artist") or "").casefold(), str(item.get("title") or "").casefold()))
+
+
+def write_topster_discogs_ownership_override(username: str, value: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_topster_discogs_ownership_override(value)
+    if not normalized:
+        raise ValueError("A valid ownership identity, album title, and owned/not-owned state are required.")
+
+    digest = topster_discogs_ownership_override_digest(normalized["identity"])
+    redis_saved = False
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        # HSET has no TTL here by design. Manual ownership flags must not expire with
+        # the seven-day Discogs collection cache or any browser-side Topster cache.
+        client.hset(
+            topster_discogs_ownership_overrides_redis_key(username),
+            digest,
+            json.dumps(normalized, ensure_ascii=False),
+        )
+        redis_saved = True
+
+    # Keep a JSON mirror for local/no-Redis deployments. Failure to mirror must not
+    # invalidate a successful durable Redis write.
+    try:
+        with TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_LOCK:
+            json_data = read_json_file(TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE, {})
+            if not isinstance(json_data, dict):
+                json_data = {}
+            json_data[digest] = normalized
+            write_json_file(TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE, json_data)
+    except Exception:
+        if not redis_saved:
+            raise
+
+    return normalized
+
+
+@app.route("/api/topster-discogs-ownership-overrides", methods=["GET", "POST"])
+def api_topster_discogs_ownership_overrides():
+    username = str(request.args.get("username") or DISCOGS_COLLECTION_USERNAME).strip() or DISCOGS_COLLECTION_USERNAME
+    if username.casefold() != DISCOGS_COLLECTION_USERNAME.casefold():
+        return discogs_collection_json_response({"ok": False, "error": "Only the configured Navincitron Discogs collection is available."}, 400)
+
+    if request.method == "GET":
+        try:
+            return discogs_collection_json_response({
+                "ok": True,
+                "username": username,
+                "overrides": read_topster_discogs_ownership_overrides(username),
+            })
+        except Exception as error:
+            return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
+
+    admin_error = require_topster_admin_response()
+    if admin_error is not None:
+        return admin_error
+
+    payload = request.get_json(silent=True) or {}
+    submitted_username = str(payload.get("username") or username).strip() or username
+    if submitted_username.casefold() != DISCOGS_COLLECTION_USERNAME.casefold():
+        return discogs_collection_json_response({"ok": False, "error": "Only the configured Navincitron Discogs collection is available."}, 400)
+
+    try:
+        saved = write_topster_discogs_ownership_override(submitted_username, payload)
+        return discogs_collection_json_response({
+            "ok": True,
+            "username": submitted_username,
+            "override": saved,
+        })
+    except ValueError as error:
+        return discogs_collection_json_response({"ok": False, "error": str(error)}, 400)
+    except Exception as error:
         return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
 
 
