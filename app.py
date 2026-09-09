@@ -5782,6 +5782,10 @@ def spotify_current_track_snapshot(playback: dict[str, Any] | None) -> dict[str,
             ]
         )
 
+    playback_context = playback.get("context") if isinstance(playback.get("context"), dict) else {}
+    context_uri = str(playback_context.get("uri") or "").strip()
+    context_type = str(playback_context.get("type") or "").strip()
+
     return {
         "key": track_key,
         "id": item.get("id"),
@@ -5792,6 +5796,10 @@ def spotify_current_track_snapshot(playback: dict[str, Any] | None) -> dict[str,
         "albumArtists": album_artists,
         "albumArtist": ", ".join(album_artists) or (", ".join(artists) or "Unknown artist"),
         "album": album_name or "Unknown album",
+        "albumId": album.get("id"),
+        "albumUri": str(album.get("uri") or "").strip(),
+        "contextUri": context_uri,
+        "contextType": context_type,
         "coverUrl": cover_url,
         "artworkSource": "spotify" if cover_url else "",
         "spotifyUrl": spotify_url,
@@ -6288,6 +6296,121 @@ def lyrics_genius_album_link():
         return jsonify({"ok": False, "error": str(error)}), 502
 
 
+
+def fetch_genius_song_annotations(song_id: int) -> list[dict[str, Any]]:
+    access_token = get_genius_access_token()
+    if not access_token:
+        raise RuntimeError("Genius annotations require GENIUS_ACCESS_TOKEN on the backend.")
+
+    query = urlencode({
+        "song_id": int(song_id),
+        "per_page": 50,
+        "text_format": "plain",
+    })
+    payload = genius_json_request(
+        f"https://api.genius.com/referents?{query}",
+        access_token,
+    )
+    response = payload.get("response") if isinstance(payload, dict) else None
+    referents = response.get("referents") if isinstance(response, dict) else None
+    if not isinstance(referents, list):
+        return []
+
+    items: list[dict[str, Any]] = []
+    seen_annotation_ids: set[int] = set()
+
+    for referent in referents:
+        if not isinstance(referent, dict):
+            continue
+        fragment = str(referent.get("fragment") or "").strip()
+        annotations = referent.get("annotations")
+        if not isinstance(annotations, list):
+            continue
+
+        for annotation in annotations:
+            if not isinstance(annotation, dict):
+                continue
+
+            annotation_id_raw = annotation.get("id")
+            try:
+                annotation_id = int(annotation_id_raw)
+            except (TypeError, ValueError):
+                annotation_id = 0
+            if annotation_id and annotation_id in seen_annotation_ids:
+                continue
+            if annotation_id:
+                seen_annotation_ids.add(annotation_id)
+
+            body_value = annotation.get("body")
+            if isinstance(body_value, dict):
+                body = str(
+                    body_value.get("plain")
+                    or body_value.get("text")
+                    or body_value.get("dom")
+                    or ""
+                ).strip()
+            else:
+                body = str(body_value or "").strip()
+
+            authors = annotation.get("authors")
+            author = ""
+            if isinstance(authors, list) and authors:
+                first_author = authors[0]
+                if isinstance(first_author, dict):
+                    author = str(first_author.get("name") or first_author.get("login") or "").strip()
+            if not author:
+                author_obj = annotation.get("author")
+                if isinstance(author_obj, dict):
+                    author = str(author_obj.get("name") or author_obj.get("login") or "").strip()
+
+            votes_raw = annotation.get("votes_total")
+            try:
+                votes = int(votes_raw) if votes_raw is not None else None
+            except (TypeError, ValueError):
+                votes = None
+
+            if not fragment and not body:
+                continue
+
+            items.append({
+                "id": annotation_id or None,
+                "fragment": fragment,
+                "body": body,
+                "author": author,
+                "verified": bool(annotation.get("verified")),
+                "votes": votes,
+            })
+
+    return items
+
+
+@app.route("/api/lyrics/genius-annotations", methods=["GET"])
+def lyrics_genius_annotations():
+    song_id_raw = request.args.get("song_id")
+    try:
+        song_id = int(song_id_raw)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "A valid Genius song_id is required."}), 400
+    if song_id <= 0:
+        return jsonify({"ok": False, "error": "A valid Genius song_id is required."}), 400
+
+    try:
+        annotations = fetch_genius_song_annotations(song_id)
+    except Exception as error:
+        response = jsonify({"ok": False, "error": str(error)})
+        response.status_code = 502
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    response = jsonify({
+        "ok": True,
+        "songId": song_id,
+        "annotations": annotations,
+    })
+    response.headers["Cache-Control"] = "private, max-age=300"
+    return response
+
+
 @app.route("/api/lyrics/current", methods=["GET"])
 def current_lyrics():
     try:
@@ -6411,6 +6534,272 @@ def current_lyrics():
     )
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+
+def spotify_track_part_range_signature(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.replace("–", "-").replace("—", "-").replace("−", "-")
+    match = re.search(r"\b(?:parts?|pts?\.?)\s*(\d+)\s*-\s*(\d+)\b", text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return f"{int(match.group(1))}-{int(match.group(2))}"
+
+
+def spotify_discogs_track_match_score(target_title: Any, spotify_title: Any) -> float:
+    target_part_range = spotify_track_part_range_signature(target_title)
+    spotify_part_range = spotify_track_part_range_signature(spotify_title)
+    if target_part_range and spotify_part_range and target_part_range != spotify_part_range:
+        return 0.0
+
+    target_key = normalize_lyrics_match_text(target_title)
+    spotify_key = normalize_lyrics_match_text(spotify_title)
+    if target_key and target_key == spotify_key:
+        return 1.0
+
+    score = discogs_track_title_match_score(target_title, spotify_title)
+    if target_part_range and spotify_part_range and target_part_range == spotify_part_range:
+        score = max(score, 0.98)
+    return score
+
+
+def spotify_album_name_matches(left: Any, right: Any) -> bool:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if not left_text or not right_text:
+        return True
+
+    left_key = normalize_lyrics_match_text(clean_lyrics_album_title(left_text))
+    right_key = normalize_lyrics_match_text(clean_lyrics_album_title(right_text))
+    if left_key and left_key == right_key:
+        return True
+
+    raw_left = normalize_lyrics_match_text(left_text)
+    raw_right = normalize_lyrics_match_text(right_text)
+    return bool(raw_left and raw_left == raw_right)
+
+
+def spotify_album_tracks_all(spotify_client: Any, album_id: str) -> list[dict[str, Any]]:
+    tracks: list[dict[str, Any]] = []
+    offset = 0
+    limit = 50
+    while True:
+        page = spotify_client.album_tracks(album_id, limit=limit, offset=offset)
+        items = page.get("items") if isinstance(page, dict) else None
+        if isinstance(items, list):
+            tracks.extend(item for item in items if isinstance(item, dict))
+        if not isinstance(page, dict) or not page.get("next"):
+            break
+        offset += limit
+    return tracks
+
+
+def spotify_playlist_items_all(spotify_client: Any, playlist_id: str) -> list[tuple[int, dict[str, Any]]]:
+    results: list[tuple[int, dict[str, Any]]] = []
+    offset = 0
+    limit = 100
+
+    while True:
+        try:
+            page = spotify_client.playlist_items(
+                playlist_id,
+                limit=limit,
+                offset=offset,
+                additional_types=("track",),
+            )
+        except TypeError:
+            page = spotify_client.playlist_items(
+                playlist_id,
+                limit=limit,
+                offset=offset,
+            )
+
+        raw_items = page.get("items") if isinstance(page, dict) else None
+        if not isinstance(raw_items, list):
+            break
+
+        for index, wrapper in enumerate(raw_items):
+            if not isinstance(wrapper, dict):
+                continue
+            item = wrapper.get("item")
+            if not isinstance(item, dict):
+                item = wrapper.get("track")
+            if not isinstance(item, dict):
+                continue
+            results.append((offset + index, item))
+
+        if not page.get("next"):
+            break
+        offset += limit
+
+    return results
+
+
+def spotify_best_target_track(
+    candidates: list[dict[str, Any]],
+    target_title: str,
+) -> tuple[dict[str, Any] | None, float]:
+    best_item: dict[str, Any] | None = None
+    best_score = 0.0
+    for item in candidates:
+        title = str(item.get("name") or "").strip()
+        score = spotify_discogs_track_match_score(target_title, title)
+        if score > best_score:
+            best_score = score
+            best_item = item
+    return best_item, best_score
+
+
+@app.route("/api/lyrics/play-track", methods=["POST"])
+def lyrics_play_track():
+    payload = request.get_json(silent=True) or {}
+    target_title = str(payload.get("title") or "").strip()
+    requested_album = str(payload.get("album") or "").strip()
+
+    if not target_title:
+        return jsonify({
+            "ok": False,
+            "authenticated": True,
+            "error": "A track title is required.",
+        }), 400
+
+    try:
+        spotify_client = get_spotify_client()
+    except SpotifyLoginRequired as error:
+        response = jsonify({
+            "ok": False,
+            "authenticated": False,
+            "error": str(error),
+        })
+        response.status_code = 401
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except SpotifyTokenRefreshTemporarilyUnavailable as error:
+        response = jsonify({
+            "ok": False,
+            "authenticated": True,
+            "temporarilyUnavailable": True,
+            "error": str(error),
+        })
+        response.status_code = 503
+        response.headers["Retry-After"] = "6"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    try:
+        try:
+            playback = spotify_client.current_playback(additional_types="track")
+        except TypeError:
+            playback = spotify_client.current_playback()
+
+        if not isinstance(playback, dict):
+            raise RuntimeError("Spotify does not currently have an active playback context.")
+
+        current_item = playback.get("item") if isinstance(playback.get("item"), dict) else {}
+        current_album = current_item.get("album") if isinstance(current_item.get("album"), dict) else {}
+        current_album_name = str(current_album.get("name") or requested_album or "").strip()
+        album_id = str(current_album.get("id") or "").strip()
+        album_uri = str(current_album.get("uri") or "").strip()
+        if album_id and not album_uri:
+            album_uri = f"spotify:album:{album_id}"
+
+        # Preferred path: use the current Spotify album itself. This keeps playback
+        # in album context, so selecting a Tracklist row still gives Spotify the
+        # rest of that album as the queue/context.
+        if album_id:
+            album_tracks = spotify_album_tracks_all(spotify_client, album_id)
+            matched_track, match_score = spotify_best_target_track(album_tracks, target_title)
+            matched_uri = str((matched_track or {}).get("uri") or "").strip()
+            if matched_track is not None and match_score >= 0.55 and matched_uri:
+                spotify_client.start_playback(
+                    context_uri=album_uri,
+                    offset={"uri": matched_uri},
+                    position_ms=0,
+                )
+                if process_is_running():
+                    append_log(f"[lyrics page selected album track: {matched_track.get('name') or target_title}]")
+                response = jsonify({
+                    "ok": True,
+                    "authenticated": True,
+                    "matchedTitle": str(matched_track.get("name") or target_title),
+                    "source": "album",
+                    "message": f"Playing {matched_track.get('name') or target_title} on Spotify.",
+                })
+                response.headers["Cache-Control"] = "no-store"
+                return response
+
+        # Fallback for local files or playlist-only album copies: if the current
+        # playback context is a playlist, find the requested Discogs row among
+        # playlist items belonging to the same currently playing Spotify album.
+        context = playback.get("context") if isinstance(playback.get("context"), dict) else {}
+        context_uri = str(context.get("uri") or "").strip()
+        context_type = str(context.get("type") or "").strip().lower()
+
+        if context_type == "playlist" and context_uri.startswith("spotify:playlist:"):
+            playlist_id = context_uri.rsplit(":", 1)[-1]
+            playlist_items = spotify_playlist_items_all(spotify_client, playlist_id)
+
+            best_position: int | None = None
+            best_item: dict[str, Any] | None = None
+            best_score = 0.0
+
+            for position, item in playlist_items:
+                if str(item.get("type") or "track").lower() not in {"", "track"}:
+                    continue
+
+                item_album = item.get("album") if isinstance(item.get("album"), dict) else {}
+                item_album_name = str(item_album.get("name") or "").strip()
+                if not item_album_name:
+                    local_meta = local_spotify_uri_metadata(str(item.get("uri") or ""))
+                    item_album_name = str(local_meta.get("album") or "").strip()
+                if current_album_name and item_album_name and not spotify_album_name_matches(
+                    current_album_name,
+                    item_album_name,
+                ):
+                    continue
+
+                score = spotify_discogs_track_match_score(
+                    target_title,
+                    item.get("name") or "",
+                )
+                if score > best_score:
+                    best_score = score
+                    best_position = position
+                    best_item = item
+
+            if best_item is not None and best_position is not None and best_score >= 0.55:
+                spotify_client.start_playback(
+                    context_uri=context_uri,
+                    offset={"position": int(best_position)},
+                    position_ms=0,
+                )
+                if process_is_running():
+                    append_log(f"[lyrics page selected playlist track: {best_item.get('name') or target_title}]")
+                response = jsonify({
+                    "ok": True,
+                    "authenticated": True,
+                    "matchedTitle": str(best_item.get("name") or target_title),
+                    "source": "playlist",
+                    "message": f"Playing {best_item.get('name') or target_title} on Spotify.",
+                })
+                response.headers["Cache-Control"] = "no-store"
+                return response
+
+        raise RuntimeError(
+            f'Could not find a Spotify track corresponding to "{target_title}" '
+            "in the current album or playlist context."
+        )
+
+    except Exception as error:
+        response = jsonify({
+            "ok": False,
+            "authenticated": True,
+            "error": f"Could not play the selected Spotify track: {error}",
+        })
+        response.status_code = 502
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 @app.route("/api/lyrics/control/<action>", methods=["POST"])
