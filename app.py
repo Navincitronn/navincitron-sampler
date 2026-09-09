@@ -17,7 +17,8 @@ import time
 import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-from html import unescape as html_unescape
+from html import escape as html_escape, unescape as html_unescape
+from html.parser import HTMLParser
 from collections import deque
 from datetime import timedelta
 from pathlib import Path
@@ -3961,6 +3962,295 @@ def genius_json_request(url: str, access_token: str) -> dict[str, Any]:
     return payload
 
 
+
+GENIUS_PAGE_MAX_BYTES = 8 * 1024 * 1024
+GENIUS_REFERENT_PATH_PATTERN = re.compile(r"^/(\d+)(?:/|$)")
+GENIUS_SAFE_LYRIC_TAGS = {"a", "b", "br", "div", "em", "genius-referent", "i", "p", "span", "strong"}
+GENIUS_VOID_TAGS = {"br", "hr", "img", "input", "link", "meta", "source", "wbr"}
+
+
+def genius_referent_id_from_url(raw_url: Any) -> int | None:
+    value = str(raw_url or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = urlparse(value if value.startswith(("http://", "https://")) else "https://genius.com" + (value if value.startswith("/") else "/" + value))
+    except Exception:
+        return None
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host not in {"genius.com", "www.genius.com"}:
+        return None
+    match = GENIUS_REFERENT_PATH_PATTERN.match(parsed.path or "")
+    if not match:
+        return None
+    try:
+        referent_id = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return referent_id if referent_id > 0 else None
+
+
+def normalize_genius_page_url(raw_url: Any, song_id: int) -> str:
+    value = str(raw_url or "").strip()
+    if value:
+        try:
+            parsed = urlparse(value)
+            host = (parsed.hostname or "").casefold().rstrip(".")
+            if parsed.scheme == "https" and host in {"genius.com", "www.genius.com"}:
+                return value
+        except Exception:
+            pass
+    return f"https://genius.com/songs/{int(song_id)}"
+
+
+class GeniusLyricsPageParser(HTMLParser):
+    """Extract only Genius's lyric containers and mark annotation referents.
+
+    The public Genius page is never returned wholesale. Only a small allowlist of
+    lyric-formatting tags is retained, attributes are rebuilt from scratch, and
+    annotation links are converted into same-page referent controls for lyrics.js.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.containers: list[str] = []
+        self._parts: list[str] = []
+        self._container_depth = 0
+        self._skip_depth = 0
+        self._emitted_tags: list[str] = []
+
+    @staticmethod
+    def _attrs(attrs: list[tuple[str, str | None]]) -> dict[str, str]:
+        return {str(key or "").casefold(): str(value or "") for key, value in attrs}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = str(tag or "").casefold()
+        attr_map = self._attrs(attrs)
+
+        if self._container_depth <= 0:
+            if tag == "div" and "data-lyrics-container" in attr_map:
+                self._container_depth = 1
+                self._parts = []
+                self._emitted_tags = []
+            return
+
+        if self._skip_depth > 0:
+            if tag not in GENIUS_VOID_TAGS:
+                self._skip_depth += 1
+            return
+
+        if attr_map.get("data-exclude-from-selection", "").casefold() == "true":
+            if tag not in GENIUS_VOID_TAGS:
+                self._skip_depth = 1
+            return
+
+        if tag == "div":
+            self._container_depth += 1
+
+        if tag not in GENIUS_SAFE_LYRIC_TAGS:
+            return
+
+        if tag == "br":
+            self._parts.append("<br>")
+            return
+
+        if tag in {"a", "genius-referent"}:
+            href = attr_map.get("href", "").strip()
+            raw_referent_id = attr_map.get("data-genius-referent-id", "").strip()
+            referent_id = int(raw_referent_id) if raw_referent_id.isdigit() and int(raw_referent_id) > 0 else genius_referent_id_from_url(href)
+            if referent_id:
+                absolute_href = (
+                    href if href.startswith("https://")
+                    else "https://genius.com" + (href if href.startswith("/") else "/" + href)
+                    if href
+                    else "https://genius.com"
+                )
+                self._parts.append(
+                    '<a class="lyrics-genius-annotated-fragment" '
+                    f'data-genius-referent-id="{referent_id}" '
+                    f'href="{html_escape(absolute_href, quote=True)}">'
+                )
+                self._emitted_tags.append("a")
+                return
+
+            safe_href = ""
+            if href:
+                try:
+                    parsed = urlparse(href if href.startswith(("http://", "https://")) else "https://genius.com" + (href if href.startswith("/") else "/" + href))
+                    if parsed.scheme == "https" and (parsed.hostname or "").casefold().rstrip(".") in {"genius.com", "www.genius.com"}:
+                        safe_href = parsed.geturl()
+                except Exception:
+                    safe_href = ""
+            if safe_href:
+                self._parts.append(
+                    f'<a href="{html_escape(safe_href, quote=True)}" target="_blank" rel="noopener noreferrer">'
+                )
+                self._emitted_tags.append("a")
+            else:
+                self._parts.append("<span>")
+                self._emitted_tags.append("span")
+            return
+
+        self._parts.append(f"<{tag}>")
+        self._emitted_tags.append(tag)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        if str(tag or "").casefold() not in GENIUS_VOID_TAGS:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = str(tag or "").casefold()
+        if self._container_depth <= 0:
+            return
+
+        if self._skip_depth > 0:
+            self._skip_depth -= 1
+            return
+
+        if tag == "div" and self._container_depth == 1:
+            content = "".join(self._parts).strip()
+            if content:
+                self.containers.append(content)
+            self._parts = []
+            self._emitted_tags = []
+            self._container_depth = 0
+            return
+
+        if tag == "div":
+            self._container_depth = max(1, self._container_depth - 1)
+
+        if tag not in GENIUS_SAFE_LYRIC_TAGS or tag == "br":
+            return
+        if self._emitted_tags:
+            emitted_tag = self._emitted_tags.pop()
+            self._parts.append(f"</{emitted_tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if self._container_depth > 0 and self._skip_depth <= 0:
+            self._parts.append(html_escape(str(data or ""), quote=False))
+
+    def handle_entityref(self, name: str) -> None:
+        if self._container_depth > 0 and self._skip_depth <= 0:
+            self._parts.append(f"&{html_escape(str(name or ''), quote=False)};")
+
+    def handle_charref(self, name: str) -> None:
+        if self._container_depth > 0 and self._skip_depth <= 0:
+            self._parts.append(f"&#{html_escape(str(name or ''), quote=False)};")
+
+
+def extract_genius_lyrics_html(page_html: str) -> str:
+    parser = GeniusLyricsPageParser()
+    parser.feed(str(page_html or ""))
+    parser.close()
+    if not parser.containers:
+        raise RuntimeError("Genius song page did not contain readable lyric containers.")
+    return "\n".join(f'<div class="lyrics-genius-verse">{content}</div>' for content in parser.containers)
+
+
+def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
+    details_payload = genius_song_request(song_id)
+    response = details_payload.get("response")
+    song = response.get("song") if isinstance(response, dict) else None
+    if not isinstance(song, dict):
+        raise RuntimeError("Genius did not return song metadata for the requested song.")
+
+    page_url = normalize_genius_page_url(song.get("url") or song.get("path"), song_id)
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": "https://genius.com/",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+        ),
+    }
+    try:
+        with urlopen(Request(page_url, headers=headers), timeout=15) as page_response:
+            final_url = page_response.geturl()
+            final_host = (urlparse(final_url).hostname or "").casefold().rstrip(".")
+            if final_host not in {"genius.com", "www.genius.com"}:
+                raise RuntimeError("Genius redirected the song page to an unexpected host.")
+            raw = page_response.read(GENIUS_PAGE_MAX_BYTES + 1)
+    except HTTPError as error:
+        raise RuntimeError(f"Genius song page request failed with HTTP {error.code}.") from error
+    except URLError as error:
+        raise RuntimeError(f"Could not reach the Genius song page: {error.reason}") from error
+
+    if len(raw) > GENIUS_PAGE_MAX_BYTES:
+        raise RuntimeError("Genius song page exceeded the allowed response size.")
+
+    page_html = raw.decode("utf-8", errors="replace")
+    lyrics_html = extract_genius_lyrics_html(page_html)
+    return {
+        "song": build_genius_song_payload(song),
+        "lyricsHtml": lyrics_html,
+        "url": page_url,
+    }
+
+
+def genius_referent_request(referent_id: int) -> dict[str, Any]:
+    access_token = get_genius_access_token()
+    return genius_json_request(
+        f"https://api.genius.com/referents/{int(referent_id)}?text_format=plain",
+        access_token,
+    )
+
+
+def build_genius_referent_payload(payload: dict[str, Any], referent_id: int) -> dict[str, Any]:
+    response = payload.get("response")
+    referent = response.get("referent") if isinstance(response, dict) else None
+    if not isinstance(referent, dict) and isinstance(response, dict):
+        referents = response.get("referents")
+        if isinstance(referents, list):
+            referent = next((item for item in referents if isinstance(item, dict)), None)
+    if not isinstance(referent, dict):
+        raise RuntimeError("Genius did not return the requested annotation referent.")
+
+    fragment = str(referent.get("fragment") or "").strip()
+    referent_url = str(referent.get("url") or "").strip()
+    annotations_payload: list[dict[str, Any]] = []
+    annotations = referent.get("annotations")
+    if isinstance(annotations, list):
+        for annotation in annotations:
+            if not isinstance(annotation, dict):
+                continue
+            body = plain_text_from_genius_value(annotation.get("body"))
+            if not body:
+                continue
+            authors: list[str] = []
+            raw_authors = annotation.get("authors")
+            if isinstance(raw_authors, list):
+                for author in raw_authors:
+                    if isinstance(author, dict):
+                        name = str(author.get("name") or author.get("login") or "").strip()
+                        if name and name not in authors:
+                            authors.append(name)
+            created_by = annotation.get("created_by")
+            if isinstance(created_by, dict):
+                name = str(created_by.get("name") or created_by.get("login") or "").strip()
+                if name and name not in authors:
+                    authors.append(name)
+            annotation_url = str(annotation.get("url") or referent_url or "").strip()
+            annotations_payload.append({
+                "id": annotation.get("id"),
+                "body": body,
+                "authors": authors,
+                "verified": bool(annotation.get("verified")),
+                "votesTotal": int(annotation.get("votes_total") or 0),
+                "url": annotation_url,
+            })
+
+    return {
+        "id": int(referent.get("id") or referent_id),
+        "fragment": fragment,
+        "url": referent_url,
+        "annotations": annotations_payload,
+    }
+
+
 def genius_search_request(query: str) -> dict[str, Any]:
     access_token = get_genius_access_token()
     encoded_query = quote_plus(query)
@@ -6295,6 +6585,40 @@ def lyrics_genius_album_link():
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 502
 
+
+
+
+@app.route("/api/lyrics/genius-content/<int:song_id>", methods=["GET"])
+def api_lyrics_genius_content(song_id: int):
+    if song_id <= 0:
+        return jsonify({"ok": False, "error": "Invalid Genius song ID."}), 400
+    try:
+        content = fetch_genius_song_lyrics(song_id)
+        response = jsonify({"ok": True, **content})
+        response.headers["Cache-Control"] = "public, max-age=21600"
+        return response
+    except Exception as error:
+        response = jsonify({"ok": False, "error": str(error)})
+        response.status_code = 502
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
+@app.route("/api/lyrics/genius-referent/<int:referent_id>", methods=["GET"])
+def api_lyrics_genius_referent(referent_id: int):
+    if referent_id <= 0:
+        return jsonify({"ok": False, "error": "Invalid Genius referent ID."}), 400
+    try:
+        payload = genius_referent_request(referent_id)
+        referent = build_genius_referent_payload(payload, referent_id)
+        response = jsonify({"ok": True, "referent": referent})
+        response.headers["Cache-Control"] = "public, max-age=3600"
+        return response
+    except Exception as error:
+        response = jsonify({"ok": False, "error": str(error)})
+        response.status_code = 502
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 @app.route("/api/lyrics/current", methods=["GET"])
