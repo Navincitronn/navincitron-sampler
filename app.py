@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import csv
 import hashlib
 import hmac
@@ -23,7 +22,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, quote_plus, unquote, urlencode, urlparse
+from urllib.parse import quote_plus, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -67,16 +66,8 @@ CONTROL_FILE = BASE_DIR / "sampler_control.json"
 TOPSTER_COVER_CACHE_FILE = BASE_DIR / "topster_cover_cache.json"
 TOPSTER_SETTINGS_FILE = BASE_DIR / "topster_settings.json"
 TOPSTER_SOURCE_TEXT_FILE = BASE_DIR / "topster_source_text.json"
-TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE = BASE_DIR / "topster_discogs_ownership_overrides.json"
-TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_LOCK = threading.Lock()
-LYRICS_GENIUS_ALBUM_LINKS_FILE = BASE_DIR / "lyrics_genius_album_links.json"
-LYRICS_GENIUS_ALBUM_LINKS_LOCK = threading.Lock()
-LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE: dict[str, dict[str, Any] | None] = {}
 LYRICS_DISCOGS_COVER_OVERRIDES_FILE = BASE_DIR / "lyrics_discogs_cover_overrides.json"
 LYRICS_MY_ALBUMS_FILE = BASE_DIR / "my_albums.txt"
-LYRICS_GITHUB_REPOSITORY = (os.getenv("LYRICS_GITHUB_REPOSITORY") or os.getenv("GITHUB_REPOSITORY") or "").strip()
-LYRICS_GITHUB_BRANCH = (os.getenv("LYRICS_GITHUB_BRANCH") or "main").strip() or "main"
-LYRICS_GITHUB_MY_ALBUMS_PATH = (os.getenv("LYRICS_GITHUB_MY_ALBUMS_PATH") or "my_albums.txt").strip().lstrip("/") or "my_albums.txt"
 TOPSTER_REDIS_KEY_PREFIX = os.getenv("TOPSTER_REDIS_KEY_PREFIX", "navincitron:topster").strip() or "navincitron:topster"
 TOPSTER_REDIS_CLIENT: Any | None = None
 TOPSTER_REDIS_CLIENT_ERROR = ""
@@ -1648,162 +1639,6 @@ def api_discogs_collection():
         return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
 
 
-
-def topster_discogs_ownership_overrides_redis_key(username: str) -> str:
-    safe_username = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(username or DISCOGS_COLLECTION_USERNAME))
-    return (
-        f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:"
-        f"discogs-ownership-overrides:{safe_username}"
-    )
-
-
-def normalize_topster_discogs_ownership_override(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
-        return None
-
-    identity = str(value.get("identity") or "").strip()
-    artist = str(value.get("artist") or "").strip()
-    title = str(value.get("title") or value.get("album") or "").strip()
-    state = str(value.get("state") or "").strip().lower().replace("-", "_")
-
-    if state not in {"owned", "not_owned"}:
-        return None
-    if not identity or len(identity) > 1200 or "::" not in identity:
-        return None
-    if not title or len(title) > 600 or len(artist) > 600:
-        return None
-
-    release_id_raw = value.get("releaseId")
-    release_id = int(release_id_raw) if str(release_id_raw or "").isdigit() and int(release_id_raw) > 0 else None
-    release_url = str(value.get("releaseUrl") or "").strip()
-    if release_url and not release_url.startswith(("http://", "https://")):
-        release_url = ""
-
-    normalized = {
-        "identity": identity,
-        "artist": artist,
-        "title": title,
-        "state": state,
-        "savedAt": str(value.get("savedAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())).strip(),
-    }
-    if release_id:
-        normalized["releaseId"] = release_id
-    if release_url:
-        normalized["releaseUrl"] = release_url
-    return normalized
-
-
-def topster_discogs_ownership_override_digest(identity: str) -> str:
-    return hashlib.sha256(str(identity or "").encode("utf-8", errors="ignore")).hexdigest()
-
-
-def read_topster_discogs_ownership_overrides(username: str) -> list[dict[str, Any]]:
-    records: dict[str, dict[str, Any]] = {}
-
-    # JSON is a no-Redis fallback and also a best-effort mirror. Merge it first so
-    # a Redis value with the same identity remains authoritative.
-    with TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_LOCK:
-        json_data = read_json_file(TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE, {})
-    if isinstance(json_data, dict):
-        for raw in json_data.values():
-            normalized = normalize_topster_discogs_ownership_override(raw)
-            if normalized:
-                records[normalized["identity"]] = normalized
-
-    if topster_redis_is_configured():
-        try:
-            client = get_topster_redis_client()
-            if client is not None:
-                raw_values = client.hgetall(topster_discogs_ownership_overrides_redis_key(username)) or {}
-                for raw in raw_values.values():
-                    try:
-                        parsed = json.loads(raw)
-                    except Exception:
-                        continue
-                    normalized = normalize_topster_discogs_ownership_override(parsed)
-                    if normalized:
-                        records[normalized["identity"]] = normalized
-        except Exception:
-            # The JSON mirror/fallback can still make previously saved flags readable.
-            pass
-
-    return sorted(records.values(), key=lambda item: (str(item.get("artist") or "").casefold(), str(item.get("title") or "").casefold()))
-
-
-def write_topster_discogs_ownership_override(username: str, value: dict[str, Any]) -> dict[str, Any]:
-    normalized = normalize_topster_discogs_ownership_override(value)
-    if not normalized:
-        raise ValueError("A valid ownership identity, album title, and owned/not-owned state are required.")
-
-    digest = topster_discogs_ownership_override_digest(normalized["identity"])
-    redis_saved = False
-    if topster_redis_is_configured():
-        client = get_topster_redis_client()
-        if client is None:
-            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
-        # HSET has no TTL here by design. Manual ownership flags must not expire with
-        # the seven-day Discogs collection cache or any browser-side Topster cache.
-        client.hset(
-            topster_discogs_ownership_overrides_redis_key(username),
-            digest,
-            json.dumps(normalized, ensure_ascii=False),
-        )
-        redis_saved = True
-
-    # Keep a JSON mirror for local/no-Redis deployments. Failure to mirror must not
-    # invalidate a successful durable Redis write.
-    try:
-        with TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_LOCK:
-            json_data = read_json_file(TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE, {})
-            if not isinstance(json_data, dict):
-                json_data = {}
-            json_data[digest] = normalized
-            write_json_file(TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE, json_data)
-    except Exception:
-        if not redis_saved:
-            raise
-
-    return normalized
-
-
-@app.route("/api/topster-discogs-ownership-overrides", methods=["GET", "POST"])
-def api_topster_discogs_ownership_overrides():
-    username = str(request.args.get("username") or DISCOGS_COLLECTION_USERNAME).strip() or DISCOGS_COLLECTION_USERNAME
-    if username.casefold() != DISCOGS_COLLECTION_USERNAME.casefold():
-        return discogs_collection_json_response({"ok": False, "error": "Only the configured Navincitron Discogs collection is available."}, 400)
-
-    if request.method == "GET":
-        try:
-            return discogs_collection_json_response({
-                "ok": True,
-                "username": username,
-                "overrides": read_topster_discogs_ownership_overrides(username),
-            })
-        except Exception as error:
-            return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
-
-    admin_error = require_topster_admin_response()
-    if admin_error is not None:
-        return admin_error
-
-    payload = request.get_json(silent=True) or {}
-    submitted_username = str(payload.get("username") or username).strip() or username
-    if submitted_username.casefold() != DISCOGS_COLLECTION_USERNAME.casefold():
-        return discogs_collection_json_response({"ok": False, "error": "Only the configured Navincitron Discogs collection is available."}, 400)
-
-    try:
-        saved = write_topster_discogs_ownership_override(submitted_username, payload)
-        return discogs_collection_json_response({
-            "ok": True,
-            "username": submitted_username,
-            "override": saved,
-        })
-    except ValueError as error:
-        return discogs_collection_json_response({"ok": False, "error": str(error)}, 400)
-    except Exception as error:
-        return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
-
-
 def discogs_release_redis_key(release_id: int) -> str:
     return (
         f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:"
@@ -2289,14 +2124,7 @@ def discogs_composite_position_from_subtracks(sub_tracks: Any) -> str:
     if not positions:
         return ""
 
-    # Discogs represents composite songs in several ways:
-    # A1.1/A1.2/... and B3.1/B3.2/... use numeric child sections, while
-    # B3-I/B3-II/... uses Roman-numeral child sections. In both cases the
-    # shared parent position (A1 or B3) is the actual song position.
-    bases = [
-        re.sub(r"(?:[-.](?:\d+|[IVXLCDM]+))$", "", position, flags=re.IGNORECASE)
-        for position in positions
-    ]
+    bases = [re.sub(r"[-.]?[IVXLCDM]+$", "", position, flags=re.IGNORECASE) for position in positions]
     if bases[0] and all(base == bases[0] for base in bases):
         return bases[0]
 
@@ -2328,16 +2156,9 @@ def iter_discogs_release_track_titles(tracklist: Any):
         sub_tracks = entry.get("subTracks") if isinstance(entry.get("subTracks"), list) else []
 
         if entry_type == "index":
-            composite_position = discogs_composite_position_from_subtracks(sub_tracks)
-            composite_song = bool(composite_position and re.search(r"\d", composite_position))
-            if title and (duration or composite_song):
-                # A timed index is a composite song. An untimed index is also
-                # the song when its children are sections of one numbered
-                # parent position (A1.1/A1.2 -> A1, B3.1/B3.2 -> B3).
+            if title and duration:
                 yield title
             elif sub_tracks:
-                # Pure structural headings whose children are separate A1/A2,
-                # B1/B2 tracks still recurse normally.
                 yield from iter_discogs_release_track_titles(sub_tracks)
             continue
 
@@ -2725,140 +2546,6 @@ def lyrics_discogs_vinyl_tracklist():
         "coverOverride": release_cover_override or read_lyrics_album_cover_override(source_artist, source_album),
     }
     return discogs_collection_json_response(response_payload)
-
-
-def lyrics_manual_album_relation_key(value: Any) -> str:
-    normalized = normalize_lyrics_match_text(value)
-    return re.sub(r"\s+", "", normalized)
-
-
-def lyrics_manual_album_identity(artist: Any, album: Any) -> str:
-    artist_text = str(artist or "").strip()
-    artist_text = re.sub(r"\s*\*+\s*$", "", artist_text)
-    artist_text = re.sub(r"\s*\(\d+\)\s*$", "", artist_text)
-    artist_text = re.sub(r'\s*["“][^"”]+["”]\s*', " ", artist_text)
-    artist_key = lyrics_manual_album_relation_key(artist_text)
-    album_key = lyrics_manual_album_relation_key(album)
-    return f"{artist_key}::{album_key}" if album_key else ""
-
-
-def parse_discogs_release_id_from_url(raw_url: Any) -> tuple[int, str]:
-    url = str(raw_url or "").strip()
-    try:
-        parsed = urlparse(url)
-    except Exception as error:
-        raise ValueError("Enter a valid Discogs release URL.") from error
-    host = (parsed.hostname or "").casefold().rstrip(".")
-    if host not in {"discogs.com", "www.discogs.com"} and not host.endswith(".discogs.com"):
-        raise ValueError("Enter a Discogs release URL from discogs.com.")
-    match = re.search(r"/release/(\d+)(?:[-/]|$)", parsed.path, flags=re.IGNORECASE)
-    if not match:
-        raise ValueError("The Discogs link must point to a specific /release/<id> page.")
-    return int(match.group(1)), url
-
-
-def find_manual_discogs_ownership_override(artist: str, album: str) -> dict[str, Any] | None:
-    identity = lyrics_manual_album_identity(artist, album)
-    if not identity:
-        return None
-    for record in read_topster_discogs_ownership_overrides(DISCOGS_COLLECTION_USERNAME):
-        if str(record.get("identity") or "") != identity:
-            continue
-        if str(record.get("state") or "").strip().lower() != "owned":
-            return None
-        release_id = record.get("releaseId")
-        if str(release_id or "").isdigit() and int(release_id) > 0:
-            return record
-    return None
-
-
-def build_manual_discogs_tracklist_payload(artist: str, album: str, record: dict[str, Any]) -> dict[str, Any]:
-    release_id = int(record.get("releaseId") or 0)
-    if release_id <= 0:
-        raise ValueError("The saved Discogs ownership override does not contain a release ID.")
-    release = dict(fetch_discogs_release(release_id))
-    if not release.get("tracklist"):
-        raise ValueError("The linked Discogs release does not contain a tracklist.")
-    release["mediaCondition"] = ""
-    release["sleeveCondition"] = ""
-    cover_override = read_lyrics_discogs_cover_override(release_id) or read_lyrics_album_cover_override(artist, album)
-    return {
-        "ok": True,
-        "matched": True,
-        "vinylFound": True,
-        "manualOwnership": True,
-        "collectionAlbum": {
-            "title": release.get("title") or album,
-            "artists": release.get("artists") or ([artist] if artist else []),
-            "year": release.get("year"),
-        },
-        "matchedCollectionAlbums": [],
-        "sourceAlbum": album,
-        "sourceArtist": artist,
-        "release": release,
-        "coverOverride": cover_override,
-        "discogsAuth": {
-            "tokenConfigured": bool(get_discogs_token()),
-            "ownerAuthenticated": False,
-            "authenticatedUsername": "",
-            "collectionUsername": DISCOGS_COLLECTION_USERNAME,
-            "conditionFields": {},
-        },
-    }
-
-
-@app.route("/api/lyrics/discogs-manual-ownership", methods=["GET", "POST"])
-def lyrics_discogs_manual_ownership():
-    if request.method == "GET":
-        artist = str(request.args.get("artist") or "").strip()
-        album = str(request.args.get("album") or "").strip()
-        if not album:
-            return discogs_collection_json_response({"ok": False, "error": "Album is required."}, 400)
-        record = find_manual_discogs_ownership_override(artist, album)
-        if not record:
-            return discogs_collection_json_response({"ok": True, "matched": False, "manualOwnership": False})
-        try:
-            payload = build_manual_discogs_tracklist_payload(artist, album, record)
-            payload["override"] = record
-            return discogs_collection_json_response(payload)
-        except Exception as error:
-            return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
-
-    admin_error = require_topster_admin_response()
-    if admin_error is not None:
-        return admin_error
-
-    payload = request.get_json(silent=True) or {}
-    artist = str(payload.get("artist") or "").strip()
-    album = str(payload.get("album") or "").strip()
-    if not album:
-        return discogs_collection_json_response({"ok": False, "error": "The currently playing album does not have a usable title."}, 400)
-    try:
-        release_id, release_url = parse_discogs_release_id_from_url(payload.get("releaseUrl") or payload.get("url"))
-        release = fetch_discogs_release(release_id)
-        if not release.get("tracklist"):
-            raise ValueError("The linked Discogs release does not contain a tracklist.")
-        identity = lyrics_manual_album_identity(artist, album)
-        if not identity:
-            raise ValueError("The currently playing album does not have a usable identity.")
-        saved = write_topster_discogs_ownership_override(
-            DISCOGS_COLLECTION_USERNAME,
-            {
-                "identity": identity,
-                "artist": artist,
-                "title": album,
-                "state": "owned",
-                "releaseId": release_id,
-                "releaseUrl": release_url,
-            },
-        )
-        response_payload = build_manual_discogs_tracklist_payload(artist, album, saved)
-        response_payload["override"] = saved
-        return discogs_collection_json_response(response_payload)
-    except ValueError as error:
-        return discogs_collection_json_response({"ok": False, "error": str(error)}, 400)
-    except Exception as error:
-        return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
 
 
 @app.route("/topster-admin-login", methods=["GET", "POST"])
@@ -3512,400 +3199,8 @@ def get_spotify_client():
 GENIUS_LOOKUP_CACHE: dict[str, dict[str, Any]] = {}
 GENIUS_LOOKUP_CACHE_LOCK = threading.Lock()
 GENIUS_LOOKUP_CACHE_MAX_ITEMS = 500
-GENIUS_LOOKUP_CACHE_VERSION = 2
 GENIUS_MATCH_TTL_SECONDS = 7 * 24 * 60 * 60
 GENIUS_MISS_TTL_SECONDS = 60 * 60
-
-
-def lyrics_genius_album_links_redis_key() -> str:
-    return f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:lyrics-genius-album-links"
-
-
-def normalize_lyrics_genius_album_link(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
-        return None
-    artist = str(value.get("artist") or "").strip()
-    album = str(value.get("album") or "").strip()
-    identity = str(value.get("identity") or lyrics_manual_album_identity(artist, album)).strip()
-    url = str(value.get("url") or "").strip()
-    album_id_raw = value.get("albumId")
-    album_id = int(album_id_raw) if str(album_id_raw or "").isdigit() and int(album_id_raw) > 0 else None
-    if not identity or not album or not url or not album_id:
-        return None
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return None
-    host = (parsed.hostname or "").casefold().rstrip(".")
-    if host not in {"genius.com", "www.genius.com"} or not parsed.path.casefold().startswith("/albums/"):
-        return None
-
-    tracks: list[dict[str, Any]] = []
-    for raw_track in value.get("tracks") if isinstance(value.get("tracks"), list) else []:
-        if not isinstance(raw_track, dict):
-            continue
-        song_id_raw = raw_track.get("songId") or raw_track.get("id")
-        song_id = int(song_id_raw) if str(song_id_raw or "").isdigit() and int(song_id_raw) > 0 else None
-        title = str(raw_track.get("title") or "").strip()
-        if not song_id or not title:
-            continue
-        tracks.append({
-            "songId": song_id,
-            "title": title,
-            "url": str(raw_track.get("url") or "").strip(),
-            "position": str(raw_track.get("position") or "").strip(),
-        })
-    if not tracks:
-        return None
-    return {
-        "identity": identity,
-        "artist": artist,
-        "album": album,
-        "url": url,
-        "albumId": album_id,
-        "tracks": tracks,
-        "savedAt": str(value.get("savedAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())).strip(),
-    }
-
-
-def read_lyrics_genius_album_link(artist: str, album: str) -> dict[str, Any] | None:
-    identity = lyrics_manual_album_identity(artist, album)
-    if not identity:
-        return None
-    with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
-        if identity in LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE:
-            cached = LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE[identity]
-            return dict(cached) if isinstance(cached, dict) else None
-
-    record = None
-    digest = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()
-    if topster_redis_is_configured():
-        try:
-            client = get_topster_redis_client()
-            if client is not None:
-                raw = client.hget(lyrics_genius_album_links_redis_key(), digest)
-                if raw:
-                    record = normalize_lyrics_genius_album_link(json.loads(raw))
-        except Exception:
-            record = None
-    if record is None:
-        try:
-            with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
-                data = read_json_file(LYRICS_GENIUS_ALBUM_LINKS_FILE, {})
-            if isinstance(data, dict):
-                record = normalize_lyrics_genius_album_link(data.get(digest))
-        except Exception:
-            record = None
-
-    with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
-        LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE[identity] = dict(record) if isinstance(record, dict) else None
-    return record
-
-
-def write_lyrics_genius_album_link(value: dict[str, Any]) -> dict[str, Any]:
-    normalized = normalize_lyrics_genius_album_link(value)
-    if not normalized:
-        raise ValueError("A valid Genius album link and tracklist are required.")
-    identity = normalized["identity"]
-    digest = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()
-    redis_saved = False
-    if topster_redis_is_configured():
-        client = get_topster_redis_client()
-        if client is None:
-            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
-        client.hset(lyrics_genius_album_links_redis_key(), digest, json.dumps(normalized, ensure_ascii=False))
-        redis_saved = True
-    try:
-        with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
-            data = read_json_file(LYRICS_GENIUS_ALBUM_LINKS_FILE, {})
-            if not isinstance(data, dict):
-                data = {}
-            data[digest] = normalized
-            write_json_file(LYRICS_GENIUS_ALBUM_LINKS_FILE, data)
-            LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE[identity] = dict(normalized)
-    except Exception:
-        if not redis_saved:
-            raise
-        with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
-            LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE[identity] = dict(normalized)
-    return normalized
-
-
-def validate_genius_album_url(raw_url: Any) -> str:
-    url = str(raw_url or "").strip()
-    try:
-        parsed = urlparse(url)
-    except Exception as error:
-        raise ValueError("Enter a valid Genius album URL.") from error
-    host = (parsed.hostname or "").casefold().rstrip(".")
-    if host not in {"genius.com", "www.genius.com"} or not parsed.path.casefold().startswith("/albums/"):
-        raise ValueError("Enter a Genius album URL in the form https://genius.com/albums/Artist/Album.")
-    return url
-
-
-def genius_album_id_from_page_html(html: str) -> int | None:
-    decoded = html_unescape(str(html or ""))
-    patterns = (
-        r'"album_ids"\s*:\s*\[\s*(\d+)',
-        r'\\"album_ids\\"\s*:\s*\[\s*(\d+)',
-        r'"album_id"\s*:\s*(\d+)',
-        r'"albumId"\s*:\s*(\d+)',
-        r'/api/albums/(\d+)',
-    )
-    for pattern in patterns:
-        match = re.search(pattern, decoded, flags=re.IGNORECASE)
-        if match and int(match.group(1)) > 0:
-            return int(match.group(1))
-    return None
-
-
-def fetch_genius_album_id_from_url(
-    url: str,
-    context_artist: str = "",
-    context_album: str = "",
-) -> int:
-    """Resolve a Genius album URL without depending on Genius page HTML.
-
-    Render/VPS requests to public genius.com album pages can receive HTTP 403.
-    The direct HTML read remains a fast path, but the durable fallback uses the
-    authenticated api.genius.com search/song endpoints and matches the returned
-    song's album metadata back to the exact album URL/title supplied by the user.
-    """
-    validated_url = validate_genius_album_url(url)
-    headers = {
-        "Accept": "text/html,application/xhtml+xml",
-        "User-Agent": "Mozilla/5.0 (compatible; NavincitronLyrics/1.3; +https://www.navincitron.com)",
-    }
-    page_error = None
-    try:
-        with urlopen(Request(validated_url, headers=headers), timeout=15) as response:
-            html = response.read(6 * 1024 * 1024).decode("utf-8", errors="replace")
-        album_id = genius_album_id_from_page_html(html)
-        if album_id:
-            return album_id
-    except Exception as error:
-        # Genius commonly denies datacenter HTML requests with 403. Do not
-        # consider that fatal; the official API fallback below is the primary
-        # resolution path in production.
-        page_error = error
-
-    if not get_genius_access_token():
-        detail = f" ({page_error})" if page_error else ""
-        raise RuntimeError(
-            "Could not determine the Genius album ID because the album page "
-            f"could not be read and GENIUS_ACCESS_TOKEN is unavailable{detail}."
-        )
-
-    parsed = urlparse(validated_url)
-    parts = [unquote(part) for part in parsed.path.split("/") if part]
-    url_artist_hint = parts[1].replace("-", " ") if len(parts) > 1 else ""
-    url_album_hint = parts[2].replace("-", " ") if len(parts) > 2 else ""
-    target_path = parsed.path.rstrip("/").casefold()
-    target_artist_key = normalize_lyrics_match_text(url_artist_hint or context_artist)
-    target_album_key = normalize_lyrics_match_text(url_album_hint)
-    context_album_key = normalize_lyrics_match_text(clean_lyrics_album_title(context_album))
-
-    # Put the distinctive album-slug words first. This matters for titles such
-    # as "Live/Hhaï", where a broad "Magma Live Hhai" search can bury the album's
-    # songs beneath unrelated "live" results.
-    url_album_tokens = [token for token in normalize_lyrics_match_text(url_album_hint).split() if token]
-    distinctive_tokens = [token for token in url_album_tokens if len(token) >= 4 and token not in {"live", "album", "deluxe", "remastered"}]
-
-    queries: list[str] = []
-    def add_query(*values: Any) -> None:
-        query = " ".join(str(value or "").strip() for value in values if str(value or "").strip())
-        query = re.sub(r"\s+", " ", query).strip()
-        if query and query.casefold() not in {existing.casefold() for existing in queries}:
-            queries.append(query)
-
-    for token in distinctive_tokens:
-        add_query(url_artist_hint or context_artist, token)
-        add_query(token, url_artist_hint or context_artist)
-    add_query(url_artist_hint or context_artist, url_album_hint)
-    add_query(context_artist, context_album)
-    add_query(url_album_hint, url_artist_hint or context_artist)
-    add_query(url_artist_hint or context_artist, clean_lyrics_album_title(context_album))
-
-    best_candidate: tuple[float, int] | None = None
-    seen_song_ids: set[int] = set()
-
-    for query in queries[:8]:
-        try:
-            search_payload = genius_search_request(query)
-        except Exception:
-            continue
-
-        for hit in genius_song_hits(search_payload)[:20]:
-            song_id_raw = hit.get("id")
-            if not str(song_id_raw or "").isdigit():
-                continue
-            song_id = int(song_id_raw)
-            if song_id in seen_song_ids:
-                continue
-            seen_song_ids.add(song_id)
-
-            song = hit
-            album_data = hit.get("album") if isinstance(hit.get("album"), dict) else None
-            if not album_data:
-                try:
-                    details_payload = genius_song_request(song_id)
-                    response = details_payload.get("response")
-                    detailed_song = response.get("song") if isinstance(response, dict) else None
-                    if isinstance(detailed_song, dict):
-                        song = detailed_song
-                        album_data = song.get("album") if isinstance(song.get("album"), dict) else None
-                except Exception:
-                    album_data = None
-            if not album_data:
-                continue
-
-            album_id_raw = album_data.get("id")
-            if not str(album_id_raw or "").isdigit() or int(album_id_raw) <= 0:
-                continue
-            album_id = int(album_id_raw)
-            album_url = str(album_data.get("url") or "").strip()
-            album_name = str(album_data.get("name") or album_data.get("full_title") or "").strip()
-
-            if album_url:
-                try:
-                    if urlparse(album_url).path.rstrip("/").casefold() == target_path:
-                        return album_id
-                except Exception:
-                    pass
-
-            candidate_album_key = normalize_lyrics_match_text(album_name)
-            candidate_artist_names: list[str] = []
-            album_artist = album_data.get("artist")
-            if isinstance(album_artist, dict) and album_artist.get("name"):
-                candidate_artist_names.append(str(album_artist.get("name")))
-            primary_artist = song.get("primary_artist")
-            if isinstance(primary_artist, dict) and primary_artist.get("name"):
-                candidate_artist_names.append(str(primary_artist.get("name")))
-            candidate_artist_key = normalize_lyrics_match_text(" ".join(candidate_artist_names))
-
-            album_score = 0.0
-            if target_album_key and candidate_album_key == target_album_key:
-                album_score = 1.0
-            elif target_album_key:
-                album_score = lyrics_token_overlap(target_album_key, candidate_album_key)
-            if context_album_key and candidate_album_key == context_album_key:
-                album_score = max(album_score, 0.92)
-
-            artist_score = 0.0
-            if target_artist_key and candidate_artist_key:
-                if target_artist_key == candidate_artist_key:
-                    artist_score = 1.0
-                elif target_artist_key in candidate_artist_key or candidate_artist_key in target_artist_key:
-                    artist_score = 0.9
-                else:
-                    artist_score = lyrics_token_overlap(target_artist_key, candidate_artist_key)
-
-            total_score = album_score * 0.75 + artist_score * 0.25
-            if album_score >= 0.92 and artist_score >= 0.75:
-                return album_id
-            if best_candidate is None or total_score > best_candidate[0]:
-                best_candidate = (total_score, album_id)
-
-    if best_candidate and best_candidate[0] >= 0.82:
-        return best_candidate[1]
-
-    detail = f" The direct Genius page request failed with {page_error}." if page_error else ""
-    raise RuntimeError(
-        "Could not determine the Genius album ID from that link using either "
-        f"the album page or the Genius API.{detail}"
-    )
-
-
-def fetch_genius_album_tracks(album_id: int) -> list[dict[str, Any]]:
-    access_token = get_genius_access_token()
-    if not access_token:
-        raise RuntimeError("Genius album linking requires GENIUS_ACCESS_TOKEN on the backend.")
-    tracks: list[dict[str, Any]] = []
-    page = 1
-    while page <= 20:
-        payload = genius_json_request(
-            f"https://api.genius.com/albums/{int(album_id)}/tracks?per_page=50&page={page}&text_format=plain",
-            access_token,
-        )
-        response = payload.get("response") if isinstance(payload, dict) else None
-        raw_tracks = response.get("tracks") if isinstance(response, dict) and isinstance(response.get("tracks"), list) else []
-        for raw_track in raw_tracks:
-            if not isinstance(raw_track, dict):
-                continue
-            song = raw_track.get("song") if isinstance(raw_track.get("song"), dict) else raw_track
-            song_id_raw = song.get("id")
-            title = str(song.get("title") or song.get("title_with_featured") or "").strip()
-            if not str(song_id_raw or "").isdigit() or not title:
-                continue
-            tracks.append({
-                "songId": int(song_id_raw),
-                "title": title,
-                "url": str(song.get("url") or "").strip(),
-                "position": str(raw_track.get("number") or raw_track.get("track_number") or len(tracks) + 1),
-            })
-        next_page = response.get("next_page") if isinstance(response, dict) else None
-        if not next_page or not raw_tracks:
-            break
-        try:
-            page = int(next_page)
-        except (TypeError, ValueError):
-            page += 1
-    if not tracks:
-        raise RuntimeError("Genius returned no tracks for that album page.")
-    return tracks
-
-
-def track_album_artist_for_manual_link(track: dict[str, Any]) -> str:
-    album_artists = track.get("albumArtists") if isinstance(track.get("albumArtists"), list) else []
-    if album_artists:
-        return str(album_artists[0] or "").strip()
-    artists = track.get("artists") if isinstance(track.get("artists"), list) else []
-    if artists:
-        return str(artists[0] or "").strip()
-    return str(track.get("albumArtist") or track.get("artist") or "").split(",", 1)[0].strip()
-
-
-def lookup_genius_song_from_manual_album_link(track: dict[str, Any]) -> dict[str, Any] | None:
-    artist = track_album_artist_for_manual_link(track)
-    album = str(track.get("album") or "").strip()
-    mapping = read_lyrics_genius_album_link(artist, album)
-    if not mapping:
-        return None
-    title = str(track.get("title") or "").strip()
-    best_track = None
-    best_score = 0.0
-    for candidate in mapping.get("tracks") if isinstance(mapping.get("tracks"), list) else []:
-        score = discogs_track_title_match_score(title, candidate.get("title"))
-        if score > best_score:
-            best_score = score
-            best_track = candidate
-    if best_track is None or best_score < 0.55:
-        return None
-    song_id = int(best_track.get("songId") or 0)
-    if song_id <= 0:
-        return None
-    try:
-        details_payload = genius_song_request(song_id)
-        response = details_payload.get("response")
-        song = response.get("song") if isinstance(response, dict) else None
-        if isinstance(song, dict):
-            result = build_genius_song_payload(song)
-            result["manualAlbumUrl"] = mapping.get("url")
-            return result
-    except Exception:
-        pass
-    stub = {
-        "id": song_id,
-        "title": best_track.get("title") or title,
-        "url": best_track.get("url") or "",
-        "primary_artist": {"name": artist},
-        "album": {"name": album},
-    }
-    result = build_genius_song_payload(stub)
-    result["manualAlbumUrl"] = mapping.get("url")
-    return result
-
-
 def get_genius_access_token() -> str:
     # Genius's official API requires a Client Access Token. Accept a few common
     # environment-variable names so existing deployments can add the token
@@ -4046,23 +3341,6 @@ def clean_lyrics_track_title(value: Any) -> str:
         text,
         flags=re.IGNORECASE,
     )
-
-    # Spotify commonly chains version qualifiers with multiple " - " segments,
-    # e.g. "Deuce - Live/1975 - 2025 Remaster". The previous one-shot suffix
-    # regex could not cross the second hyphen, leaving the whole version string
-    # in the Genius query. Peel qualifying suffix segments from right to left.
-    parts = re.split(r"\s+-\s+", text)
-    while len(parts) > 1:
-        suffix = parts[-1].strip()
-        if (
-            re.search(rf"(?:{qualifier_words})", suffix, flags=re.IGNORECASE)
-            or re.search(r"\b(?:19|20)\d{2}\b", suffix)
-        ):
-            parts.pop()
-            continue
-        break
-    text = " - ".join(parts)
-
     text = re.sub(
         rf"\s+-\s+[^-]*(?:{qualifier_words})[^-]*$",
         "",
@@ -4070,37 +3348,6 @@ def clean_lyrics_track_title(value: Any) -> str:
         flags=re.IGNORECASE,
     )
     return re.sub(r"\s+", " ", text).strip(" -")
-
-
-def clean_lyrics_album_title(value: Any) -> str:
-    """Remove edition/live/remaster packaging while preserving the album identity."""
-    text = str(value or "").strip()
-    if not text:
-        return ""
-
-    qualifier_words = (
-        r"\blive\b|remaster(?:ed|ing)?|deluxe|expanded|anniversary|"
-        r"bonus track|edition|mono|stereo"
-    )
-    text = re.sub(
-        rf"\s*[\[(][^\])]*(?:{qualifier_words})[^\])]*[\])]\s*",
-        " ",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    parts = re.split(r"\s+-\s+", text)
-    while len(parts) > 1:
-        suffix = parts[-1].strip()
-        if (
-            re.search(rf"(?:{qualifier_words})", suffix, flags=re.IGNORECASE)
-            or re.search(r"\b(?:19|20)\d{2}\b", suffix)
-        ):
-            parts.pop()
-            continue
-        break
-
-    return re.sub(r"\s+", " ", " - ".join(parts)).strip(" -")
 
 
 def lyrics_token_overlap(left: Any, right: Any) -> float:
@@ -4179,36 +3426,12 @@ def score_genius_song_match(
         if isinstance(candidate_album, dict)
         else ""
     )
-    requested_album_clean = clean_lyrics_album_title(album_name)
-    candidate_album_clean = clean_lyrics_album_title(candidate_album_name)
-    requested_album_norm = normalize_lyrics_match_text(requested_album_clean)
-    candidate_album_norm = normalize_lyrics_match_text(candidate_album_clean)
-
-    if requested_album_norm and candidate_album_norm:
-        album_overlap = lyrics_token_overlap(requested_album_clean, candidate_album_clean)
-        if requested_album_norm == candidate_album_norm:
-            # Album-specific live pages should outrank a studio page with the same
-            # base song title and artist.
-            score += 18.0
+    if album_name and candidate_album_name:
+        album_overlap = lyrics_token_overlap(album_name, candidate_album_name)
+        if normalize_lyrics_match_text(album_name) == normalize_lyrics_match_text(candidate_album_name):
+            score += 10.0
         else:
-            score += 10.0 * album_overlap
-
-    # Genius search results do not always include an album object. Live pages often
-    # carry the album/version in the song title or URL slug instead
-    # ("Deuce (Alive!)" / "Kiss-deuce-alive-lyrics"). Use that as a secondary hint.
-    if requested_album_norm and requested_album_norm != candidate_album_norm:
-        candidate_hint = " ".join(
-            str(value or "")
-            for value in (
-                candidate_title,
-                song.get("path"),
-                song.get("url"),
-            )
-        )
-        candidate_hint_norm = normalize_lyrics_match_text(candidate_hint)
-        album_tokens = [token for token in requested_album_norm.split() if token]
-        if album_tokens and all(token in candidate_hint_norm.split() for token in album_tokens):
-            score += 12.0
+            score += 8.0 * album_overlap
 
     return score
 
@@ -5782,10 +5005,6 @@ def spotify_current_track_snapshot(playback: dict[str, Any] | None) -> dict[str,
             ]
         )
 
-    playback_context = playback.get("context") if isinstance(playback.get("context"), dict) else {}
-    context_uri = str(playback_context.get("uri") or "").strip()
-    context_type = str(playback_context.get("type") or "").strip()
-
     return {
         "key": track_key,
         "id": item.get("id"),
@@ -5796,10 +5015,6 @@ def spotify_current_track_snapshot(playback: dict[str, Any] | None) -> dict[str,
         "albumArtists": album_artists,
         "albumArtist": ", ".join(album_artists) or (", ".join(artists) or "Unknown artist"),
         "album": album_name or "Unknown album",
-        "albumId": album.get("id"),
-        "albumUri": str(album.get("uri") or "").strip(),
-        "contextUri": context_uri,
-        "contextType": context_type,
         "coverUrl": cover_url,
         "artworkSource": "spotify" if cover_url else "",
         "spotifyUrl": spotify_url,
@@ -5855,11 +5070,7 @@ def build_genius_song_payload(song: dict[str, Any]) -> dict[str, Any]:
 
 
 def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
-    manual_result = lookup_genius_song_from_manual_album_link(track)
-    if manual_result is not None:
-        return manual_result
-
-    cache_key = f"v{GENIUS_LOOKUP_CACHE_VERSION}::" + str(track.get("key") or "")
+    cache_key = str(track.get("key") or "")
     now = time.time()
 
     with GENIUS_LOOKUP_CACHE_LOCK:
@@ -5874,42 +5085,16 @@ def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
     album_name = str(track.get("album") or "").strip()
     primary_artist = artists[0] if artists else ""
 
+    queries = [" ".join(part for part in (title, primary_artist) if part).strip()]
     cleaned_title = clean_lyrics_track_title(title)
-    cleaned_album = clean_lyrics_album_title(album_name)
-    exact_query = " ".join(part for part in (title, primary_artist) if part).strip()
     cleaned_query = " ".join(part for part in (cleaned_title, primary_artist) if part).strip()
-    album_query = " ".join(
-        part for part in (cleaned_title, primary_artist, cleaned_album) if part
-    ).strip()
-
-    title_was_simplified = (
-        normalize_lyrics_match_text(cleaned_title)
-        != normalize_lyrics_match_text(title)
-    )
-    album_was_simplified = (
-        normalize_lyrics_match_text(cleaned_album)
-        != normalize_lyrics_match_text(album_name)
-    )
-    versioned_track = title_was_simplified or album_was_simplified
-
-    queries: list[str] = []
-    def add_query(value: str) -> None:
-        query = str(value or "").strip()
-        if query and query not in queries:
-            queries.append(query)
-
-    # For live/remastered Spotify tracks, ask Genius for the base song + album
-    # identity first. This makes "Deuce ... 2025 Remaster" favor the Alive! page
-    # instead of a studio Deuce result or a remaster metadata stub.
-    if versioned_track:
-        add_query(album_query)
-    add_query(exact_query)
-    add_query(cleaned_query)
-    if not versioned_track:
-        add_query(album_query)
+    if cleaned_query and cleaned_query not in queries:
+        queries.append(cleaned_query)
 
     candidates: dict[int, dict[str, Any]] = {}
-    for query in queries[:3]:
+    for query in queries[:2]:
+        if not query:
+            continue
         payload = genius_search_request(query)
         for song in genius_song_hits(payload):
             try:
@@ -5918,15 +5103,13 @@ def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
                 continue
             candidates[song_id] = song
         if candidates:
+            # A second query is useful only when the exact Spotify title did not
+            # produce plausible candidates.
             best_now = max(
                 score_genius_song_match(song, title, artists, album_name)
                 for song in candidates.values()
             )
-            # Normal tracks keep the fast one-query path. Versioned/live tracks
-            # require a stronger match before short-circuiting so a generic studio
-            # result cannot prevent the album-specific query from being considered.
-            threshold = 105.0 if versioned_track else 90.0
-            if best_now >= threshold:
+            if best_now >= 90:
                 break
 
     best_song: dict[str, Any] | None = None
@@ -5971,220 +5154,56 @@ def lyrics_my_albums_redis_key() -> str:
     return f"{safe_prefix}:lyrics:my-albums"
 
 
-def get_lyrics_github_token() -> str:
-    return normalize_secret_text(os.getenv("LYRICS_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN"))
-
-
-def lyrics_github_repository_parts() -> tuple[str, str] | None:
-    repository = str(LYRICS_GITHUB_REPOSITORY or "").strip().strip("/")
-    if repository.startswith("https://github.com/"):
-        repository = repository[len("https://github.com/"):]
-    if repository.endswith(".git"):
-        repository = repository[:-4]
-    parts = repository.split("/", 1)
-    if len(parts) != 2 or not all(part.strip() for part in parts):
-        return None
-    return parts[0].strip(), parts[1].strip()
-
-
-def lyrics_github_is_configured() -> bool:
-    return lyrics_github_repository_parts() is not None
-
-
-def lyrics_github_contents_url() -> str:
-    parts = lyrics_github_repository_parts()
-    if parts is None:
-        raise RuntimeError(
-            "GitHub score synchronization is not configured. Set LYRICS_GITHUB_REPOSITORY to owner/repository."
-        )
-    owner, repository = parts
-    path = quote(LYRICS_GITHUB_MY_ALBUMS_PATH, safe="/")
-    return f"https://api.github.com/repos/{quote(owner)}/{quote(repository)}/contents/{path}"
-
-
-def lyrics_github_request_json(
-    url: str,
-    *,
-    method: str = "GET",
-    payload: dict[str, Any] | None = None,
-    require_token: bool = False,
-) -> dict[str, Any]:
-    token = get_lyrics_github_token()
-    if require_token and not token:
-        raise RuntimeError(
-            "GitHub score saving requires LYRICS_GITHUB_TOKEN (or GITHUB_TOKEN) with Contents read/write access."
-        )
-
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "navincitron-lyrics-score-sync/1.0",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    data = None
-    if payload is not None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-
-    github_request = Request(url, data=data, headers=headers, method=method)
-    try:
-        with urlopen(github_request, timeout=12) as github_response:
-            raw = github_response.read().decode("utf-8", errors="replace")
-    except HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        try:
-            detail = (json.loads(body) or {}).get("message") or body
-        except Exception:
-            detail = body
-        detail = str(detail or error.reason or f"HTTP {error.code}").strip()
-        raise RuntimeError(f"GitHub my_albums.txt request failed ({error.code}): {detail}") from error
-    except URLError as error:
-        raise RuntimeError(f"GitHub my_albums.txt request failed: {error.reason}") from error
-
-    if not raw.strip():
-        return {}
-    try:
-        decoded = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise RuntimeError("GitHub returned an invalid JSON response for my_albums.txt.") from error
-    return decoded if isinstance(decoded, dict) else {}
-
-
-def read_lyrics_my_albums_from_github() -> tuple[str, str]:
-    if not lyrics_github_is_configured():
-        raise RuntimeError(
-            "GitHub score synchronization is not configured. Set LYRICS_GITHUB_REPOSITORY to owner/repository."
-        )
-    url = lyrics_github_contents_url() + "?" + urlencode({"ref": LYRICS_GITHUB_BRANCH})
-    payload = lyrics_github_request_json(url)
-    encoded = str(payload.get("content") or "").replace("\n", "")
-    if not encoded:
-        raise RuntimeError(
-            f"GitHub did not return {LYRICS_GITHUB_MY_ALBUMS_PATH} from branch {LYRICS_GITHUB_BRANCH}."
-        )
-    try:
-        text = base64.b64decode(encoded, validate=False).decode("utf-8")
-    except Exception as error:
-        raise RuntimeError("GitHub returned my_albums.txt in an unreadable encoding.") from error
-    return text.replace("\r\n", "\n").replace("\r", "\n"), str(payload.get("sha") or "")
-
-
-def synchronize_lyrics_my_albums_backend_text(text: str) -> tuple[list[str], list[str]]:
-    """Mirror the canonical GitHub text into Redis and the Render runtime file."""
-    written: list[str] = []
-    warnings: list[str] = []
-    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-
+def read_lyrics_my_albums_text() -> tuple[str, str]:
+    """Return the editable score source and the backing store that supplied it."""
     if topster_redis_is_configured():
         client = get_topster_redis_client()
         if client is None:
-            warnings.append(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
-        else:
-            try:
-                client.set(lyrics_my_albums_redis_key(), normalized)
-                written.append("redis")
-            except RedisError as error:
-                warnings.append(f"Lyrics score Redis write failed: {error}")
-
-    try:
-        temp_path = LYRICS_MY_ALBUMS_FILE.with_suffix(LYRICS_MY_ALBUMS_FILE.suffix + ".tmp")
-        temp_path.write_text(normalized, encoding="utf-8")
-        temp_path.replace(LYRICS_MY_ALBUMS_FILE)
-        written.append("file")
-    except OSError as error:
-        warnings.append(f"Could not write runtime {LYRICS_MY_ALBUMS_FILE.name}: {error}")
-
-    return written, warnings
-
-
-def read_lyrics_my_albums_text() -> tuple[str, str, str, list[str]]:
-    """
-    Return score text, source, GitHub revision, and warnings.
-
-    When GitHub synchronization is configured, the repository copy is canonical.
-    This means a desktop edit becomes authoritative after it is committed/pushed to
-    the configured branch; the next Lyrics score read mirrors it into Redis and the
-    Render runtime file automatically.
-    """
-    warnings: list[str] = []
-    if lyrics_github_is_configured():
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
         try:
-            text, revision = read_lyrics_my_albums_from_github()
-            _, sync_warnings = synchronize_lyrics_my_albums_backend_text(text)
-            warnings.extend(sync_warnings)
-            return text, "github", revision, warnings
-        except RuntimeError as error:
-            warnings.append(str(error))
-
-    if topster_redis_is_configured():
-        client = get_topster_redis_client()
-        if client is None:
-            warnings.append(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
-        else:
-            try:
-                stored = client.get(lyrics_my_albums_redis_key())
-            except RedisError as error:
-                warnings.append(f"Lyrics score Redis read failed: {error}")
-            else:
-                if stored is not None:
-                    return str(stored), "redis", "", warnings
+            stored = client.get(lyrics_my_albums_redis_key())
+        except RedisError as error:
+            raise RuntimeError(f"Lyrics score Redis read failed: {error}") from error
+        if stored is not None:
+            return str(stored), "redis"
 
     if LYRICS_MY_ALBUMS_FILE.exists():
         try:
-            return LYRICS_MY_ALBUMS_FILE.read_text(encoding="utf-8"), "file", "", warnings
+            return LYRICS_MY_ALBUMS_FILE.read_text(encoding="utf-8"), "file"
         except OSError as error:
-            warnings.append(f"Could not read {LYRICS_MY_ALBUMS_FILE.name}: {error}")
+            raise RuntimeError(f"Could not read {LYRICS_MY_ALBUMS_FILE.name}: {error}") from error
 
-    return "", "none", "", warnings
+    # The production frontend can still bootstrap from its static my_albums.txt.
+    # On the first Save it sends the complete source text here, after which Redis
+    # (when configured) becomes the persistent editable copy.
+    return "", "none"
 
 
-def write_lyrics_my_albums_text(text: str, base_revision: str = "") -> tuple[str, str, list[str]]:
-    """
-    Save score text to GitHub first, then mirror that exact committed text to the
-    Lyrics backend stores. GitHub is therefore the canonical copy shared by GitHub
-    Pages, website edits, and later desktop commits.
-    """
-    if not lyrics_github_is_configured():
-        raise RuntimeError(
-            "Score saving is configured to update both GitHub Pages and the Lyrics backend, but "
-            "LYRICS_GITHUB_REPOSITORY is not set."
-        )
-    if not get_lyrics_github_token():
-        raise RuntimeError(
-            "Score saving requires LYRICS_GITHUB_TOKEN (or GITHUB_TOKEN) with Contents read/write access."
-        )
+def write_lyrics_my_albums_text(text: str) -> str:
+    """Persist the complete my_albums source. Redis is authoritative on Render."""
+    wrote_redis = False
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        try:
+            client.set(lyrics_my_albums_redis_key(), text)
+            wrote_redis = True
+        except RedisError as error:
+            raise RuntimeError(f"Lyrics score Redis write failed: {error}") from error
 
-    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    current_text, current_revision = read_lyrics_my_albums_from_github()
-    requested_base = str(base_revision or "").strip()
-    if requested_base and current_revision and requested_base != current_revision:
-        raise RuntimeError(
-            "my_albums.txt changed on GitHub after this page loaded. Refresh the page before saving so newer desktop/GitHub edits are not overwritten."
-        )
-
-    revision = current_revision
-    if normalized != current_text:
-        body: dict[str, Any] = {
-            "message": "Update my_albums.txt from Lyrics score editor",
-            "content": base64.b64encode(normalized.encode("utf-8")).decode("ascii"),
-            "branch": LYRICS_GITHUB_BRANCH,
-        }
-        if current_revision:
-            body["sha"] = current_revision
-        result = lyrics_github_request_json(
-            lyrics_github_contents_url(),
-            method="PUT",
-            payload=body,
-            require_token=True,
-        )
-        content = result.get("content") if isinstance(result.get("content"), dict) else {}
-        revision = str(content.get("sha") or revision)
-
-    written, warnings = synchronize_lyrics_my_albums_backend_text(normalized)
-    storage_parts = ["github", *written]
-    return "+".join(dict.fromkeys(storage_parts)), revision, warnings
+    # Also keep the runtime copy in my_albums.txt synchronized when the deployment
+    # filesystem is writable. Render filesystems are ephemeral, so Redis remains
+    # the durable source across restarts/deploys.
+    try:
+        temp_path = LYRICS_MY_ALBUMS_FILE.with_suffix(LYRICS_MY_ALBUMS_FILE.suffix + ".tmp")
+        temp_path.write_text(text, encoding="utf-8")
+        temp_path.replace(LYRICS_MY_ALBUMS_FILE)
+        return "redis+file" if wrote_redis else "file"
+    except OSError as error:
+        if wrote_redis:
+            return "redis"
+        raise RuntimeError(f"Could not write {LYRICS_MY_ALBUMS_FILE.name}: {error}") from error
 
 
 @app.route("/api/lyrics/my-albums", methods=["GET", "PUT"])
@@ -6196,218 +5215,27 @@ def lyrics_my_albums():
 
         payload = request.get_json(silent=True) or {}
         text = payload.get("text")
-        base_revision = str(payload.get("baseRevision") or "").strip()
         if not isinstance(text, str):
             return jsonify({"ok": False, "error": "A complete my_albums text string is required."}), 400
         if len(text.encode("utf-8")) > 2_000_000:
             return jsonify({"ok": False, "error": "my_albums.txt exceeds the 2 MB edit limit."}), 413
 
         try:
-            storage, revision, warnings = write_lyrics_my_albums_text(text, base_revision=base_revision)
+            storage = write_lyrics_my_albums_text(text)
         except RuntimeError as error:
-            message = str(error)
-            status_code = 409 if "changed on GitHub after this page loaded" in message else 503
-            return jsonify({"ok": False, "error": message}), status_code
+            return jsonify({"ok": False, "error": str(error)}), 503
 
-        response = jsonify({
-            "ok": True,
-            "text": text.replace("\r\n", "\n").replace("\r", "\n"),
-            "storage": storage,
-            "revision": revision,
-            "warnings": warnings,
-        })
+        response = jsonify({"ok": True, "text": text, "storage": storage})
         response.headers["Cache-Control"] = "no-store"
         return response
 
-    text, storage, revision, warnings = read_lyrics_my_albums_text()
-    response = jsonify({
-        "ok": True,
-        "text": text,
-        "storage": storage,
-        "revision": revision,
-        "warnings": warnings,
-        "githubConfigured": lyrics_github_is_configured(),
-        "githubWritable": bool(lyrics_github_is_configured() and get_lyrics_github_token()),
-        "writable": is_topster_admin(),
-    })
+    try:
+        text, storage = read_lyrics_my_albums_text()
+    except RuntimeError as error:
+        return jsonify({"ok": False, "text": "", "storage": "error", "error": str(error)}), 503
+
+    response = jsonify({"ok": True, "text": text, "storage": storage, "writable": is_topster_admin()})
     response.headers["Cache-Control"] = "no-store"
-    return response
-
-
-@app.route("/api/lyrics/genius-album-link", methods=["GET", "POST"])
-def lyrics_genius_album_link():
-    if request.method == "GET":
-        artist = str(request.args.get("artist") or "").strip()
-        album = str(request.args.get("album") or "").strip()
-        if not album:
-            return jsonify({"ok": False, "error": "Album is required."}), 400
-        mapping = read_lyrics_genius_album_link(artist, album)
-        return jsonify({
-            "ok": True,
-            "linked": bool(mapping),
-            "mapping": {
-                "artist": mapping.get("artist"),
-                "album": mapping.get("album"),
-                "url": mapping.get("url"),
-                "albumId": mapping.get("albumId"),
-                "trackCount": len(mapping.get("tracks") or []),
-            } if mapping else None,
-        })
-
-    admin_error = require_topster_admin_response()
-    if admin_error is not None:
-        return admin_error
-    payload = request.get_json(silent=True) or {}
-    artist = str(payload.get("artist") or "").strip()
-    album = str(payload.get("album") or "").strip()
-    if not album:
-        return jsonify({"ok": False, "error": "The currently playing album does not have a usable title."}), 400
-    try:
-        url = validate_genius_album_url(payload.get("url"))
-        album_id = fetch_genius_album_id_from_url(url, artist, album)
-        tracks = fetch_genius_album_tracks(album_id)
-        identity = lyrics_manual_album_identity(artist, album)
-        if not identity:
-            raise ValueError("The currently playing album does not have a usable identity.")
-        saved = write_lyrics_genius_album_link({
-            "identity": identity,
-            "artist": artist,
-            "album": album,
-            "url": url,
-            "albumId": album_id,
-            "tracks": tracks,
-        })
-        with GENIUS_LOOKUP_CACHE_LOCK:
-            GENIUS_LOOKUP_CACHE.clear()
-        return jsonify({
-            "ok": True,
-            "linked": True,
-            "mapping": {
-                "artist": saved.get("artist"),
-                "album": saved.get("album"),
-                "url": saved.get("url"),
-                "albumId": saved.get("albumId"),
-                "trackCount": len(saved.get("tracks") or []),
-            },
-        })
-    except ValueError as error:
-        return jsonify({"ok": False, "error": str(error)}), 400
-    except Exception as error:
-        return jsonify({"ok": False, "error": str(error)}), 502
-
-
-
-def fetch_genius_song_annotations(song_id: int) -> list[dict[str, Any]]:
-    access_token = get_genius_access_token()
-    if not access_token:
-        raise RuntimeError("Genius annotations require GENIUS_ACCESS_TOKEN on the backend.")
-
-    query = urlencode({
-        "song_id": int(song_id),
-        "per_page": 50,
-        "text_format": "plain",
-    })
-    payload = genius_json_request(
-        f"https://api.genius.com/referents?{query}",
-        access_token,
-    )
-    response = payload.get("response") if isinstance(payload, dict) else None
-    referents = response.get("referents") if isinstance(response, dict) else None
-    if not isinstance(referents, list):
-        return []
-
-    items: list[dict[str, Any]] = []
-    seen_annotation_ids: set[int] = set()
-
-    for referent in referents:
-        if not isinstance(referent, dict):
-            continue
-        fragment = str(referent.get("fragment") or "").strip()
-        annotations = referent.get("annotations")
-        if not isinstance(annotations, list):
-            continue
-
-        for annotation in annotations:
-            if not isinstance(annotation, dict):
-                continue
-
-            annotation_id_raw = annotation.get("id")
-            try:
-                annotation_id = int(annotation_id_raw)
-            except (TypeError, ValueError):
-                annotation_id = 0
-            if annotation_id and annotation_id in seen_annotation_ids:
-                continue
-            if annotation_id:
-                seen_annotation_ids.add(annotation_id)
-
-            body_value = annotation.get("body")
-            if isinstance(body_value, dict):
-                body = str(
-                    body_value.get("plain")
-                    or body_value.get("text")
-                    or body_value.get("dom")
-                    or ""
-                ).strip()
-            else:
-                body = str(body_value or "").strip()
-
-            authors = annotation.get("authors")
-            author = ""
-            if isinstance(authors, list) and authors:
-                first_author = authors[0]
-                if isinstance(first_author, dict):
-                    author = str(first_author.get("name") or first_author.get("login") or "").strip()
-            if not author:
-                author_obj = annotation.get("author")
-                if isinstance(author_obj, dict):
-                    author = str(author_obj.get("name") or author_obj.get("login") or "").strip()
-
-            votes_raw = annotation.get("votes_total")
-            try:
-                votes = int(votes_raw) if votes_raw is not None else None
-            except (TypeError, ValueError):
-                votes = None
-
-            if not fragment and not body:
-                continue
-
-            items.append({
-                "id": annotation_id or None,
-                "fragment": fragment,
-                "body": body,
-                "author": author,
-                "verified": bool(annotation.get("verified")),
-                "votes": votes,
-            })
-
-    return items
-
-
-@app.route("/api/lyrics/genius-annotations", methods=["GET"])
-def lyrics_genius_annotations():
-    song_id_raw = request.args.get("song_id")
-    try:
-        song_id = int(song_id_raw)
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "A valid Genius song_id is required."}), 400
-    if song_id <= 0:
-        return jsonify({"ok": False, "error": "A valid Genius song_id is required."}), 400
-
-    try:
-        annotations = fetch_genius_song_annotations(song_id)
-    except Exception as error:
-        response = jsonify({"ok": False, "error": str(error)})
-        response.status_code = 502
-        response.headers["Cache-Control"] = "no-store"
-        return response
-
-    response = jsonify({
-        "ok": True,
-        "songId": song_id,
-        "annotations": annotations,
-    })
-    response.headers["Cache-Control"] = "private, max-age=300"
     return response
 
 
@@ -6534,272 +5362,6 @@ def current_lyrics():
     )
     response.headers["Cache-Control"] = "no-store"
     return response
-
-
-
-def spotify_track_part_range_signature(value: Any) -> str:
-    text = unicodedata.normalize("NFKD", str(value or ""))
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    text = text.replace("–", "-").replace("—", "-").replace("−", "-")
-    match = re.search(r"\b(?:parts?|pts?\.?)\s*(\d+)\s*-\s*(\d+)\b", text, flags=re.IGNORECASE)
-    if not match:
-        return ""
-    return f"{int(match.group(1))}-{int(match.group(2))}"
-
-
-def spotify_discogs_track_match_score(target_title: Any, spotify_title: Any) -> float:
-    target_part_range = spotify_track_part_range_signature(target_title)
-    spotify_part_range = spotify_track_part_range_signature(spotify_title)
-    if target_part_range and spotify_part_range and target_part_range != spotify_part_range:
-        return 0.0
-
-    target_key = normalize_lyrics_match_text(target_title)
-    spotify_key = normalize_lyrics_match_text(spotify_title)
-    if target_key and target_key == spotify_key:
-        return 1.0
-
-    score = discogs_track_title_match_score(target_title, spotify_title)
-    if target_part_range and spotify_part_range and target_part_range == spotify_part_range:
-        score = max(score, 0.98)
-    return score
-
-
-def spotify_album_name_matches(left: Any, right: Any) -> bool:
-    left_text = str(left or "").strip()
-    right_text = str(right or "").strip()
-    if not left_text or not right_text:
-        return True
-
-    left_key = normalize_lyrics_match_text(clean_lyrics_album_title(left_text))
-    right_key = normalize_lyrics_match_text(clean_lyrics_album_title(right_text))
-    if left_key and left_key == right_key:
-        return True
-
-    raw_left = normalize_lyrics_match_text(left_text)
-    raw_right = normalize_lyrics_match_text(right_text)
-    return bool(raw_left and raw_left == raw_right)
-
-
-def spotify_album_tracks_all(spotify_client: Any, album_id: str) -> list[dict[str, Any]]:
-    tracks: list[dict[str, Any]] = []
-    offset = 0
-    limit = 50
-    while True:
-        page = spotify_client.album_tracks(album_id, limit=limit, offset=offset)
-        items = page.get("items") if isinstance(page, dict) else None
-        if isinstance(items, list):
-            tracks.extend(item for item in items if isinstance(item, dict))
-        if not isinstance(page, dict) or not page.get("next"):
-            break
-        offset += limit
-    return tracks
-
-
-def spotify_playlist_items_all(spotify_client: Any, playlist_id: str) -> list[tuple[int, dict[str, Any]]]:
-    results: list[tuple[int, dict[str, Any]]] = []
-    offset = 0
-    limit = 100
-
-    while True:
-        try:
-            page = spotify_client.playlist_items(
-                playlist_id,
-                limit=limit,
-                offset=offset,
-                additional_types=("track",),
-            )
-        except TypeError:
-            page = spotify_client.playlist_items(
-                playlist_id,
-                limit=limit,
-                offset=offset,
-            )
-
-        raw_items = page.get("items") if isinstance(page, dict) else None
-        if not isinstance(raw_items, list):
-            break
-
-        for index, wrapper in enumerate(raw_items):
-            if not isinstance(wrapper, dict):
-                continue
-            item = wrapper.get("item")
-            if not isinstance(item, dict):
-                item = wrapper.get("track")
-            if not isinstance(item, dict):
-                continue
-            results.append((offset + index, item))
-
-        if not page.get("next"):
-            break
-        offset += limit
-
-    return results
-
-
-def spotify_best_target_track(
-    candidates: list[dict[str, Any]],
-    target_title: str,
-) -> tuple[dict[str, Any] | None, float]:
-    best_item: dict[str, Any] | None = None
-    best_score = 0.0
-    for item in candidates:
-        title = str(item.get("name") or "").strip()
-        score = spotify_discogs_track_match_score(target_title, title)
-        if score > best_score:
-            best_score = score
-            best_item = item
-    return best_item, best_score
-
-
-@app.route("/api/lyrics/play-track", methods=["POST"])
-def lyrics_play_track():
-    payload = request.get_json(silent=True) or {}
-    target_title = str(payload.get("title") or "").strip()
-    requested_album = str(payload.get("album") or "").strip()
-
-    if not target_title:
-        return jsonify({
-            "ok": False,
-            "authenticated": True,
-            "error": "A track title is required.",
-        }), 400
-
-    try:
-        spotify_client = get_spotify_client()
-    except SpotifyLoginRequired as error:
-        response = jsonify({
-            "ok": False,
-            "authenticated": False,
-            "error": str(error),
-        })
-        response.status_code = 401
-        response.headers["Cache-Control"] = "no-store"
-        return response
-    except SpotifyTokenRefreshTemporarilyUnavailable as error:
-        response = jsonify({
-            "ok": False,
-            "authenticated": True,
-            "temporarilyUnavailable": True,
-            "error": str(error),
-        })
-        response.status_code = 503
-        response.headers["Retry-After"] = "6"
-        response.headers["Cache-Control"] = "no-store"
-        return response
-
-    try:
-        try:
-            playback = spotify_client.current_playback(additional_types="track")
-        except TypeError:
-            playback = spotify_client.current_playback()
-
-        if not isinstance(playback, dict):
-            raise RuntimeError("Spotify does not currently have an active playback context.")
-
-        current_item = playback.get("item") if isinstance(playback.get("item"), dict) else {}
-        current_album = current_item.get("album") if isinstance(current_item.get("album"), dict) else {}
-        current_album_name = str(current_album.get("name") or requested_album or "").strip()
-        album_id = str(current_album.get("id") or "").strip()
-        album_uri = str(current_album.get("uri") or "").strip()
-        if album_id and not album_uri:
-            album_uri = f"spotify:album:{album_id}"
-
-        # Preferred path: use the current Spotify album itself. This keeps playback
-        # in album context, so selecting a Tracklist row still gives Spotify the
-        # rest of that album as the queue/context.
-        if album_id:
-            album_tracks = spotify_album_tracks_all(spotify_client, album_id)
-            matched_track, match_score = spotify_best_target_track(album_tracks, target_title)
-            matched_uri = str((matched_track or {}).get("uri") or "").strip()
-            if matched_track is not None and match_score >= 0.55 and matched_uri:
-                spotify_client.start_playback(
-                    context_uri=album_uri,
-                    offset={"uri": matched_uri},
-                    position_ms=0,
-                )
-                if process_is_running():
-                    append_log(f"[lyrics page selected album track: {matched_track.get('name') or target_title}]")
-                response = jsonify({
-                    "ok": True,
-                    "authenticated": True,
-                    "matchedTitle": str(matched_track.get("name") or target_title),
-                    "source": "album",
-                    "message": f"Playing {matched_track.get('name') or target_title} on Spotify.",
-                })
-                response.headers["Cache-Control"] = "no-store"
-                return response
-
-        # Fallback for local files or playlist-only album copies: if the current
-        # playback context is a playlist, find the requested Discogs row among
-        # playlist items belonging to the same currently playing Spotify album.
-        context = playback.get("context") if isinstance(playback.get("context"), dict) else {}
-        context_uri = str(context.get("uri") or "").strip()
-        context_type = str(context.get("type") or "").strip().lower()
-
-        if context_type == "playlist" and context_uri.startswith("spotify:playlist:"):
-            playlist_id = context_uri.rsplit(":", 1)[-1]
-            playlist_items = spotify_playlist_items_all(spotify_client, playlist_id)
-
-            best_position: int | None = None
-            best_item: dict[str, Any] | None = None
-            best_score = 0.0
-
-            for position, item in playlist_items:
-                if str(item.get("type") or "track").lower() not in {"", "track"}:
-                    continue
-
-                item_album = item.get("album") if isinstance(item.get("album"), dict) else {}
-                item_album_name = str(item_album.get("name") or "").strip()
-                if not item_album_name:
-                    local_meta = local_spotify_uri_metadata(str(item.get("uri") or ""))
-                    item_album_name = str(local_meta.get("album") or "").strip()
-                if current_album_name and item_album_name and not spotify_album_name_matches(
-                    current_album_name,
-                    item_album_name,
-                ):
-                    continue
-
-                score = spotify_discogs_track_match_score(
-                    target_title,
-                    item.get("name") or "",
-                )
-                if score > best_score:
-                    best_score = score
-                    best_position = position
-                    best_item = item
-
-            if best_item is not None and best_position is not None and best_score >= 0.55:
-                spotify_client.start_playback(
-                    context_uri=context_uri,
-                    offset={"position": int(best_position)},
-                    position_ms=0,
-                )
-                if process_is_running():
-                    append_log(f"[lyrics page selected playlist track: {best_item.get('name') or target_title}]")
-                response = jsonify({
-                    "ok": True,
-                    "authenticated": True,
-                    "matchedTitle": str(best_item.get("name") or target_title),
-                    "source": "playlist",
-                    "message": f"Playing {best_item.get('name') or target_title} on Spotify.",
-                })
-                response.headers["Cache-Control"] = "no-store"
-                return response
-
-        raise RuntimeError(
-            f'Could not find a Spotify track corresponding to "{target_title}" '
-            "in the current album or playlist context."
-        )
-
-    except Exception as error:
-        response = jsonify({
-            "ok": False,
-            "authenticated": True,
-            "error": f"Could not play the selected Spotify track: {error}",
-        })
-        response.status_code = 502
-        response.headers["Cache-Control"] = "no-store"
-        return response
 
 
 @app.route("/api/lyrics/control/<action>", methods=["POST"])
