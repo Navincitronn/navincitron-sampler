@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import hmac
@@ -15,12 +16,14 @@ import sys
 import time
 import threading
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from html import unescape as html_unescape
 from collections import deque
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus, unquote, urlencode, urlparse
+from urllib.parse import quote, quote_plus, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -64,15 +67,36 @@ CONTROL_FILE = BASE_DIR / "sampler_control.json"
 TOPSTER_COVER_CACHE_FILE = BASE_DIR / "topster_cover_cache.json"
 TOPSTER_SETTINGS_FILE = BASE_DIR / "topster_settings.json"
 TOPSTER_SOURCE_TEXT_FILE = BASE_DIR / "topster_source_text.json"
+TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE = BASE_DIR / "topster_discogs_ownership_overrides.json"
+TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_LOCK = threading.Lock()
+LYRICS_GENIUS_ALBUM_LINKS_FILE = BASE_DIR / "lyrics_genius_album_links.json"
+LYRICS_GENIUS_ALBUM_LINKS_LOCK = threading.Lock()
+LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE: dict[str, dict[str, Any] | None] = {}
+LYRICS_DISCOGS_COVER_OVERRIDES_FILE = BASE_DIR / "lyrics_discogs_cover_overrides.json"
+LYRICS_MY_ALBUMS_FILE = BASE_DIR / "my_albums.txt"
+LYRICS_GITHUB_REPOSITORY = (os.getenv("LYRICS_GITHUB_REPOSITORY") or os.getenv("GITHUB_REPOSITORY") or "").strip()
+LYRICS_GITHUB_BRANCH = (os.getenv("LYRICS_GITHUB_BRANCH") or "main").strip() or "main"
+LYRICS_GITHUB_MY_ALBUMS_PATH = (os.getenv("LYRICS_GITHUB_MY_ALBUMS_PATH") or "my_albums.txt").strip().lstrip("/") or "my_albums.txt"
 TOPSTER_REDIS_KEY_PREFIX = os.getenv("TOPSTER_REDIS_KEY_PREFIX", "navincitron:topster").strip() or "navincitron:topster"
 TOPSTER_REDIS_CLIENT: Any | None = None
 TOPSTER_REDIS_CLIENT_ERROR = ""
 DISCOGS_COLLECTION_USERNAME = (os.getenv("DISCOGS_COLLECTION_USERNAME", "NNavincitron").strip() or "NNavincitron")
 DISCOGS_COLLECTION_MEMORY_CACHE: dict[str, Any] = {}
+DISCOGS_RELEASE_MEMORY_CACHE: dict[int, dict[str, Any]] = {}
 try:
-    DISCOGS_COLLECTION_CACHE_SECONDS = max(60, int(os.getenv("DISCOGS_COLLECTION_CACHE_SECONDS", "1800") or 1800))
+    DISCOGS_COLLECTION_CACHE_SECONDS = max(60, int(os.getenv("DISCOGS_COLLECTION_CACHE_SECONDS", "604800") or 604800))
 except (TypeError, ValueError):
-    DISCOGS_COLLECTION_CACHE_SECONDS = 1800
+    DISCOGS_COLLECTION_CACHE_SECONDS = 604800
+try:
+    DISCOGS_RELEASE_CACHE_SECONDS = max(60, int(os.getenv("DISCOGS_RELEASE_CACHE_SECONDS", str(DISCOGS_COLLECTION_CACHE_SECONDS)) or DISCOGS_COLLECTION_CACHE_SECONDS))
+except (TypeError, ValueError):
+    DISCOGS_RELEASE_CACHE_SECONDS = DISCOGS_COLLECTION_CACHE_SECONDS
+
+# Increment this whenever the collection payload/matching contract changes. The
+# version is part of the Redis key, so a deploy cannot silently keep serving a
+# week-old collection snapshot produced by an older matcher revision.
+DISCOGS_COLLECTION_CACHE_VERSION = 12
+DISCOGS_RELEASE_CACHE_VERSION = 2
 
 
 SCOPE = (
@@ -309,7 +333,7 @@ def submitted_topster_credentials_are_valid(submitted_username: str, submitted_p
 
 def is_topster_admin_protected_page(filename: str) -> bool:
     name = str(filename or "").strip().lower()
-    if name in {"hub.html", "grid.html", "ranked_grid.html", "draft_album_list.html", "lyrics.html"}:
+    if name in {"hub.html", "grid.html", "ranked_grid.html", "draft_album_list.html", "lyrics.html", "last_fm.html"}:
         return True
     if name.startswith("draft_") and name.endswith(".html"):
         return True
@@ -532,6 +556,11 @@ def redirect_hub_html():
 @app.route("/lyrics.html")
 def redirect_lyrics_html():
     return redirect_topster_frontend_page("lyrics.html")
+
+
+@app.route("/last_fm.html")
+def redirect_last_fm_html():
+    return redirect_topster_frontend_page("last_fm.html")
 
 
 @app.route("/grid.html")
@@ -966,6 +995,8 @@ def normalize_topster_settings(value: Any) -> dict[str, Any]:
             "width": clamp_int(raw.get("width"), 1, 25, 10),
             "height": clamp_int(raw.get("height"), 1, 10, 10),
             "sidebarMode": raw.get("sidebarMode") if raw.get("sidebarMode") in allowed_sidebar_modes else "artist-title",
+            "sidebarWidth": clamp_int(raw.get("sidebarWidth"), 10, 50, 20),
+            "sidebarTextScale": clamp_int(raw.get("sidebarTextScale"), 50, 200, 100),
             "roundCorners": clamp_int(raw.get("roundCorners"), 0, 24, 0),
             "albumGap": clamp_int(raw.get("albumGap"), 0, 100, 4),
             "font": raw.get("font") if raw.get("font") in allowed_fonts else "Arial",
@@ -992,14 +1023,166 @@ def get_discogs_token() -> str:
     return normalize_secret_text(os.getenv("DISCOGS_TOKEN") or read_env_file_value("DISCOGS_TOKEN") or "")
 
 
+WIKIPEDIA_MOVIE_TITLE_ALIASES = {
+    "3 WOMEN": "3 Women",
+    "TRAINSPOTTING": "Trainspotting (film)",
+    "ALL THE PRESIDENT'S MEN": "All the President's Men (film)",
+    "CRIA!": "Cría cuervos",
+}
+
+MOVIE_POSTER_ALLOWED_HOST_SUFFIXES = (
+    "media-amazon.com",
+    "filmaffinity.com",
+    "wikimedia.org",
+    "tmdb.org",
+    "ltrbxd.com",
+    "letterboxd.com",
+    "impawards.com",
+)
+
+
+def movie_poster_host_is_allowed(raw_url: str) -> bool:
+    try:
+        parsed = urlparse(str(raw_url or "").strip())
+    except Exception:
+        return False
+    if parsed.scheme.lower() != "https":
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    return any(host == suffix or host.endswith("." + suffix) for suffix in MOVIE_POSTER_ALLOWED_HOST_SUFFIXES)
+
+
+def fetch_remote_movie_poster(raw_url: str) -> tuple[bytes, str] | None:
+    url = str(raw_url or "").strip()
+    if not movie_poster_host_is_allowed(url):
+        return None
+
+    parsed = urlparse(url)
+    referer = f"{parsed.scheme}://{parsed.netloc}/" if parsed.scheme and parsed.netloc else ""
+    headers = {
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (compatible; Navincitron/1.0; +https://www.navincitron.com)",
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    try:
+        with urlopen(Request(url, headers=headers), timeout=10) as response:
+            final_url = response.geturl()
+            if not movie_poster_host_is_allowed(final_url):
+                return None
+            content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if not content_type.startswith("image/"):
+                return None
+            data = response.read(8 * 1024 * 1024 + 1)
+    except (HTTPError, URLError, TimeoutError):
+        return None
+
+    if not data or len(data) > 8 * 1024 * 1024:
+        return None
+    return data, content_type or "image/jpeg"
+
+
+def fetch_wikipedia_movie_poster_url(title: str) -> str:
+    requested_title = str(title or "").strip()
+    if not requested_title:
+        return ""
+
+    mapped = WIKIPEDIA_MOVIE_TITLE_ALIASES.get(requested_title.upper())
+    candidates = list(dict.fromkeys(filter(None, [mapped, f"{requested_title} (film)", requested_title])))
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Navincitron/1.0 +https://www.navincitron.com",
+    }
+
+    for candidate in candidates:
+        params = urlencode(
+            {
+                "action": "query",
+                "format": "json",
+                "formatversion": "2",
+                "redirects": "1",
+                "prop": "pageimages",
+                "piprop": "thumbnail|original",
+                "pithumbsize": "330",
+                "titles": candidate,
+            }
+        )
+        url = f"https://en.wikipedia.org/w/api.php?{params}"
+        try:
+            with urlopen(Request(url, headers=headers), timeout=8) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+            continue
+
+        query = payload.get("query") if isinstance(payload, dict) else None
+        pages = query.get("pages") if isinstance(query, dict) else None
+        if not isinstance(pages, list):
+            continue
+
+        for page in pages:
+            if not isinstance(page, dict) or page.get("missing") is not None:
+                continue
+            thumbnail = page.get("thumbnail") if isinstance(page.get("thumbnail"), dict) else {}
+            original = page.get("original") if isinstance(page.get("original"), dict) else {}
+            image_url = str(thumbnail.get("source") or original.get("source") or "").strip()
+            if image_url.startswith(("https://", "http://")):
+                return image_url
+
+    return ""
+
+
+@app.route("/api/movie-poster", methods=["GET"])
+def api_movie_poster():
+    direct_url = str(request.args.get("url") or "").strip()
+    title = str(request.args.get("title") or "").strip()
+
+    poster_url = direct_url
+    if not poster_url and title:
+        poster_url = fetch_wikipedia_movie_poster_url(title)
+
+    if not poster_url:
+        return "Movie poster was not found.", 404
+
+    fetched = fetch_remote_movie_poster(poster_url)
+    if not fetched:
+        if direct_url and not movie_poster_host_is_allowed(direct_url):
+            return "Movie poster host is not allowed.", 400
+        return "Movie poster could not be loaded.", 502
+
+    image_bytes, content_type = fetched
+    response = app.response_class(image_bytes, status=200, mimetype=content_type)
+    response.headers["Cache-Control"] = "public, max-age=86400"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+def discogs_collection_cache_scope(username: str) -> str:
+    token = get_discogs_token()
+    auth_scope = "public"
+    if token:
+        # Changing/removing the Discogs token must never leave a week-old public or
+        # differently-authenticated collection snapshot active. Only a short hash is
+        # used in internal cache keys; the token itself is never stored there.
+        auth_scope = "token-" + hashlib.sha256(token.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return f"{username}::{auth_scope}"
+
+
 def discogs_collection_redis_key(username: str) -> str:
     safe_username = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(username or DISCOGS_COLLECTION_USERNAME))
-    return f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:discogs-collection:{safe_username}"
+    scope = discogs_collection_cache_scope(username).rsplit("::", 1)[-1]
+    return (
+        f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:"
+        f"discogs-collection-v{DISCOGS_COLLECTION_CACHE_VERSION}:{safe_username}:{scope}"
+    )
 
 
 def read_discogs_collection_cache(username: str) -> dict[str, Any] | None:
     now = time.time()
-    memory = DISCOGS_COLLECTION_MEMORY_CACHE.get(username)
+    memory_key = discogs_collection_cache_scope(username)
+    memory = DISCOGS_COLLECTION_MEMORY_CACHE.get(memory_key)
     if isinstance(memory, dict) and (now - float(memory.get("cachedAtEpoch", 0))) < DISCOGS_COLLECTION_CACHE_SECONDS:
         return memory.get("payload") if isinstance(memory.get("payload"), dict) else None
 
@@ -1011,7 +1194,7 @@ def read_discogs_collection_cache(username: str) -> dict[str, Any] | None:
                 if raw:
                     parsed = json.loads(raw)
                     if isinstance(parsed, dict):
-                        DISCOGS_COLLECTION_MEMORY_CACHE[username] = {
+                        DISCOGS_COLLECTION_MEMORY_CACHE[memory_key] = {
                             "cachedAtEpoch": now,
                             "payload": parsed,
                         }
@@ -1024,7 +1207,8 @@ def read_discogs_collection_cache(username: str) -> dict[str, Any] | None:
 
 def write_discogs_collection_cache(username: str, payload: dict[str, Any]) -> None:
     now = time.time()
-    DISCOGS_COLLECTION_MEMORY_CACHE[username] = {
+    memory_key = discogs_collection_cache_scope(username)
+    DISCOGS_COLLECTION_MEMORY_CACHE[memory_key] = {
         "cachedAtEpoch": now,
         "payload": payload,
     }
@@ -1071,6 +1255,21 @@ def fetch_discogs_collection_page(username: str, page: int, per_page: int = 100)
                     wait_seconds = 2.0
                 time.sleep(wait_seconds)
                 continue
+            if error.code in {401, 403} and token:
+                # A stale/wrong personal token should not make a public collection
+                # unusable. Retry this page anonymously; owner-only collection fields
+                # will remain unavailable and the frontend will report that clearly.
+                public_headers = {
+                    "Accept": "application/json",
+                    "User-Agent": "Navincitron/1.0 +https://www.navincitron.com",
+                }
+                try:
+                    with urlopen(Request(url, headers=public_headers), timeout=20) as response:
+                        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+                    if isinstance(payload, dict):
+                        return payload
+                except Exception:
+                    pass
             if error.code in {401, 403} and not token:
                 raise RuntimeError(
                     "Discogs rejected the public collection request. Configure DISCOGS_TOKEN in Render for reliable authenticated collection access."
@@ -1084,6 +1283,207 @@ def fetch_discogs_collection_page(username: str, page: int, per_page: int = 100)
             break
 
     raise RuntimeError(f"Discogs collection request failed: {last_error}")
+
+
+def normalize_discogs_formats(raw_formats: Any) -> list[dict[str, Any]]:
+    formats: list[dict[str, Any]] = []
+    if not isinstance(raw_formats, list):
+        return formats
+
+    for item in raw_formats:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        descriptions = [
+            str(value).strip()
+            for value in (item.get("descriptions") or [])
+            if str(value).strip()
+        ] if isinstance(item.get("descriptions"), list) else []
+        text = str(item.get("text") or "").strip()
+        quantity = item.get("qty")
+        formats.append(
+            {
+                "name": name,
+                "qty": str(quantity).strip() if quantity is not None else "",
+                "descriptions": descriptions,
+                "text": text,
+            }
+        )
+    return formats
+
+
+def discogs_formats_include_vinyl(formats: Any) -> bool:
+    for item in formats if isinstance(formats, list) else []:
+        if not isinstance(item, dict):
+            continue
+        values = [str(item.get("name") or "")]
+        descriptions = item.get("descriptions")
+        if isinstance(descriptions, list):
+            values.extend(str(value or "") for value in descriptions)
+        if any("vinyl" in value.casefold() for value in values):
+            return True
+    return False
+
+
+def fetch_discogs_authenticated_username() -> str:
+    token = get_discogs_token()
+    if not token:
+        return ""
+
+    request_headers = {
+        "Accept": "application/json",
+        "Authorization": f"Discogs token={token}",
+        "User-Agent": "Navincitron/1.0 +https://www.navincitron.com",
+    }
+    try:
+        with urlopen(Request("https://api.discogs.com/oauth/identity", headers=request_headers), timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return ""
+    return str(payload.get("username") or "").strip() if isinstance(payload, dict) else ""
+
+
+def fetch_discogs_collection_field_names(username: str) -> dict[str, str]:
+    """Return Discogs collection custom-field IDs mapped to their display names.
+
+    Media Condition and Sleeve Condition are collection fields rather than release-
+    database metadata. The user's authenticated Discogs token is therefore used
+    when available so private collection values can be read. A field lookup failure
+    must never prevent the collection itself from loading.
+    """
+
+    url = f"https://api.discogs.com/users/{quote_plus(username)}/collection/fields"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Navincitron/1.0 +https://www.navincitron.com",
+    }
+    token = get_discogs_token()
+    if token:
+        headers["Authorization"] = f"Discogs token={token}"
+
+    try:
+        with urlopen(Request(url, headers=headers), timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+    fields = payload.get("fields") if isinstance(payload, dict) else None
+    if not isinstance(fields, list):
+        return {}
+
+    names: dict[str, str] = {}
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        field_id = field.get("id")
+        name = str(field.get("name") or "").strip()
+        if field_id is None or not name:
+            continue
+        names[str(field_id)] = name
+    return names
+
+
+def discogs_collection_item_conditions(
+    item: dict[str, Any],
+    field_names: dict[str, str],
+) -> tuple[str, str]:
+    """Extract the owner's media/sleeve grading for one collection instance."""
+
+    media_condition = ""
+    sleeve_condition = ""
+
+    # Be tolerant of direct fields if Discogs changes/extends the collection shape.
+    for key in ("media_condition", "mediaCondition"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            media_condition = value
+            break
+    for key in ("sleeve_condition", "sleeveCondition"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            sleeve_condition = value
+            break
+
+    notes = item.get("notes")
+    if isinstance(notes, list):
+        for note in notes:
+            if not isinstance(note, dict):
+                continue
+            field_id = str(note.get("field_id") if note.get("field_id") is not None else note.get("fieldId") or "")
+            value = str(note.get("value") or "").strip()
+            if not value:
+                continue
+            field_name = str(field_names.get(field_id) or "").strip().casefold()
+            normalized_name = re.sub(r"[^a-z]+", " ", field_name).strip()
+            if "media" in normalized_name and "condition" in normalized_name:
+                media_condition = value
+            elif "sleeve" in normalized_name and "condition" in normalized_name:
+                sleeve_condition = value
+            elif not field_name:
+                # Discogs's default collection fields are historically IDs 1 and 2.
+                # Use this only as a fallback when the field-definition request was
+                # unavailable; named fields above always take precedence.
+                if field_id == "1" and not media_condition:
+                    media_condition = value
+                elif field_id == "2" and not sleeve_condition:
+                    sleeve_condition = value
+
+    return media_condition, sleeve_condition
+
+
+def fetch_discogs_collection_release_instances(username: str, release_id: int) -> list[dict[str, Any]]:
+    token = get_discogs_token()
+    if not token or release_id <= 0:
+        return []
+    url = f"https://api.discogs.com/users/{quote_plus(username)}/collection/releases/{release_id}"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Discogs token={token}",
+        "User-Agent": "Navincitron/1.0 +https://www.navincitron.com",
+    }
+    try:
+        with urlopen(Request(url, headers=headers), timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return []
+    releases = payload.get("releases") if isinstance(payload, dict) else None
+    return [item for item in releases if isinstance(item, dict)] if isinstance(releases, list) else []
+
+
+def refresh_discogs_owned_release_conditions(
+    username: str,
+    owned_release: dict[str, Any],
+    field_names: dict[str, str],
+) -> dict[str, Any]:
+    refreshed = dict(owned_release)
+    if refreshed.get("mediaCondition") and refreshed.get("sleeveCondition"):
+        return refreshed
+    release_id_raw = refreshed.get("releaseId")
+    if not str(release_id_raw or "").isdigit() or not get_discogs_token():
+        return refreshed
+    release_id = int(release_id_raw)
+    instance_id = refreshed.get("instanceId")
+    folder_id = refreshed.get("folderId")
+    instances = fetch_discogs_collection_release_instances(username, release_id)
+    if not instances:
+        return refreshed
+
+    selected = None
+    if instance_id is not None:
+        selected = next((item for item in instances if str(item.get("instance_id")) == str(instance_id)), None)
+    if selected is None and folder_id is not None:
+        selected = next((item for item in instances if str(item.get("folder_id")) == str(folder_id)), None)
+    if selected is None and len(instances) == 1:
+        selected = instances[0]
+    if selected is None:
+        return refreshed
+
+    media_condition, sleeve_condition = discogs_collection_item_conditions(selected, field_names)
+    if media_condition and not refreshed.get("mediaCondition"):
+        refreshed["mediaCondition"] = media_condition
+    if sleeve_condition and not refreshed.get("sleeveCondition"):
+        refreshed["sleeveCondition"] = sleeve_condition
+    return refreshed
 
 
 def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
@@ -1104,7 +1504,12 @@ def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
         if isinstance(page_releases, list):
             releases.extend(item for item in page_releases if isinstance(item, dict))
 
+    authenticated_username = fetch_discogs_authenticated_username()
+    authenticated_owner = bool(authenticated_username and authenticated_username.casefold() == username.casefold())
+    collection_field_names = fetch_discogs_collection_field_names(username)
+
     unique: dict[str, dict[str, Any]] = {}
+    release_instances_by_key: dict[str, set[tuple[int, int]]] = {}
     for item in releases:
         basic = item.get("basic_information") if isinstance(item.get("basic_information"), dict) else {}
         title = str(basic.get("title") or "").strip()
@@ -1121,21 +1526,63 @@ def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
                 if name:
                     artist_names.append(name)
 
-        release_id = basic.get("id") or item.get("id")
-        master_id = basic.get("master_id")
-        year = basic.get("year")
-        key = f"{' | '.join(artist_names).casefold()}::{title.casefold()}"
-        if key in unique:
-            continue
+        release_id_raw = basic.get("id") or item.get("id")
+        release_id = int(release_id_raw) if str(release_id_raw or "").isdigit() else None
+        master_id_raw = basic.get("master_id")
+        master_id = int(master_id_raw) if str(master_id_raw or "").isdigit() and int(master_id_raw) > 0 else None
+        year_raw = basic.get("year")
+        year = int(year_raw) if str(year_raw or "").isdigit() else None
+        formats = normalize_discogs_formats(basic.get("formats"))
+        vinyl = discogs_formats_include_vinyl(formats)
+        instance_id_raw = item.get("instance_id")
+        instance_id = int(instance_id_raw) if str(instance_id_raw or "").isdigit() else None
+        media_condition, sleeve_condition = discogs_collection_item_conditions(item, collection_field_names)
 
-        unique[key] = {
-            "artist": ", ".join(artist_names),
-            "artists": artist_names,
-            "title": title,
-            "year": int(year) if str(year or "").isdigit() else None,
-            "releaseId": int(release_id) if str(release_id or "").isdigit() else None,
-            "masterId": int(master_id) if str(master_id or "").isdigit() and int(master_id) > 0 else None,
+        key = f"{' | '.join(artist_names).casefold()}::{title.casefold()}"
+        if key not in unique:
+            unique[key] = {
+                "artist": ", ".join(artist_names),
+                "artists": artist_names,
+                "title": title,
+                "year": year,
+                "releaseId": release_id,
+                "masterId": master_id,
+                # Preserve every distinct owned physical release so lyrics.html can
+                # choose an actual vinyl copy after using the same album matcher as
+                # the Topster "Exclude releases that I have" option.
+                "ownedReleases": [],
+                "vinylReleaseIds": [],
+            }
+            release_instances_by_key[key] = set()
+        else:
+            if unique[key].get("year") is None and year is not None:
+                unique[key]["year"] = year
+            if unique[key].get("masterId") is None and master_id is not None:
+                unique[key]["masterId"] = master_id
+
+        if release_id is None:
+            continue
+        instance_key = (release_id, instance_id if instance_id is not None else -1)
+        if instance_key in release_instances_by_key[key]:
+            continue
+        release_instances_by_key[key].add(instance_key)
+
+        folder_id_raw = item.get("folder_id")
+        folder_id = int(folder_id_raw) if str(folder_id_raw or "").isdigit() else None
+        owned_release = {
+            "releaseId": release_id,
+            "masterId": master_id,
+            "year": year,
+            "instanceId": instance_id,
+            "folderId": folder_id,
+            "formats": formats,
+            "vinyl": vinyl,
+            "mediaCondition": media_condition,
+            "sleeveCondition": sleeve_condition,
         }
+        unique[key]["ownedReleases"].append(owned_release)
+        if vinyl:
+            unique[key]["vinylReleaseIds"].append(release_id)
 
     payload = {
         "ok": True,
@@ -1144,35 +1591,1274 @@ def fetch_full_discogs_collection(username: str) -> dict[str, Any]:
         "uniqueAlbumCount": len(unique),
         "albums": list(unique.values()),
         "cachedSeconds": DISCOGS_COLLECTION_CACHE_SECONDS,
-        "authenticatedToDiscogs": bool(get_discogs_token()),
+        "cacheVersion": DISCOGS_COLLECTION_CACHE_VERSION,
+        "fetchedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "discogsTokenConfigured": bool(get_discogs_token()),
+        "authenticatedToDiscogs": authenticated_owner,
+        "authenticatedDiscogsUsername": authenticated_username,
+        "conditionFieldNames": collection_field_names,
     }
     return payload
+
+
+def discogs_collection_json_response(payload: dict[str, Any], status_code: int = 200):
+    response = jsonify(payload)
+    response.status_code = status_code
+    # The application already maintains its own versioned Redis/browser cache.
+    # Do not let a browser, proxy, or CDN pin an older collection payload on top
+    # of that cache contract.
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @app.route("/api/discogs-collection", methods=["GET"])
 def api_discogs_collection():
     username = str(request.args.get("username") or DISCOGS_COLLECTION_USERNAME).strip() or DISCOGS_COLLECTION_USERNAME
     if username.casefold() != DISCOGS_COLLECTION_USERNAME.casefold():
-        return jsonify({"ok": False, "error": "Only the configured Navincitron Discogs collection is available."}), 400
+        return discogs_collection_json_response({"ok": False, "error": "Only the configured Navincitron Discogs collection is available."}, 400)
 
     force_refresh = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes"}
-    if not force_refresh:
+    if force_refresh:
+        DISCOGS_COLLECTION_MEMORY_CACHE.pop(username, None)
+        if topster_redis_is_configured():
+            try:
+                client = get_topster_redis_client()
+                if client is not None:
+                    client.delete(discogs_collection_redis_key(username))
+            except Exception:
+                pass
+    else:
         cached = read_discogs_collection_cache(username)
-        if cached:
-            return jsonify(cached)
+        if cached and int(cached.get("cacheVersion") or 0) == DISCOGS_COLLECTION_CACHE_VERSION:
+            return discogs_collection_json_response(cached)
 
     try:
         payload = fetch_full_discogs_collection(username)
         write_discogs_collection_cache(username, payload)
-        return jsonify(payload)
+        return discogs_collection_json_response(payload)
     except Exception as error:
         cached = read_discogs_collection_cache(username)
         if cached:
             cached = dict(cached)
             cached["stale"] = True
             cached["warning"] = str(error)
-            return jsonify(cached)
-        return jsonify({"ok": False, "error": str(error)}), 502
+            return discogs_collection_json_response(cached)
+        return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
+
+
+
+def topster_discogs_ownership_overrides_redis_key(username: str) -> str:
+    safe_username = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(username or DISCOGS_COLLECTION_USERNAME))
+    return (
+        f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:"
+        f"discogs-ownership-overrides:{safe_username}"
+    )
+
+
+def normalize_topster_discogs_ownership_override(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+
+    identity = str(value.get("identity") or "").strip()
+    artist = str(value.get("artist") or "").strip()
+    title = str(value.get("title") or value.get("album") or "").strip()
+    state = str(value.get("state") or "").strip().lower().replace("-", "_")
+
+    if state not in {"owned", "not_owned"}:
+        return None
+    if not identity or len(identity) > 1200 or "::" not in identity:
+        return None
+    if not title or len(title) > 600 or len(artist) > 600:
+        return None
+
+    release_id_raw = value.get("releaseId")
+    release_id = int(release_id_raw) if str(release_id_raw or "").isdigit() and int(release_id_raw) > 0 else None
+    release_url = str(value.get("releaseUrl") or "").strip()
+    if release_url and not release_url.startswith(("http://", "https://")):
+        release_url = ""
+
+    normalized = {
+        "identity": identity,
+        "artist": artist,
+        "title": title,
+        "state": state,
+        "savedAt": str(value.get("savedAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())).strip(),
+    }
+    if release_id:
+        normalized["releaseId"] = release_id
+    if release_url:
+        normalized["releaseUrl"] = release_url
+    return normalized
+
+
+def topster_discogs_ownership_override_digest(identity: str) -> str:
+    return hashlib.sha256(str(identity or "").encode("utf-8", errors="ignore")).hexdigest()
+
+
+def read_topster_discogs_ownership_overrides(username: str) -> list[dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+
+    # JSON is a no-Redis fallback and also a best-effort mirror. Merge it first so
+    # a Redis value with the same identity remains authoritative.
+    with TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_LOCK:
+        json_data = read_json_file(TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE, {})
+    if isinstance(json_data, dict):
+        for raw in json_data.values():
+            normalized = normalize_topster_discogs_ownership_override(raw)
+            if normalized:
+                records[normalized["identity"]] = normalized
+
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                raw_values = client.hgetall(topster_discogs_ownership_overrides_redis_key(username)) or {}
+                for raw in raw_values.values():
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        continue
+                    normalized = normalize_topster_discogs_ownership_override(parsed)
+                    if normalized:
+                        records[normalized["identity"]] = normalized
+        except Exception:
+            # The JSON mirror/fallback can still make previously saved flags readable.
+            pass
+
+    return sorted(records.values(), key=lambda item: (str(item.get("artist") or "").casefold(), str(item.get("title") or "").casefold()))
+
+
+def write_topster_discogs_ownership_override(username: str, value: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_topster_discogs_ownership_override(value)
+    if not normalized:
+        raise ValueError("A valid ownership identity, album title, and owned/not-owned state are required.")
+
+    digest = topster_discogs_ownership_override_digest(normalized["identity"])
+    redis_saved = False
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        # HSET has no TTL here by design. Manual ownership flags must not expire with
+        # the seven-day Discogs collection cache or any browser-side Topster cache.
+        client.hset(
+            topster_discogs_ownership_overrides_redis_key(username),
+            digest,
+            json.dumps(normalized, ensure_ascii=False),
+        )
+        redis_saved = True
+
+    # Keep a JSON mirror for local/no-Redis deployments. Failure to mirror must not
+    # invalidate a successful durable Redis write.
+    try:
+        with TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_LOCK:
+            json_data = read_json_file(TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE, {})
+            if not isinstance(json_data, dict):
+                json_data = {}
+            json_data[digest] = normalized
+            write_json_file(TOPSTER_DISCOGS_OWNERSHIP_OVERRIDES_FILE, json_data)
+    except Exception:
+        if not redis_saved:
+            raise
+
+    return normalized
+
+
+@app.route("/api/topster-discogs-ownership-overrides", methods=["GET", "POST"])
+def api_topster_discogs_ownership_overrides():
+    username = str(request.args.get("username") or DISCOGS_COLLECTION_USERNAME).strip() or DISCOGS_COLLECTION_USERNAME
+    if username.casefold() != DISCOGS_COLLECTION_USERNAME.casefold():
+        return discogs_collection_json_response({"ok": False, "error": "Only the configured Navincitron Discogs collection is available."}, 400)
+
+    if request.method == "GET":
+        try:
+            return discogs_collection_json_response({
+                "ok": True,
+                "username": username,
+                "overrides": read_topster_discogs_ownership_overrides(username),
+            })
+        except Exception as error:
+            return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
+
+    admin_error = require_topster_admin_response()
+    if admin_error is not None:
+        return admin_error
+
+    payload = request.get_json(silent=True) or {}
+    submitted_username = str(payload.get("username") or username).strip() or username
+    if submitted_username.casefold() != DISCOGS_COLLECTION_USERNAME.casefold():
+        return discogs_collection_json_response({"ok": False, "error": "Only the configured Navincitron Discogs collection is available."}, 400)
+
+    try:
+        saved = write_topster_discogs_ownership_override(submitted_username, payload)
+        return discogs_collection_json_response({
+            "ok": True,
+            "username": submitted_username,
+            "override": saved,
+        })
+    except ValueError as error:
+        return discogs_collection_json_response({"ok": False, "error": str(error)}, 400)
+    except Exception as error:
+        return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
+
+
+def discogs_release_redis_key(release_id: int) -> str:
+    return (
+        f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:"
+        f"discogs-release-v{DISCOGS_RELEASE_CACHE_VERSION}:{int(release_id)}"
+    )
+
+
+def read_discogs_release_cache(release_id: int) -> dict[str, Any] | None:
+    release_id = int(release_id)
+    now = time.time()
+    memory = DISCOGS_RELEASE_MEMORY_CACHE.get(release_id)
+    if isinstance(memory, dict) and (now - float(memory.get("cachedAtEpoch", 0))) < DISCOGS_RELEASE_CACHE_SECONDS:
+        payload = memory.get("payload")
+        return payload if isinstance(payload, dict) else None
+
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                raw = client.get(discogs_release_redis_key(release_id))
+                if raw:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        DISCOGS_RELEASE_MEMORY_CACHE[release_id] = {
+                            "cachedAtEpoch": now,
+                            "payload": parsed,
+                        }
+                        return parsed
+        except Exception:
+            pass
+    return None
+
+
+def write_discogs_release_cache(release_id: int, payload: dict[str, Any]) -> None:
+    release_id = int(release_id)
+    now = time.time()
+    DISCOGS_RELEASE_MEMORY_CACHE[release_id] = {
+        "cachedAtEpoch": now,
+        "payload": payload,
+    }
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                client.setex(
+                    discogs_release_redis_key(release_id),
+                    DISCOGS_RELEASE_CACHE_SECONDS,
+                    json.dumps(payload, ensure_ascii=False),
+                )
+        except Exception:
+            pass
+
+
+def fetch_discogs_release(release_id: int) -> dict[str, Any]:
+    release_id = int(release_id)
+    cached = read_discogs_release_cache(release_id)
+    if cached:
+        return cached
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Navincitron/1.0 +https://www.navincitron.com",
+    }
+    token = get_discogs_token()
+    if token:
+        headers["Authorization"] = f"Discogs token={token}"
+
+    url = f"https://api.discogs.com/releases/{release_id}"
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            with urlopen(Request(url, headers=headers), timeout=20) as response:
+                raw = json.loads(response.read().decode("utf-8", errors="replace"))
+            if not isinstance(raw, dict):
+                raise RuntimeError("Discogs returned an invalid release response.")
+
+            artists: list[str] = []
+            for artist in raw.get("artists") if isinstance(raw.get("artists"), list) else []:
+                if isinstance(artist, dict):
+                    name = str(artist.get("name") or "").strip()
+                    if name:
+                        artists.append(name)
+
+            def normalize_track_entry(entry: Any) -> dict[str, Any] | None:
+                if not isinstance(entry, dict):
+                    return None
+                sub_tracks = []
+                for sub_track in entry.get("sub_tracks") if isinstance(entry.get("sub_tracks"), list) else []:
+                    normalized_sub_track = normalize_track_entry(sub_track)
+                    if normalized_sub_track:
+                        sub_tracks.append(normalized_sub_track)
+
+                track_artists: list[str] = []
+                for artist in entry.get("artists") if isinstance(entry.get("artists"), list) else []:
+                    if not isinstance(artist, dict):
+                        continue
+                    name = str(artist.get("name") or "").strip()
+                    if name:
+                        track_artists.append(name)
+
+                return {
+                    "position": str(entry.get("position") or "").strip(),
+                    "title": str(entry.get("title") or "").strip(),
+                    "duration": str(entry.get("duration") or "").strip(),
+                    "type": str(entry.get("type_") or entry.get("type") or "track").strip().lower(),
+                    "artists": track_artists,
+                    "subTracks": sub_tracks,
+                }
+
+            tracklist: list[dict[str, Any]] = []
+            for entry in raw.get("tracklist") if isinstance(raw.get("tracklist"), list) else []:
+                normalized_entry = normalize_track_entry(entry)
+                if normalized_entry:
+                    tracklist.append(normalized_entry)
+
+            payload = {
+                "releaseId": release_id,
+                "masterId": int(raw.get("master_id")) if str(raw.get("master_id") or "").isdigit() and int(raw.get("master_id")) > 0 else None,
+                "title": str(raw.get("title") or "").strip(),
+                "artists": artists,
+                "year": int(raw.get("year")) if str(raw.get("year") or "").isdigit() else None,
+                "formats": normalize_discogs_formats(raw.get("formats")),
+                "vinyl": discogs_formats_include_vinyl(normalize_discogs_formats(raw.get("formats"))),
+                "discogsUrl": str(raw.get("uri") or f"https://www.discogs.com/release/{release_id}").strip(),
+                "tracklist": tracklist,
+            }
+            write_discogs_release_cache(release_id, payload)
+            return payload
+        except HTTPError as error:
+            last_error = error
+            if error.code == 429 and attempt == 0:
+                retry_after = error.headers.get("Retry-After", "2") if error.headers else "2"
+                try:
+                    wait_seconds = min(8.0, max(1.0, float(retry_after)))
+                except (TypeError, ValueError):
+                    wait_seconds = 2.0
+                time.sleep(wait_seconds)
+                continue
+            raise RuntimeError(f"Discogs release request failed with HTTP {error.code}.") from error
+        except (URLError, TimeoutError, json.JSONDecodeError) as error:
+            last_error = error
+            if attempt == 0:
+                time.sleep(1.0)
+                continue
+            break
+
+    raise RuntimeError(f"Discogs release request failed: {last_error}")
+
+
+def lyrics_discogs_cover_redis_key(release_id: int) -> str:
+    return (
+        f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:"
+        f"lyrics-discogs-cover:{int(release_id)}"
+    )
+
+
+def normalize_lyrics_discogs_cover_override(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    image_url = str(value.get("imageUrl") or value.get("imageSrc") or "").strip()
+    if not image_url.startswith(("http://", "https://")):
+        return None
+    source = str(value.get("source") or "Manual").strip()[:120]
+    href = str(value.get("href") or "").strip()
+    if href and not href.startswith(("http://", "https://")):
+        href = ""
+    saved_at = str(value.get("savedAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())).strip()
+    normalized = {
+        "imageUrl": image_url,
+        "source": source or "Manual",
+        "href": href,
+        "savedAt": saved_at,
+    }
+    release_id_raw = value.get("releaseId")
+    if str(release_id_raw or "").isdigit() and int(release_id_raw) > 0:
+        normalized["releaseId"] = int(release_id_raw)
+    artist = str(value.get("artist") or "").strip()
+    album = str(value.get("album") or "").strip()
+    if artist:
+        normalized["artist"] = artist
+    if album:
+        normalized["album"] = album
+    return normalized
+
+
+def read_lyrics_discogs_cover_override(release_id: int) -> dict[str, Any] | None:
+    release_id = int(release_id)
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                raw = client.get(lyrics_discogs_cover_redis_key(release_id))
+                if raw:
+                    return normalize_lyrics_discogs_cover_override(json.loads(raw))
+        except Exception:
+            pass
+
+    data = read_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, {})
+    if not isinstance(data, dict):
+        return None
+    return normalize_lyrics_discogs_cover_override(data.get(str(release_id)))
+
+
+def write_lyrics_discogs_cover_override(release_id: int, value: dict[str, Any]) -> dict[str, Any]:
+    release_id = int(release_id)
+    normalized = normalize_lyrics_discogs_cover_override(value)
+    if not normalized:
+        raise ValueError("A valid http:// or https:// image URL is required.")
+
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        client.set(lyrics_discogs_cover_redis_key(release_id), json.dumps(normalized, ensure_ascii=False))
+        return normalized
+
+    data = read_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data[str(release_id)] = normalized
+    write_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, data)
+    return normalized
+
+
+def delete_lyrics_discogs_cover_override(release_id: int) -> None:
+    release_id = int(release_id)
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        client.delete(lyrics_discogs_cover_redis_key(release_id))
+        return
+
+    data = read_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, {})
+    if not isinstance(data, dict):
+        return
+    if str(release_id) in data:
+        data.pop(str(release_id), None)
+        write_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, data)
+
+
+def lyrics_album_cover_identity(artist: Any, album: Any) -> str:
+    artist_key = normalize_lyrics_match_text(artist)
+    album_key = normalize_lyrics_match_text(album)
+    if not album_key or album_key in {"unknown album", "none", "null"}:
+        return ""
+    return f"{artist_key}::{album_key}"
+
+
+def lyrics_album_cover_json_key(artist: Any, album: Any) -> str:
+    identity = lyrics_album_cover_identity(artist, album)
+    return f"album::{identity}" if identity else ""
+
+
+def lyrics_album_cover_redis_key(artist: Any, album: Any) -> str:
+    identity = lyrics_album_cover_identity(artist, album)
+    if not identity:
+        return ""
+    digest = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()
+    return (
+        f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:"
+        f"lyrics-album-cover:{digest}"
+    )
+
+
+def read_lyrics_album_cover_override(artist: Any, album: Any) -> dict[str, Any] | None:
+    json_key = lyrics_album_cover_json_key(artist, album)
+    if not json_key:
+        return None
+
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            redis_key = lyrics_album_cover_redis_key(artist, album)
+            if client is not None and redis_key:
+                raw = client.get(redis_key)
+                if raw:
+                    return normalize_lyrics_discogs_cover_override(json.loads(raw))
+        except Exception:
+            pass
+
+    data = read_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, {})
+    if not isinstance(data, dict):
+        return None
+    return normalize_lyrics_discogs_cover_override(data.get(json_key))
+
+
+def write_lyrics_album_cover_override(artist: Any, album: Any, value: dict[str, Any]) -> dict[str, Any]:
+    json_key = lyrics_album_cover_json_key(artist, album)
+    if not json_key:
+        raise ValueError("A valid artist and album name are required for a non-Discogs cover override.")
+
+    normalized = normalize_lyrics_discogs_cover_override(value)
+    if not normalized:
+        raise ValueError("A valid http:// or https:// image URL is required.")
+
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        redis_key = lyrics_album_cover_redis_key(artist, album)
+        if client is None or not redis_key:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        client.set(redis_key, json.dumps(normalized, ensure_ascii=False))
+        return normalized
+
+    data = read_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data[json_key] = normalized
+    write_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, data)
+    return normalized
+
+
+def delete_lyrics_album_cover_override(artist: Any, album: Any) -> None:
+    json_key = lyrics_album_cover_json_key(artist, album)
+    if not json_key:
+        return
+
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        redis_key = lyrics_album_cover_redis_key(artist, album)
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        if redis_key:
+            client.delete(redis_key)
+        return
+
+    data = read_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, {})
+    if not isinstance(data, dict):
+        return
+    if json_key in data:
+        data.pop(json_key, None)
+        write_json_file(LYRICS_DISCOGS_COVER_OVERRIDES_FILE, data)
+
+
+def read_saved_cover_override(release_id: Any = None, artist: Any = "", album: Any = "") -> dict[str, Any] | None:
+    if str(release_id or "").isdigit() and int(release_id) > 0:
+        release_override = read_lyrics_discogs_cover_override(int(release_id))
+        if release_override:
+            return release_override
+    return read_lyrics_album_cover_override(artist, album)
+
+
+def write_saved_cover_override(
+    value: dict[str, Any],
+    release_id: Any = None,
+    artist: Any = "",
+    album: Any = "",
+) -> dict[str, Any]:
+    saved: dict[str, Any] | None = None
+    release_id_int = int(release_id) if str(release_id or "").isdigit() and int(release_id) > 0 else None
+    enriched_value = dict(value)
+    if release_id_int:
+        enriched_value["releaseId"] = release_id_int
+    if str(artist or "").strip():
+        enriched_value["artist"] = str(artist).strip()
+    if str(album or "").strip():
+        enriched_value["album"] = str(album).strip()
+
+    if release_id_int:
+        saved = write_lyrics_discogs_cover_override(release_id_int, enriched_value)
+
+    # Mirror every manually chosen cover to the Spotify-facing artist/album identity.
+    # This is what lets shuffle.html reuse a cover without needing to rerun the
+    # Discogs ownership matcher. For albums that are not owned, this identity is
+    # the primary persistent key.
+    if lyrics_album_cover_identity(artist, album):
+        saved = write_lyrics_album_cover_override(artist, album, enriched_value)
+
+    if not saved:
+        raise ValueError("Provide either a Discogs releaseId or a valid artist/album identity.")
+    return saved
+
+
+def delete_saved_cover_override(release_id: Any = None, artist: Any = "", album: Any = "") -> None:
+    deleted_any = False
+    if str(release_id or "").isdigit() and int(release_id) > 0:
+        delete_lyrics_discogs_cover_override(int(release_id))
+        deleted_any = True
+    if lyrics_album_cover_identity(artist, album):
+        delete_lyrics_album_cover_override(artist, album)
+        deleted_any = True
+    if not deleted_any:
+        raise ValueError("Provide either a Discogs releaseId or a valid artist/album identity.")
+
+
+@app.route("/api/manual-cover", methods=["GET", "POST", "DELETE"])
+@app.route("/api/lyrics/discogs-cover", methods=["GET", "POST", "DELETE"])
+def lyrics_discogs_cover_override():
+    admin_error = require_topster_admin_response()
+    if admin_error is not None:
+        return admin_error
+
+    payload = request.get_json(silent=True) or {}
+    release_id_raw = payload.get("releaseId") or request.args.get("release_id") or request.args.get("releaseId")
+    artist = str(payload.get("artist") or request.args.get("artist") or "").strip()
+    album = str(payload.get("album") or request.args.get("album") or "").strip()
+    release_id = int(release_id_raw) if str(release_id_raw or "").isdigit() and int(release_id_raw) > 0 else None
+
+    if release_id is None and not lyrics_album_cover_identity(artist, album):
+        return jsonify({"ok": False, "error": "A valid Discogs releaseId or artist/album identity is required."}), 400
+
+    try:
+        if request.method == "GET":
+            override = read_saved_cover_override(release_id, artist, album)
+            return jsonify({
+                "ok": True,
+                "releaseId": release_id,
+                "artist": artist,
+                "album": album,
+                "coverOverride": override,
+            })
+
+        if request.method == "DELETE" or bool(payload.get("reset")):
+            delete_saved_cover_override(release_id, artist, album)
+            return jsonify({
+                "ok": True,
+                "releaseId": release_id,
+                "artist": artist,
+                "album": album,
+                "coverOverride": None,
+            })
+
+        value = {
+            "imageUrl": payload.get("imageUrl") or payload.get("imageSrc"),
+            "source": payload.get("source") or "Manual",
+            "href": payload.get("href") or "",
+            "savedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        override = write_saved_cover_override(value, release_id, artist, album)
+        return jsonify({
+            "ok": True,
+            "releaseId": release_id,
+            "artist": artist,
+            "album": album,
+            "coverOverride": override,
+        })
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except Exception as error:
+        return jsonify({"ok": False, "error": f"Could not save the cover override: {error}"}), 500
+
+
+def normalize_discogs_artist_for_lookup(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s*\*+\s*$", "", text)
+    text = re.sub(r"\s*\(\d+\)\s*$", "", text)
+    text = re.sub(r'\s*["“][^"”]+["”]\s*', " ", text)
+    return normalize_lyrics_match_text(re.sub(r"\s+", " ", text).strip())
+
+
+def find_discogs_collection_album_record(
+    collection_payload: dict[str, Any],
+    collection_title: str,
+    collection_artist: str,
+) -> dict[str, Any] | None:
+    title_key = normalize_lyrics_match_text(collection_title)
+    artist_key = normalize_discogs_artist_for_lookup(collection_artist)
+    if not title_key:
+        return None
+
+    title_matches: list[dict[str, Any]] = []
+    for album in collection_payload.get("albums") if isinstance(collection_payload.get("albums"), list) else []:
+        if not isinstance(album, dict):
+            continue
+        if normalize_lyrics_match_text(album.get("title")) != title_key:
+            continue
+        title_matches.append(album)
+        if not artist_key:
+            return album
+        album_artists = album.get("artists") if isinstance(album.get("artists"), list) else [album.get("artist")]
+        if any(normalize_discogs_artist_for_lookup(value) == artist_key for value in album_artists):
+            return album
+
+    return title_matches[0] if len(title_matches) == 1 else None
+
+
+def discogs_composite_position_from_subtracks(sub_tracks: Any) -> str:
+    positions = [
+        str(entry.get("position") or "").strip().upper()
+        for entry in (sub_tracks if isinstance(sub_tracks, list) else [])
+        if isinstance(entry, dict) and str(entry.get("position") or "").strip()
+    ]
+    if not positions:
+        return ""
+
+    # Discogs represents composite songs in several ways:
+    # A1.1/A1.2/... and B3.1/B3.2/... use numeric child sections, while
+    # B3-I/B3-II/... uses Roman-numeral child sections. In both cases the
+    # shared parent position (A1 or B3) is the actual song position.
+    bases = [
+        re.sub(r"(?:[-.](?:\d+|[IVXLCDM]+))$", "", position, flags=re.IGNORECASE)
+        for position in positions
+    ]
+    if bases[0] and all(base == bases[0] for base in bases):
+        return bases[0]
+
+    sides = []
+    for position in positions:
+        match = re.match(r"^([A-Z]{1,3})(?=\d|$|[-.])", position)
+        if match:
+            sides.append(match.group(1))
+    if sides and len(sides) == len(positions) and all(side == sides[0] for side in sides):
+        return sides[0]
+    return ""
+
+
+def iter_discogs_release_track_titles(tracklist: Any):
+    """Yield only song-level Discogs titles, not headings or movement sections.
+
+    Discogs uses type_=index for both structural headings and composite works. An
+    untimed index such as "Le Sacre Du Printemps" is only a heading, so recurse
+    into its A/B children. A timed index such as Rush's "Cygnus X-1 Book II:
+    Hemispheres" or "La Villa Strangiato" is the song itself; its A-I/A-II or
+    B3-I/B3-II children are sections and must not become independent songs.
+    """
+    for entry in tracklist if isinstance(tracklist, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title") or "").strip()
+        entry_type = str(entry.get("type") or "track").strip().lower()
+        duration = str(entry.get("duration") or "").strip()
+        sub_tracks = entry.get("subTracks") if isinstance(entry.get("subTracks"), list) else []
+
+        if entry_type == "index":
+            composite_position = discogs_composite_position_from_subtracks(sub_tracks)
+            composite_song = bool(composite_position and re.search(r"\d", composite_position))
+            if title and (duration or composite_song):
+                # A timed index is a composite song. An untimed index is also
+                # the song when its children are sections of one numbered
+                # parent position (A1.1/A1.2 -> A1, B3.1/B3.2 -> B3).
+                yield title
+            elif sub_tracks:
+                # Pure structural headings whose children are separate A1/A2,
+                # B1/B2 tracks still recurse normally.
+                yield from iter_discogs_release_track_titles(sub_tracks)
+            continue
+
+        if title and entry_type == "track":
+            yield title
+        if sub_tracks and not duration:
+            yield from iter_discogs_release_track_titles(sub_tracks)
+
+
+def lyrics_discogs_track_title_variants(value: Any) -> list[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: Any) -> None:
+        text = re.sub(r"\s+", " ", str(candidate or "")).strip()
+        key = normalize_lyrics_match_text(text)
+        if not text or not key or key in seen:
+            return
+        seen.add(key)
+        variants.append(text)
+
+    add(raw)
+    add(clean_lyrics_track_title(raw))
+    add(re.sub(r"\s*[\[(][^\])]*[\])]\s*$", "", raw))
+    add(re.sub(r"\s+(?:feat\.?|featuring)\s+.+$", "", raw, flags=re.IGNORECASE))
+
+    dash_index = raw.find(" - ")
+    if dash_index >= 3:
+        add(raw[:dash_index])
+    return variants
+
+
+def lyrics_discogs_levenshtein_distance(left_value: Any, right_value: Any) -> int:
+    left = str(left_value or "")
+    right = str(right_value or "")
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i]
+        for j, right_char in enumerate(right, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[j] + 1,
+                    previous[j - 1] + (0 if left_char == right_char else 1),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def discogs_track_title_match_score(current_title: Any, discogs_title: Any) -> float:
+    current_variants = lyrics_discogs_track_title_variants(current_title)
+    candidate_variants = lyrics_discogs_track_title_variants(discogs_title)
+    if not current_variants or not candidate_variants:
+        return 0.0
+
+    best = 0.0
+    for current_variant in current_variants:
+        for candidate_variant in candidate_variants:
+            current_key = normalize_lyrics_match_text(current_variant)
+            candidate_key = normalize_lyrics_match_text(candidate_variant)
+            if not current_key or not candidate_key:
+                continue
+            if current_key == candidate_key:
+                return 1.0
+
+            current_compact = current_key.replace(" ", "")
+            candidate_compact = candidate_key.replace(" ", "")
+            if current_compact and current_compact == candidate_compact:
+                return 0.99
+
+            shorter = current_compact if len(current_compact) <= len(candidate_compact) else candidate_compact
+            longer = candidate_compact if len(current_compact) <= len(candidate_compact) else current_compact
+            if len(shorter) >= 4 and longer.startswith(shorter):
+                best = max(best, 0.93)
+
+            left_tokens = set(current_key.split())
+            right_tokens = set(candidate_key.split())
+            if left_tokens and right_tokens:
+                intersection = len(left_tokens & right_tokens)
+                containment = intersection / max(1, min(len(left_tokens), len(right_tokens)))
+                overlap = intersection / max(len(left_tokens), len(right_tokens))
+                if containment == 1 and min(len(left_tokens), len(right_tokens)) >= 2:
+                    best = max(best, 0.91)
+                elif containment >= 0.8:
+                    best = max(best, 0.84)
+                elif overlap >= 0.6:
+                    best = max(best, 0.72)
+
+            if min(len(current_compact), len(candidate_compact)) >= 4:
+                distance = lyrics_discogs_levenshtein_distance(current_compact, candidate_compact)
+                max_length = max(len(current_compact), len(candidate_compact))
+                if distance <= 1:
+                    best = max(best, 0.90)
+                elif distance <= 2 and max_length >= 8:
+                    best = max(best, 0.78)
+
+    return best
+
+
+def discogs_release_track_match_score(release: dict[str, Any], current_track_title: str) -> float:
+    if not current_track_title:
+        return 0.0
+    return max(
+        (discogs_track_title_match_score(current_track_title, title) for title in iter_discogs_release_track_titles(release.get("tracklist"))),
+        default=0.0,
+    )
+
+
+def discogs_release_has_side_positions(release: dict[str, Any]) -> bool:
+    def positions(tracklist: Any):
+        for entry in tracklist if isinstance(tracklist, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            position = str(entry.get("position") or "").strip()
+            if position:
+                yield position
+            if isinstance(entry.get("subTracks"), list):
+                yield from positions(entry.get("subTracks"))
+
+    return any(re.match(r"^[A-Za-z]{1,3}(?:\d|$)", position) for position in positions(release.get("tracklist")))
+
+
+def get_discogs_collection_payload_for_lyrics(username: str) -> dict[str, Any]:
+    cached = read_discogs_collection_cache(username)
+    if cached and int(cached.get("cacheVersion") or 0) == DISCOGS_COLLECTION_CACHE_VERSION:
+        return cached
+    payload = fetch_full_discogs_collection(username)
+    write_discogs_collection_cache(username, payload)
+    return payload
+
+
+@app.route("/api/lyrics/discogs-vinyl-tracklist", methods=["GET"])
+def lyrics_discogs_vinyl_tracklist():
+    collection_title = str(request.args.get("collection_title") or "").strip()
+    collection_artist = str(request.args.get("collection_artist") or "").strip()
+    source_artist = str(request.args.get("artist") or "").strip()
+    source_track_artist = str(request.args.get("track_artist") or "").strip()
+    source_album = str(request.args.get("album") or "").strip()
+    current_track_title = str(request.args.get("track") or "").strip()
+
+    requested_collection_matches: list[dict[str, str]] = []
+    raw_collection_matches = str(request.args.get("collection_matches") or "").strip()
+    if raw_collection_matches:
+        try:
+            parsed_matches = json.loads(raw_collection_matches)
+            if isinstance(parsed_matches, list):
+                for item in parsed_matches[:16]:
+                    if not isinstance(item, dict):
+                        continue
+                    title = str(item.get("title") or "").strip()
+                    artist = str(item.get("artist") or "").strip()
+                    if title:
+                        requested_collection_matches.append({"title": title, "artist": artist})
+        except json.JSONDecodeError:
+            requested_collection_matches = []
+
+    if collection_title:
+        requested_collection_matches.insert(0, {"title": collection_title, "artist": collection_artist})
+
+    deduped_requests: list[dict[str, str]] = []
+    seen_request_keys: set[str] = set()
+    for item in requested_collection_matches:
+        key = f"{normalize_discogs_artist_for_lookup(item.get('artist'))}::{normalize_lyrics_match_text(item.get('title'))}"
+        if not key or key in seen_request_keys:
+            continue
+        seen_request_keys.add(key)
+        deduped_requests.append(item)
+
+    if not deduped_requests:
+        return discogs_collection_json_response({"ok": False, "error": "At least one matched Discogs collection title is required."}, 400)
+
+    username = DISCOGS_COLLECTION_USERNAME
+    try:
+        collection_payload = get_discogs_collection_payload_for_lyrics(username)
+    except Exception as error:
+        return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
+
+    matched_albums: list[dict[str, Any]] = []
+    seen_album_keys: set[str] = set()
+    for requested_match in deduped_requests:
+        album = find_discogs_collection_album_record(
+            collection_payload,
+            requested_match.get("title", ""),
+            requested_match.get("artist", ""),
+        )
+        if not album:
+            continue
+        album_key = f"{normalize_discogs_artist_for_lookup((album.get('artists') or [''])[0] if isinstance(album.get('artists'), list) and album.get('artists') else album.get('artist'))}::{normalize_lyrics_match_text(album.get('title'))}"
+        if album_key in seen_album_keys:
+            continue
+        seen_album_keys.add(album_key)
+        matched_albums.append(album)
+
+    if not matched_albums:
+        return discogs_collection_json_response(
+            {
+                "ok": True,
+                "matched": False,
+                "vinylFound": False,
+                "message": "Album not owned.",
+            }
+        )
+
+    candidate_releases: list[tuple[int, dict[str, Any], bool, dict[str, Any]]] = []
+    seen_release_instances: set[tuple[int, int]] = set()
+
+    def add_album_vinyl_release_ids(album: dict[str, Any], primary: bool) -> None:
+        owned_releases = album.get("ownedReleases") if isinstance(album.get("ownedReleases"), list) else []
+        for owned_release in owned_releases:
+            if not isinstance(owned_release, dict) or not owned_release.get("vinyl"):
+                continue
+            release_id = owned_release.get("releaseId")
+            if not str(release_id or "").isdigit():
+                continue
+            release_id_int = int(release_id)
+            instance_id_raw = owned_release.get("instanceId")
+            instance_id_int = int(instance_id_raw) if str(instance_id_raw or "").isdigit() else -1
+            candidate_key = (release_id_int, instance_id_int)
+            if candidate_key in seen_release_instances:
+                continue
+            seen_release_instances.add(candidate_key)
+            candidate_releases.append((release_id_int, album, primary, owned_release))
+
+    for album in matched_albums:
+        add_album_vinyl_release_ids(album, True)
+
+    # Related releases remain a fallback for container/multi-release ownership
+    # cases. They are considered only when none of the exact collection matches
+    # contains the currently playing song.
+    related_albums: list[dict[str, Any]] = []
+    related_artist_keys = {
+        normalize_discogs_artist_for_lookup(source_artist),
+        *{
+            normalize_discogs_artist_for_lookup(artist)
+            for album in matched_albums
+            for artist in (album.get("artists") if isinstance(album.get("artists"), list) else [album.get("artist")])
+        },
+    }
+    related_artist_keys.discard("")
+    if related_artist_keys:
+        for album in collection_payload.get("albums") if isinstance(collection_payload.get("albums"), list) else []:
+            if not isinstance(album, dict) or album in matched_albums:
+                continue
+            album_artists = album.get("artists") if isinstance(album.get("artists"), list) else [album.get("artist")]
+            if any(normalize_discogs_artist_for_lookup(value) in related_artist_keys for value in album_artists):
+                related_albums.append(album)
+
+    loaded_releases: list[tuple[float, float, int, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    errors: list[str] = []
+
+    def load_candidates(candidates: list[tuple[int, dict[str, Any], bool, dict[str, Any]]]) -> None:
+        for release_id, album, primary, owned_release in candidates:
+            if len(loaded_releases) >= 20:
+                break
+            try:
+                release = fetch_discogs_release(release_id)
+                if not release.get("vinyl"):
+                    continue
+                track_score = discogs_release_track_match_score(release, current_track_title)
+                score = track_score * 100.0
+                if primary:
+                    score += 15.0
+                if discogs_release_has_side_positions(release):
+                    score += 5.0
+                # If the same physical Discogs release exists in the collection more
+                # than once, prefer the collection instance that actually has grading
+                # filled in. This does not outweigh release/track matching.
+                if str(owned_release.get("mediaCondition") or "").strip():
+                    score += 0.25
+                if str(owned_release.get("sleeveCondition") or "").strip():
+                    score += 0.25
+                loaded_releases.append((score, track_score, release_id, release, album, owned_release))
+            except Exception as error:
+                errors.append(f"Release {release_id}: {error}")
+
+    load_candidates(list(candidate_releases))
+
+    primary_has_track = any(track_score >= 0.55 for _score, track_score, _release_id, _release, _album, _owned_release in loaded_releases)
+    if current_track_title and not primary_has_track:
+        related_candidates: list[tuple[int, dict[str, Any], bool, dict[str, Any]]] = []
+        before_instances = set(seen_release_instances)
+        for album in related_albums:
+            add_album_vinyl_release_ids(album, False)
+        for candidate in candidate_releases:
+            release_id = candidate[0]
+            owned_release = candidate[3]
+            instance_id_raw = owned_release.get("instanceId")
+            instance_id_int = int(instance_id_raw) if str(instance_id_raw or "").isdigit() else -1
+            if (release_id, instance_id_int) not in before_instances:
+                related_candidates.append(candidate)
+        load_candidates(related_candidates)
+
+    if not loaded_releases:
+        primary_album = matched_albums[0]
+        return discogs_collection_json_response(
+            {
+                "ok": True,
+                "matched": True,
+                "vinylFound": False,
+                "collectionAlbum": {
+                    "title": primary_album.get("title"),
+                    "artists": primary_album.get("artists") or [],
+                    "year": primary_album.get("year"),
+                },
+                "message": "Album owned, but no owned vinyl release tracklist could be loaded.",
+                "errors": errors[:5],
+            }
+        )
+
+    loaded_releases.sort(key=lambda item: item[0], reverse=True)
+    _score, _track_score, _release_id, selected_release, selected_album, selected_owned_release = loaded_releases[0]
+    selected_owned_release = refresh_discogs_owned_release_conditions(
+        username,
+        selected_owned_release,
+        collection_payload.get("conditionFieldNames") if isinstance(collection_payload.get("conditionFieldNames"), dict) else {},
+    )
+
+    # Release database metadata is shared by every owner, whereas media/sleeve
+    # grading belongs to this exact collection instance. Merge the latter only
+    # into this response; do not put private collection grading in release cache.
+    selected_release = dict(selected_release)
+    selected_release["mediaCondition"] = str(selected_owned_release.get("mediaCondition") or "").strip()
+    selected_release["sleeveCondition"] = str(selected_owned_release.get("sleeveCondition") or "").strip()
+    selected_release["collectionInstanceId"] = selected_owned_release.get("instanceId")
+
+    selected_release_id = int(selected_release.get("releaseId") or 0) if str(selected_release.get("releaseId") or "").isdigit() else 0
+    release_cover_override = read_lyrics_discogs_cover_override(selected_release_id) if selected_release_id > 0 else None
+    if release_cover_override:
+        # Existing v4 release-specific overrides predate the shared artist/album
+        # cache. Mirror them lazily to both album-artist and track-artist Spotify
+        # identities so shuffle.html can immediately reuse them.
+        for mirror_artist in dict.fromkeys([source_track_artist, source_artist]):
+            if not lyrics_album_cover_identity(mirror_artist, source_album):
+                continue
+            try:
+                if not read_lyrics_album_cover_override(mirror_artist, source_album):
+                    mirror_value = dict(release_cover_override)
+                    if selected_release_id > 0:
+                        mirror_value["releaseId"] = selected_release_id
+                    mirror_value["artist"] = mirror_artist
+                    mirror_value["album"] = source_album
+                    write_lyrics_album_cover_override(mirror_artist, source_album, mirror_value)
+            except Exception:
+                pass
+
+    response_payload = {
+        "ok": True,
+        "matched": True,
+        "vinylFound": True,
+        "collectionAlbum": {
+            "title": selected_album.get("title"),
+            "artists": selected_album.get("artists") or [],
+            "year": selected_album.get("year"),
+        },
+        "matchedCollectionAlbums": [
+            {
+                "title": album.get("title"),
+                "artists": album.get("artists") or [],
+                "year": album.get("year"),
+            }
+            for album in matched_albums
+        ],
+        "sourceAlbum": source_album,
+        "sourceArtist": source_artist,
+        "discogsAuth": {
+            "tokenConfigured": bool(collection_payload.get("discogsTokenConfigured")),
+            "ownerAuthenticated": bool(collection_payload.get("authenticatedToDiscogs")),
+            "authenticatedUsername": str(collection_payload.get("authenticatedDiscogsUsername") or ""),
+            "collectionUsername": username,
+            "conditionFields": collection_payload.get("conditionFieldNames") if isinstance(collection_payload.get("conditionFieldNames"), dict) else {},
+        },
+        "release": selected_release,
+        "coverOverride": release_cover_override or read_lyrics_album_cover_override(source_artist, source_album),
+    }
+    return discogs_collection_json_response(response_payload)
+
+
+def lyrics_manual_album_relation_key(value: Any) -> str:
+    normalized = normalize_lyrics_match_text(value)
+    return re.sub(r"\s+", "", normalized)
+
+
+def lyrics_manual_album_identity(artist: Any, album: Any) -> str:
+    artist_text = str(artist or "").strip()
+    artist_text = re.sub(r"\s*\*+\s*$", "", artist_text)
+    artist_text = re.sub(r"\s*\(\d+\)\s*$", "", artist_text)
+    artist_text = re.sub(r'\s*["“][^"”]+["”]\s*', " ", artist_text)
+    artist_key = lyrics_manual_album_relation_key(artist_text)
+    album_key = lyrics_manual_album_relation_key(album)
+    return f"{artist_key}::{album_key}" if album_key else ""
+
+
+def parse_discogs_release_id_from_url(raw_url: Any) -> tuple[int, str]:
+    url = str(raw_url or "").strip()
+    try:
+        parsed = urlparse(url)
+    except Exception as error:
+        raise ValueError("Enter a valid Discogs release URL.") from error
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host not in {"discogs.com", "www.discogs.com"} and not host.endswith(".discogs.com"):
+        raise ValueError("Enter a Discogs release URL from discogs.com.")
+    match = re.search(r"/release/(\d+)(?:[-/]|$)", parsed.path, flags=re.IGNORECASE)
+    if not match:
+        raise ValueError("The Discogs link must point to a specific /release/<id> page.")
+    return int(match.group(1)), url
+
+
+def find_manual_discogs_ownership_override(artist: str, album: str) -> dict[str, Any] | None:
+    identity = lyrics_manual_album_identity(artist, album)
+    if not identity:
+        return None
+    for record in read_topster_discogs_ownership_overrides(DISCOGS_COLLECTION_USERNAME):
+        if str(record.get("identity") or "") != identity:
+            continue
+        if str(record.get("state") or "").strip().lower() != "owned":
+            return None
+        release_id = record.get("releaseId")
+        if str(release_id or "").isdigit() and int(release_id) > 0:
+            return record
+    return None
+
+
+def build_manual_discogs_tracklist_payload(artist: str, album: str, record: dict[str, Any]) -> dict[str, Any]:
+    release_id = int(record.get("releaseId") or 0)
+    if release_id <= 0:
+        raise ValueError("The saved Discogs ownership override does not contain a release ID.")
+    release = dict(fetch_discogs_release(release_id))
+    if not release.get("tracklist"):
+        raise ValueError("The linked Discogs release does not contain a tracklist.")
+    release["mediaCondition"] = ""
+    release["sleeveCondition"] = ""
+    cover_override = read_lyrics_discogs_cover_override(release_id) or read_lyrics_album_cover_override(artist, album)
+    return {
+        "ok": True,
+        "matched": True,
+        "vinylFound": True,
+        "manualOwnership": True,
+        "collectionAlbum": {
+            "title": release.get("title") or album,
+            "artists": release.get("artists") or ([artist] if artist else []),
+            "year": release.get("year"),
+        },
+        "matchedCollectionAlbums": [],
+        "sourceAlbum": album,
+        "sourceArtist": artist,
+        "release": release,
+        "coverOverride": cover_override,
+        "discogsAuth": {
+            "tokenConfigured": bool(get_discogs_token()),
+            "ownerAuthenticated": False,
+            "authenticatedUsername": "",
+            "collectionUsername": DISCOGS_COLLECTION_USERNAME,
+            "conditionFields": {},
+        },
+    }
+
+
+@app.route("/api/lyrics/discogs-manual-ownership", methods=["GET", "POST"])
+def lyrics_discogs_manual_ownership():
+    if request.method == "GET":
+        artist = str(request.args.get("artist") or "").strip()
+        album = str(request.args.get("album") or "").strip()
+        if not album:
+            return discogs_collection_json_response({"ok": False, "error": "Album is required."}, 400)
+        record = find_manual_discogs_ownership_override(artist, album)
+        if not record:
+            return discogs_collection_json_response({"ok": True, "matched": False, "manualOwnership": False})
+        try:
+            payload = build_manual_discogs_tracklist_payload(artist, album, record)
+            payload["override"] = record
+            return discogs_collection_json_response(payload)
+        except Exception as error:
+            return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
+
+    admin_error = require_topster_admin_response()
+    if admin_error is not None:
+        return admin_error
+
+    payload = request.get_json(silent=True) or {}
+    artist = str(payload.get("artist") or "").strip()
+    album = str(payload.get("album") or "").strip()
+    if not album:
+        return discogs_collection_json_response({"ok": False, "error": "The currently playing album does not have a usable title."}, 400)
+    try:
+        release_id, release_url = parse_discogs_release_id_from_url(payload.get("releaseUrl") or payload.get("url"))
+        release = fetch_discogs_release(release_id)
+        if not release.get("tracklist"):
+            raise ValueError("The linked Discogs release does not contain a tracklist.")
+        identity = lyrics_manual_album_identity(artist, album)
+        if not identity:
+            raise ValueError("The currently playing album does not have a usable identity.")
+        saved = write_topster_discogs_ownership_override(
+            DISCOGS_COLLECTION_USERNAME,
+            {
+                "identity": identity,
+                "artist": artist,
+                "title": album,
+                "state": "owned",
+                "releaseId": release_id,
+                "releaseUrl": release_url,
+            },
+        )
+        response_payload = build_manual_discogs_tracklist_payload(artist, album, saved)
+        response_payload["override"] = saved
+        return discogs_collection_json_response(response_payload)
+    except ValueError as error:
+        return discogs_collection_json_response({"ok": False, "error": str(error)}, 400)
+    except Exception as error:
+        return discogs_collection_json_response({"ok": False, "error": str(error)}, 502)
 
 
 @app.route("/topster-admin-login", methods=["GET", "POST"])
@@ -1212,7 +2898,7 @@ def topster_admin_login():
             body {{ background:#333; color:#fff; font-family:Arial,sans-serif; display:grid; place-items:center; min-height:100vh; margin:0; }}
             form {{ background:#444; border-radius:10px; padding:24px; width:min(420px, calc(100vw - 32px)); }}
             input {{ box-sizing:border-box; width:100%; padding:10px; margin:10px 0 16px; }}
-            button {{ background:#1974D2; border:0; border-radius:5px; color:white; cursor:pointer; padding:10px 18px; }}
+            button {{ background:#40bcf4; border:0; border-radius:5px; color:white; cursor:pointer; padding:10px 18px; }}
         </style>
     </head>
     <body>
@@ -1826,8 +3512,400 @@ def get_spotify_client():
 GENIUS_LOOKUP_CACHE: dict[str, dict[str, Any]] = {}
 GENIUS_LOOKUP_CACHE_LOCK = threading.Lock()
 GENIUS_LOOKUP_CACHE_MAX_ITEMS = 500
+GENIUS_LOOKUP_CACHE_VERSION = 2
 GENIUS_MATCH_TTL_SECONDS = 7 * 24 * 60 * 60
 GENIUS_MISS_TTL_SECONDS = 60 * 60
+
+
+def lyrics_genius_album_links_redis_key() -> str:
+    return f"{TOPSTER_REDIS_KEY_PREFIX.strip(':') or 'navincitron:topster'}:lyrics-genius-album-links"
+
+
+def normalize_lyrics_genius_album_link(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    artist = str(value.get("artist") or "").strip()
+    album = str(value.get("album") or "").strip()
+    identity = str(value.get("identity") or lyrics_manual_album_identity(artist, album)).strip()
+    url = str(value.get("url") or "").strip()
+    album_id_raw = value.get("albumId")
+    album_id = int(album_id_raw) if str(album_id_raw or "").isdigit() and int(album_id_raw) > 0 else None
+    if not identity or not album or not url or not album_id:
+        return None
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host not in {"genius.com", "www.genius.com"} or not parsed.path.casefold().startswith("/albums/"):
+        return None
+
+    tracks: list[dict[str, Any]] = []
+    for raw_track in value.get("tracks") if isinstance(value.get("tracks"), list) else []:
+        if not isinstance(raw_track, dict):
+            continue
+        song_id_raw = raw_track.get("songId") or raw_track.get("id")
+        song_id = int(song_id_raw) if str(song_id_raw or "").isdigit() and int(song_id_raw) > 0 else None
+        title = str(raw_track.get("title") or "").strip()
+        if not song_id or not title:
+            continue
+        tracks.append({
+            "songId": song_id,
+            "title": title,
+            "url": str(raw_track.get("url") or "").strip(),
+            "position": str(raw_track.get("position") or "").strip(),
+        })
+    if not tracks:
+        return None
+    return {
+        "identity": identity,
+        "artist": artist,
+        "album": album,
+        "url": url,
+        "albumId": album_id,
+        "tracks": tracks,
+        "savedAt": str(value.get("savedAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())).strip(),
+    }
+
+
+def read_lyrics_genius_album_link(artist: str, album: str) -> dict[str, Any] | None:
+    identity = lyrics_manual_album_identity(artist, album)
+    if not identity:
+        return None
+    with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
+        if identity in LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE:
+            cached = LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE[identity]
+            return dict(cached) if isinstance(cached, dict) else None
+
+    record = None
+    digest = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()
+    if topster_redis_is_configured():
+        try:
+            client = get_topster_redis_client()
+            if client is not None:
+                raw = client.hget(lyrics_genius_album_links_redis_key(), digest)
+                if raw:
+                    record = normalize_lyrics_genius_album_link(json.loads(raw))
+        except Exception:
+            record = None
+    if record is None:
+        try:
+            with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
+                data = read_json_file(LYRICS_GENIUS_ALBUM_LINKS_FILE, {})
+            if isinstance(data, dict):
+                record = normalize_lyrics_genius_album_link(data.get(digest))
+        except Exception:
+            record = None
+
+    with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
+        LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE[identity] = dict(record) if isinstance(record, dict) else None
+    return record
+
+
+def write_lyrics_genius_album_link(value: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_lyrics_genius_album_link(value)
+    if not normalized:
+        raise ValueError("A valid Genius album link and tracklist are required.")
+    identity = normalized["identity"]
+    digest = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()
+    redis_saved = False
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            raise RuntimeError(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        client.hset(lyrics_genius_album_links_redis_key(), digest, json.dumps(normalized, ensure_ascii=False))
+        redis_saved = True
+    try:
+        with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
+            data = read_json_file(LYRICS_GENIUS_ALBUM_LINKS_FILE, {})
+            if not isinstance(data, dict):
+                data = {}
+            data[digest] = normalized
+            write_json_file(LYRICS_GENIUS_ALBUM_LINKS_FILE, data)
+            LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE[identity] = dict(normalized)
+    except Exception:
+        if not redis_saved:
+            raise
+        with LYRICS_GENIUS_ALBUM_LINKS_LOCK:
+            LYRICS_GENIUS_ALBUM_LINK_MEMORY_CACHE[identity] = dict(normalized)
+    return normalized
+
+
+def validate_genius_album_url(raw_url: Any) -> str:
+    url = str(raw_url or "").strip()
+    try:
+        parsed = urlparse(url)
+    except Exception as error:
+        raise ValueError("Enter a valid Genius album URL.") from error
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host not in {"genius.com", "www.genius.com"} or not parsed.path.casefold().startswith("/albums/"):
+        raise ValueError("Enter a Genius album URL in the form https://genius.com/albums/Artist/Album.")
+    return url
+
+
+def genius_album_id_from_page_html(html: str) -> int | None:
+    decoded = html_unescape(str(html or ""))
+    patterns = (
+        r'"album_ids"\s*:\s*\[\s*(\d+)',
+        r'\\"album_ids\\"\s*:\s*\[\s*(\d+)',
+        r'"album_id"\s*:\s*(\d+)',
+        r'"albumId"\s*:\s*(\d+)',
+        r'/api/albums/(\d+)',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, decoded, flags=re.IGNORECASE)
+        if match and int(match.group(1)) > 0:
+            return int(match.group(1))
+    return None
+
+
+def fetch_genius_album_id_from_url(
+    url: str,
+    context_artist: str = "",
+    context_album: str = "",
+) -> int:
+    """Resolve a Genius album URL without depending on Genius page HTML.
+
+    Render/VPS requests to public genius.com album pages can receive HTTP 403.
+    The direct HTML read remains a fast path, but the durable fallback uses the
+    authenticated api.genius.com search/song endpoints and matches the returned
+    song's album metadata back to the exact album URL/title supplied by the user.
+    """
+    validated_url = validate_genius_album_url(url)
+    headers = {
+        "Accept": "text/html,application/xhtml+xml",
+        "User-Agent": "Mozilla/5.0 (compatible; NavincitronLyrics/1.3; +https://www.navincitron.com)",
+    }
+    page_error = None
+    try:
+        with urlopen(Request(validated_url, headers=headers), timeout=15) as response:
+            html = response.read(6 * 1024 * 1024).decode("utf-8", errors="replace")
+        album_id = genius_album_id_from_page_html(html)
+        if album_id:
+            return album_id
+    except Exception as error:
+        # Genius commonly denies datacenter HTML requests with 403. Do not
+        # consider that fatal; the official API fallback below is the primary
+        # resolution path in production.
+        page_error = error
+
+    if not get_genius_access_token():
+        detail = f" ({page_error})" if page_error else ""
+        raise RuntimeError(
+            "Could not determine the Genius album ID because the album page "
+            f"could not be read and GENIUS_ACCESS_TOKEN is unavailable{detail}."
+        )
+
+    parsed = urlparse(validated_url)
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    url_artist_hint = parts[1].replace("-", " ") if len(parts) > 1 else ""
+    url_album_hint = parts[2].replace("-", " ") if len(parts) > 2 else ""
+    target_path = parsed.path.rstrip("/").casefold()
+    target_artist_key = normalize_lyrics_match_text(url_artist_hint or context_artist)
+    target_album_key = normalize_lyrics_match_text(url_album_hint)
+    context_album_key = normalize_lyrics_match_text(clean_lyrics_album_title(context_album))
+
+    # Put the distinctive album-slug words first. This matters for titles such
+    # as "Live/Hhaï", where a broad "Magma Live Hhai" search can bury the album's
+    # songs beneath unrelated "live" results.
+    url_album_tokens = [token for token in normalize_lyrics_match_text(url_album_hint).split() if token]
+    distinctive_tokens = [token for token in url_album_tokens if len(token) >= 4 and token not in {"live", "album", "deluxe", "remastered"}]
+
+    queries: list[str] = []
+    def add_query(*values: Any) -> None:
+        query = " ".join(str(value or "").strip() for value in values if str(value or "").strip())
+        query = re.sub(r"\s+", " ", query).strip()
+        if query and query.casefold() not in {existing.casefold() for existing in queries}:
+            queries.append(query)
+
+    for token in distinctive_tokens:
+        add_query(url_artist_hint or context_artist, token)
+        add_query(token, url_artist_hint or context_artist)
+    add_query(url_artist_hint or context_artist, url_album_hint)
+    add_query(context_artist, context_album)
+    add_query(url_album_hint, url_artist_hint or context_artist)
+    add_query(url_artist_hint or context_artist, clean_lyrics_album_title(context_album))
+
+    best_candidate: tuple[float, int] | None = None
+    seen_song_ids: set[int] = set()
+
+    for query in queries[:8]:
+        try:
+            search_payload = genius_search_request(query)
+        except Exception:
+            continue
+
+        for hit in genius_song_hits(search_payload)[:20]:
+            song_id_raw = hit.get("id")
+            if not str(song_id_raw or "").isdigit():
+                continue
+            song_id = int(song_id_raw)
+            if song_id in seen_song_ids:
+                continue
+            seen_song_ids.add(song_id)
+
+            song = hit
+            album_data = hit.get("album") if isinstance(hit.get("album"), dict) else None
+            if not album_data:
+                try:
+                    details_payload = genius_song_request(song_id)
+                    response = details_payload.get("response")
+                    detailed_song = response.get("song") if isinstance(response, dict) else None
+                    if isinstance(detailed_song, dict):
+                        song = detailed_song
+                        album_data = song.get("album") if isinstance(song.get("album"), dict) else None
+                except Exception:
+                    album_data = None
+            if not album_data:
+                continue
+
+            album_id_raw = album_data.get("id")
+            if not str(album_id_raw or "").isdigit() or int(album_id_raw) <= 0:
+                continue
+            album_id = int(album_id_raw)
+            album_url = str(album_data.get("url") or "").strip()
+            album_name = str(album_data.get("name") or album_data.get("full_title") or "").strip()
+
+            if album_url:
+                try:
+                    if urlparse(album_url).path.rstrip("/").casefold() == target_path:
+                        return album_id
+                except Exception:
+                    pass
+
+            candidate_album_key = normalize_lyrics_match_text(album_name)
+            candidate_artist_names: list[str] = []
+            album_artist = album_data.get("artist")
+            if isinstance(album_artist, dict) and album_artist.get("name"):
+                candidate_artist_names.append(str(album_artist.get("name")))
+            primary_artist = song.get("primary_artist")
+            if isinstance(primary_artist, dict) and primary_artist.get("name"):
+                candidate_artist_names.append(str(primary_artist.get("name")))
+            candidate_artist_key = normalize_lyrics_match_text(" ".join(candidate_artist_names))
+
+            album_score = 0.0
+            if target_album_key and candidate_album_key == target_album_key:
+                album_score = 1.0
+            elif target_album_key:
+                album_score = lyrics_token_overlap(target_album_key, candidate_album_key)
+            if context_album_key and candidate_album_key == context_album_key:
+                album_score = max(album_score, 0.92)
+
+            artist_score = 0.0
+            if target_artist_key and candidate_artist_key:
+                if target_artist_key == candidate_artist_key:
+                    artist_score = 1.0
+                elif target_artist_key in candidate_artist_key or candidate_artist_key in target_artist_key:
+                    artist_score = 0.9
+                else:
+                    artist_score = lyrics_token_overlap(target_artist_key, candidate_artist_key)
+
+            total_score = album_score * 0.75 + artist_score * 0.25
+            if album_score >= 0.92 and artist_score >= 0.75:
+                return album_id
+            if best_candidate is None or total_score > best_candidate[0]:
+                best_candidate = (total_score, album_id)
+
+    if best_candidate and best_candidate[0] >= 0.82:
+        return best_candidate[1]
+
+    detail = f" The direct Genius page request failed with {page_error}." if page_error else ""
+    raise RuntimeError(
+        "Could not determine the Genius album ID from that link using either "
+        f"the album page or the Genius API.{detail}"
+    )
+
+
+def fetch_genius_album_tracks(album_id: int) -> list[dict[str, Any]]:
+    access_token = get_genius_access_token()
+    if not access_token:
+        raise RuntimeError("Genius album linking requires GENIUS_ACCESS_TOKEN on the backend.")
+    tracks: list[dict[str, Any]] = []
+    page = 1
+    while page <= 20:
+        payload = genius_json_request(
+            f"https://api.genius.com/albums/{int(album_id)}/tracks?per_page=50&page={page}&text_format=plain",
+            access_token,
+        )
+        response = payload.get("response") if isinstance(payload, dict) else None
+        raw_tracks = response.get("tracks") if isinstance(response, dict) and isinstance(response.get("tracks"), list) else []
+        for raw_track in raw_tracks:
+            if not isinstance(raw_track, dict):
+                continue
+            song = raw_track.get("song") if isinstance(raw_track.get("song"), dict) else raw_track
+            song_id_raw = song.get("id")
+            title = str(song.get("title") or song.get("title_with_featured") or "").strip()
+            if not str(song_id_raw or "").isdigit() or not title:
+                continue
+            tracks.append({
+                "songId": int(song_id_raw),
+                "title": title,
+                "url": str(song.get("url") or "").strip(),
+                "position": str(raw_track.get("number") or raw_track.get("track_number") or len(tracks) + 1),
+            })
+        next_page = response.get("next_page") if isinstance(response, dict) else None
+        if not next_page or not raw_tracks:
+            break
+        try:
+            page = int(next_page)
+        except (TypeError, ValueError):
+            page += 1
+    if not tracks:
+        raise RuntimeError("Genius returned no tracks for that album page.")
+    return tracks
+
+
+def track_album_artist_for_manual_link(track: dict[str, Any]) -> str:
+    album_artists = track.get("albumArtists") if isinstance(track.get("albumArtists"), list) else []
+    if album_artists:
+        return str(album_artists[0] or "").strip()
+    artists = track.get("artists") if isinstance(track.get("artists"), list) else []
+    if artists:
+        return str(artists[0] or "").strip()
+    return str(track.get("albumArtist") or track.get("artist") or "").split(",", 1)[0].strip()
+
+
+def lookup_genius_song_from_manual_album_link(track: dict[str, Any]) -> dict[str, Any] | None:
+    artist = track_album_artist_for_manual_link(track)
+    album = str(track.get("album") or "").strip()
+    mapping = read_lyrics_genius_album_link(artist, album)
+    if not mapping:
+        return None
+    title = str(track.get("title") or "").strip()
+    best_track = None
+    best_score = 0.0
+    for candidate in mapping.get("tracks") if isinstance(mapping.get("tracks"), list) else []:
+        score = discogs_track_title_match_score(title, candidate.get("title"))
+        if score > best_score:
+            best_score = score
+            best_track = candidate
+    if best_track is None or best_score < 0.55:
+        return None
+    song_id = int(best_track.get("songId") or 0)
+    if song_id <= 0:
+        return None
+    try:
+        details_payload = genius_song_request(song_id)
+        response = details_payload.get("response")
+        song = response.get("song") if isinstance(response, dict) else None
+        if isinstance(song, dict):
+            result = build_genius_song_payload(song)
+            result["manualAlbumUrl"] = mapping.get("url")
+            return result
+    except Exception:
+        pass
+    stub = {
+        "id": song_id,
+        "title": best_track.get("title") or title,
+        "url": best_track.get("url") or "",
+        "primary_artist": {"name": artist},
+        "album": {"name": album},
+    }
+    result = build_genius_song_payload(stub)
+    result["manualAlbumUrl"] = mapping.get("url")
+    return result
+
+
 def get_genius_access_token() -> str:
     # Genius's official API requires a Client Access Token. Accept a few common
     # environment-variable names so existing deployments can add the token
@@ -1968,6 +4046,23 @@ def clean_lyrics_track_title(value: Any) -> str:
         text,
         flags=re.IGNORECASE,
     )
+
+    # Spotify commonly chains version qualifiers with multiple " - " segments,
+    # e.g. "Deuce - Live/1975 - 2025 Remaster". The previous one-shot suffix
+    # regex could not cross the second hyphen, leaving the whole version string
+    # in the Genius query. Peel qualifying suffix segments from right to left.
+    parts = re.split(r"\s+-\s+", text)
+    while len(parts) > 1:
+        suffix = parts[-1].strip()
+        if (
+            re.search(rf"(?:{qualifier_words})", suffix, flags=re.IGNORECASE)
+            or re.search(r"\b(?:19|20)\d{2}\b", suffix)
+        ):
+            parts.pop()
+            continue
+        break
+    text = " - ".join(parts)
+
     text = re.sub(
         rf"\s+-\s+[^-]*(?:{qualifier_words})[^-]*$",
         "",
@@ -1975,6 +4070,37 @@ def clean_lyrics_track_title(value: Any) -> str:
         flags=re.IGNORECASE,
     )
     return re.sub(r"\s+", " ", text).strip(" -")
+
+
+def clean_lyrics_album_title(value: Any) -> str:
+    """Remove edition/live/remaster packaging while preserving the album identity."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    qualifier_words = (
+        r"\blive\b|remaster(?:ed|ing)?|deluxe|expanded|anniversary|"
+        r"bonus track|edition|mono|stereo"
+    )
+    text = re.sub(
+        rf"\s*[\[(][^\])]*(?:{qualifier_words})[^\])]*[\])]\s*",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    parts = re.split(r"\s+-\s+", text)
+    while len(parts) > 1:
+        suffix = parts[-1].strip()
+        if (
+            re.search(rf"(?:{qualifier_words})", suffix, flags=re.IGNORECASE)
+            or re.search(r"\b(?:19|20)\d{2}\b", suffix)
+        ):
+            parts.pop()
+            continue
+        break
+
+    return re.sub(r"\s+", " ", " - ".join(parts)).strip(" -")
 
 
 def lyrics_token_overlap(left: Any, right: Any) -> float:
@@ -2053,12 +4179,36 @@ def score_genius_song_match(
         if isinstance(candidate_album, dict)
         else ""
     )
-    if album_name and candidate_album_name:
-        album_overlap = lyrics_token_overlap(album_name, candidate_album_name)
-        if normalize_lyrics_match_text(album_name) == normalize_lyrics_match_text(candidate_album_name):
-            score += 10.0
+    requested_album_clean = clean_lyrics_album_title(album_name)
+    candidate_album_clean = clean_lyrics_album_title(candidate_album_name)
+    requested_album_norm = normalize_lyrics_match_text(requested_album_clean)
+    candidate_album_norm = normalize_lyrics_match_text(candidate_album_clean)
+
+    if requested_album_norm and candidate_album_norm:
+        album_overlap = lyrics_token_overlap(requested_album_clean, candidate_album_clean)
+        if requested_album_norm == candidate_album_norm:
+            # Album-specific live pages should outrank a studio page with the same
+            # base song title and artist.
+            score += 18.0
         else:
-            score += 8.0 * album_overlap
+            score += 10.0 * album_overlap
+
+    # Genius search results do not always include an album object. Live pages often
+    # carry the album/version in the song title or URL slug instead
+    # ("Deuce (Alive!)" / "Kiss-deuce-alive-lyrics"). Use that as a secondary hint.
+    if requested_album_norm and requested_album_norm != candidate_album_norm:
+        candidate_hint = " ".join(
+            str(value or "")
+            for value in (
+                candidate_title,
+                song.get("path"),
+                song.get("url"),
+            )
+        )
+        candidate_hint_norm = normalize_lyrics_match_text(candidate_hint)
+        album_tokens = [token for token in requested_album_norm.split() if token]
+        if album_tokens and all(token in candidate_hint_norm.split() for token in album_tokens):
+            score += 12.0
 
     return score
 
@@ -2196,24 +4346,1275 @@ def lastfm_json_request(params: dict[str, Any]) -> dict[str, Any]:
         },
     )
 
-    try:
-        with urlopen(lastfm_request, timeout=10) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
-    except HTTPError as error:
-        raise RuntimeError(f"Last.fm request failed with HTTP {error.code}.") from error
-    except URLError as error:
-        raise RuntimeError(f"Could not reach Last.fm: {error.reason}") from error
-    except json.JSONDecodeError as error:
-        raise RuntimeError("Last.fm returned an unreadable JSON response.") from error
+    # Long custom-range charts can require many Last.fm calls. A single
+    # transient 500/502/503/504 (or Last.fm's temporary-error/rate-limit
+    # response) should not abort the entire chart.
+    max_attempts = 4
+    transient_http_codes = {429, 500, 502, 503, 504}
+    transient_lastfm_codes = {11, 16, 29}
+    last_error: Exception | None = None
 
-    if not isinstance(payload, dict):
-        raise RuntimeError("Last.fm returned an invalid JSON response.")
-    if payload.get("error"):
-        raise RuntimeError(
-            f"Last.fm API error {payload.get('error')}: "
-            f"{str(payload.get('message') or 'lookup failed').strip()}"
+    for attempt in range(max_attempts):
+        payload: Any = None
+        try:
+            with urlopen(lastfm_request, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        except HTTPError as error:
+            last_error = error
+            if error.code in transient_http_codes and attempt < max_attempts - 1:
+                retry_after = error.headers.get("Retry-After") if error.headers else None
+                try:
+                    wait_seconds = float(retry_after) if retry_after is not None else 0.0
+                except (TypeError, ValueError):
+                    wait_seconds = 0.0
+                if wait_seconds <= 0:
+                    wait_seconds = min(4.0, 0.6 * (2 ** attempt))
+                time.sleep(max(0.25, min(8.0, wait_seconds)))
+                continue
+            raise RuntimeError(f"Last.fm request failed with HTTP {error.code}.") from error
+        except URLError as error:
+            last_error = error
+            if attempt < max_attempts - 1:
+                time.sleep(min(4.0, 0.6 * (2 ** attempt)))
+                continue
+            raise RuntimeError(f"Could not reach Last.fm: {error.reason}") from error
+        except json.JSONDecodeError as error:
+            last_error = error
+            if attempt < max_attempts - 1:
+                time.sleep(min(2.0, 0.4 * (2 ** attempt)))
+                continue
+            raise RuntimeError("Last.fm returned an unreadable JSON response.") from error
+
+        if not isinstance(payload, dict):
+            last_error = RuntimeError("Last.fm returned an invalid JSON response.")
+            if attempt < max_attempts - 1:
+                time.sleep(min(2.0, 0.4 * (2 ** attempt)))
+                continue
+            raise last_error
+
+        if payload.get("error"):
+            error_code = lastfm_int_value(payload.get("error"), 0)
+            message = str(payload.get("message") or "lookup failed").strip()
+            if error_code in transient_lastfm_codes and attempt < max_attempts - 1:
+                time.sleep(min(5.0, 0.75 * (2 ** attempt)))
+                continue
+            raise RuntimeError(f"Last.fm API error {payload.get('error')}: {message}")
+
+        return payload
+
+    raise RuntimeError(f"Last.fm request failed after retries: {last_error}")
+
+
+LASTFM_PROFILE_USERNAME = (os.getenv("LASTFM_PROFILE_USERNAME", "Navincitron").strip() or "Navincitron")
+LASTFM_CHART_MAX_ITEMS = 1000
+LASTFM_RECENT_MAX_SCROBBLES = 50_000
+LASTFM_WEEKLY_CHART_CACHE: dict[str, dict[str, Any]] = {}
+LASTFM_WEEKLY_CHART_CACHE_LOCK = threading.Lock()
+LASTFM_WEEKLY_CHART_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
+LASTFM_WEEKLY_CHART_CACHE_MAX_ITEMS = 1200
+LASTFM_WEB_IMAGE_CACHE: dict[str, dict[str, Any]] = {}
+LASTFM_WEB_IMAGE_CACHE_LOCK = threading.Lock()
+LASTFM_WEB_IMAGE_MATCH_TTL_SECONDS = 30 * 24 * 60 * 60
+LASTFM_WEB_IMAGE_MISS_TTL_SECONDS = 6 * 60 * 60
+LASTFM_WEB_IMAGE_CACHE_MAX_ITEMS = 1500
+
+
+def lastfm_music_path_component(value: str) -> str:
+    # Last.fm uses '+' for spaces in music paths, while a literal plus sign in
+    # an artist name needs to survive that convention. Double-encode literal
+    # plus signs so Florence + the Machine resolves to the same canonical page
+    # Last.fm itself emits.
+    encoded = quote_plus(str(value or "").strip(), safe="")
+    return encoded.replace("%2B", "%252B").replace("%2b", "%252B")
+
+
+def lastfm_web_image_cache_get(key: str) -> str | None:
+    now = time.time()
+    with LASTFM_WEB_IMAGE_CACHE_LOCK:
+        cached = LASTFM_WEB_IMAGE_CACHE.get(key)
+        if not isinstance(cached, dict):
+            return None
+        value = str(cached.get("value") or "")
+        age = now - float(cached.get("timestamp") or 0)
+        ttl = LASTFM_WEB_IMAGE_MATCH_TTL_SECONDS if value else LASTFM_WEB_IMAGE_MISS_TTL_SECONDS
+        if age > ttl:
+            LASTFM_WEB_IMAGE_CACHE.pop(key, None)
+            return None
+        return value
+
+
+def lastfm_web_image_cache_put(key: str, value: str) -> str:
+    now = time.time()
+    with LASTFM_WEB_IMAGE_CACHE_LOCK:
+        LASTFM_WEB_IMAGE_CACHE[key] = {"timestamp": now, "value": value}
+        if len(LASTFM_WEB_IMAGE_CACHE) > LASTFM_WEB_IMAGE_CACHE_MAX_ITEMS:
+            oldest_key = min(
+                LASTFM_WEB_IMAGE_CACHE,
+                key=lambda item_key: float(LASTFM_WEB_IMAGE_CACHE[item_key].get("timestamp") or 0),
+            )
+            LASTFM_WEB_IMAGE_CACHE.pop(oldest_key, None)
+    return value
+
+
+def fetch_lastfm_html(url: str) -> str:
+    target = str(url or "").strip()
+    if not target.startswith("https://www.last.fm/"):
+        return ""
+    request_obj = Request(
+        target,
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": "Mozilla/5.0 (compatible; Navincitron/1.0; +https://www.navincitron.com)",
+        },
+    )
+    try:
+        with urlopen(request_obj, timeout=10) as response:
+            return response.read(3 * 1024 * 1024).decode("utf-8", errors="replace")
+    except (HTTPError, URLError, TimeoutError):
+        return ""
+
+
+def extract_lastfm_header_image(html_text: str) -> str:
+    if not html_text:
+        return ""
+    decoded = html_unescape(html_text)
+
+    # The large image shown on Last.fm music pages is stored as a CSS
+    # background on .header-new-background-image. This is also used on artist
+    # pages and provides a much better fallback than the historical API star
+    # placeholder.
+    for tag in re.findall(r"<[^>]*header-new-background-image[^>]*>", decoded, flags=re.IGNORECASE):
+        style_match = re.search(r"style\s*=\s*([\"'])(.*?)\1", tag, flags=re.IGNORECASE | re.DOTALL)
+        if not style_match:
+            continue
+        image_match = re.search(
+            r"background-image\s*:\s*url\(\s*([\"']?)(https?://[^)\"']+)\1\s*\)",
+            style_match.group(2),
+            flags=re.IGNORECASE,
         )
-    return payload
+        if image_match:
+            image_url = useful_lastfm_image_url(image_match.group(2))
+            if image_url:
+                return image_url
+
+    # Do not fall back to arbitrary <img> / avatar elements here. User-library
+    # pages contain the Last.fm account avatar, and treating that as an artist
+    # image caused every artist tile to resolve to the Navincitron profile photo.
+    # Artist pages are handled by extract_lastfm_artist_gallery_image() first;
+    # music pages that lack a CSS hero can still use their page metadata below.
+
+    # Final non-personalized fallback for page variants that use metadata.
+    meta_match = re.search(
+        r"<meta[^>]+(?:property|name)=[\"'](?:og:image|twitter:image)[\"'][^>]+content=[\"'](https?://[^\"']+)[\"']",
+        decoded,
+        flags=re.IGNORECASE,
+    )
+    if meta_match:
+        return useful_lastfm_image_url(meta_match.group(1))
+    return ""
+
+
+def extract_lastfm_artist_gallery_image(html_text: str) -> str:
+    """Return the large CDN form of the first artist-gallery image hash on a Last.fm page."""
+    if not html_text:
+        return ""
+    decoded = html_unescape(html_text)
+
+    # Last.fm's artist hero / preferred image links point at
+    # /music/<artist>/+images/<32-hex-image-id>. The same id is accepted by
+    # Last.fm's public image CDN, which avoids depending on CSS background
+    # markup that changes between page variants.
+    patterns = (
+        r"href\s*=\s*['\"][^'\"]*/\+images/([0-9a-f]{32})(?:[^'\"]*)['\"]",
+        r"href\s*=\s*['\"][^'\"]*/%2Bimages(?:/|%2F)([0-9a-f]{32})(?:[^'\"]*)['\"]",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, decoded, flags=re.IGNORECASE)
+        if match:
+            return f"https://lastfm-img.freetls.fastly.net/i/u/770x0/{match.group(1).lower()}.jpg"
+    return ""
+
+
+def extract_lastfm_artist_page_image(html_text: str) -> str:
+    # Prefer the gallery id because Pro preferred images are represented by the
+    # artist image/gallery selection. Fall back to the page's hero/meta image.
+    return extract_lastfm_artist_gallery_image(html_text) or extract_lastfm_header_image(html_text)
+
+
+def extract_lastfm_page_image_candidates(html_text: str, include_artist_gallery: bool = False, limit: int = 24) -> list[str]:
+    """Extract page-specific Last.fm artwork without accepting account/profile avatars."""
+    if not html_text:
+        return []
+
+    decoded = html_unescape(html_text)
+    candidates: list[str] = []
+
+    def add(raw_url: Any) -> None:
+        url = useful_lastfm_image_url(raw_url)
+        if not url or url in candidates:
+            return
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        # Keep automatic picker results on Last.fm's image infrastructure. A
+        # user may still paste any http(s) image URL explicitly in the UI.
+        if not (host.endswith("last.fm") or "lastfm" in host or "audioscrobbler" in host):
+            return
+        candidates.append(url)
+
+    # Page hero / metadata image is the safest album/track candidate and also a
+    # useful artist fallback. This helper deliberately never scans arbitrary img
+    # tags, because Last.fm user/library pages contain account avatars.
+    add(extract_lastfm_header_image(decoded))
+
+    if include_artist_gallery:
+        patterns = (
+            r"href\s*=\s*['\"][^'\"]*/\+images/([0-9a-f]{32})(?:[^'\"]*)['\"]",
+            r"href\s*=\s*['\"][^'\"]*/%2Bimages(?:/|%2F)([0-9a-f]{32})(?:[^'\"]*)['\"]",
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, decoded, flags=re.IGNORECASE):
+                add(f"https://lastfm-img.freetls.fastly.net/i/u/770x0/{match.group(1).lower()}.jpg")
+                if len(candidates) >= limit:
+                    break
+            if len(candidates) >= limit:
+                break
+
+    return candidates[: max(1, int(limit))]
+
+
+def normalize_lastfm_music_url(raw_url: str) -> str:
+    candidate = str(raw_url or "").strip()
+    if candidate.startswith("http://www.last.fm/"):
+        candidate = "https://www.last.fm/" + candidate[len("http://www.last.fm/"):]
+    if not candidate.startswith("https://www.last.fm/"):
+        return ""
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return ""
+    if (parsed.hostname or "").lower() != "www.last.fm" or not parsed.path.startswith("/music/"):
+        return ""
+    return candidate
+
+
+def lastfm_cover_option_pages(mode: str, artist: str, title: str, album: str, item_url: str = "") -> list[str]:
+    artist_name = str(artist or "").strip()
+    title_name = str(title or "").strip()
+    album_name = str(album or "").strip()
+    pages: list[str] = []
+
+    direct = normalize_lastfm_music_url(item_url)
+    if direct:
+        pages.append(direct)
+
+    if not artist_name:
+        return list(dict.fromkeys(pages))
+
+    encoded_artist = lastfm_music_path_component(artist_name)
+    if mode == "artists":
+        pages.append(f"https://www.last.fm/music/{encoded_artist}")
+    elif mode == "albums":
+        release_name = album_name or title_name
+        if release_name:
+            pages.append(f"https://www.last.fm/music/{encoded_artist}/{lastfm_music_path_component(release_name)}")
+    else:
+        # Songs/recently-played entries may expose both a track page and a known
+        # release page. Both are legitimate Last.fm-only artwork sources.
+        if title_name:
+            pages.append(f"https://www.last.fm/music/{encoded_artist}/_/{lastfm_music_path_component(title_name)}")
+        if album_name:
+            pages.append(f"https://www.last.fm/music/{encoded_artist}/{lastfm_music_path_component(album_name)}")
+
+    return list(dict.fromkeys(filter(None, pages)))
+
+
+def lastfm_artist_image_url(username: str, artist: str, artist_url: str = "") -> str:
+    artist_name = str(artist or "").strip()
+    if not artist_name:
+        return ""
+
+    # v3 invalidates the v2 artist-image cache. v2 checked the user's public
+    # library page first; that page exposes the user's account avatar and can
+    # therefore return the same Navincitron profile picture for every artist.
+    cache_key = f"artist-v3::{str(username or '').casefold()}::{artist_name.casefold()}"
+    cached = lastfm_web_image_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    encoded_artist = lastfm_music_path_component(artist_name)
+    candidates = []
+    canonical_url = str(artist_url or "").strip()
+    if canonical_url.startswith("http://www.last.fm/"):
+        canonical_url = "https://www.last.fm/" + canonical_url[len("http://www.last.fm/"):]
+    if canonical_url.startswith("https://www.last.fm/") and "/music/" in canonical_url:
+        candidates.append(canonical_url)
+    # Always include the canonical public artist page. Unlike /user/.../library,
+    # this page's +images hero belongs to the requested artist rather than the
+    # account whose library is being viewed.
+    candidates.append(f"https://www.last.fm/music/{encoded_artist}")
+
+    for candidate in dict.fromkeys(candidates):
+        html_text = fetch_lastfm_html(candidate)
+        image_url = useful_lastfm_image_url(extract_lastfm_artist_page_image(html_text))
+        if image_url:
+            return lastfm_web_image_cache_put(cache_key, image_url)
+
+    # Documented API fallback. Supplying username gives user-context playcount;
+    # Last.fm does not document a preferred-image field here, but the ordinary
+    # image array is still useful when it is not the historical placeholder.
+    try:
+        payload = lastfm_json_request(
+            {
+                "method": "artist.getInfo",
+                "artist": artist_name,
+                "username": str(username or LASTFM_PROFILE_USERNAME).strip(),
+                "autocorrect": 1,
+            }
+        )
+        artist_info = payload.get("artist") if isinstance(payload.get("artist"), dict) else {}
+        image_url = useful_lastfm_image_url(best_lastfm_image_url(artist_info.get("image")))
+        if image_url:
+            return lastfm_web_image_cache_put(cache_key, image_url)
+    except Exception:
+        pass
+
+    return lastfm_web_image_cache_put(cache_key, "")
+
+
+def lastfm_track_album_image_url(artist: str, track: str, track_url: str = "") -> tuple[str, str]:
+    artist_name = str(artist or "").strip()
+    track_name = str(track or "").strip()
+    if not artist_name or not track_name:
+        return "", ""
+    cache_key = f"track::{artist_name.casefold()}::{track_name.casefold()}"
+    cached = lastfm_web_image_cache_get(cache_key)
+    if cached is not None:
+        if "\u241f" in cached:
+            image_url, album_name = cached.split("\u241f", 1)
+            return image_url, album_name
+        return cached, ""
+
+    image_url = ""
+    album_name = ""
+    try:
+        payload = lastfm_json_request(
+            {
+                "method": "track.getInfo",
+                "artist": artist_name,
+                "track": track_name,
+                "username": LASTFM_PROFILE_USERNAME,
+            }
+        )
+        track_info = payload.get("track") if isinstance(payload.get("track"), dict) else {}
+        album_info = track_info.get("album") if isinstance(track_info.get("album"), dict) else {}
+        image_url = best_lastfm_image_url(album_info.get("image"))
+        album_name = str(album_info.get("title") or "").strip()
+    except Exception:
+        pass
+
+    if not image_url:
+        candidate = str(track_url or "").strip()
+        if candidate.startswith("http://www.last.fm/"):
+            candidate = "https://www.last.fm/" + candidate[len("http://www.last.fm/"):]
+        if not candidate.startswith("https://www.last.fm/"):
+            encoded_artist = lastfm_music_path_component(artist_name)
+            encoded_track = lastfm_music_path_component(track_name)
+            candidate = f"https://www.last.fm/music/{encoded_artist}/_/{encoded_track}"
+        image_url = extract_lastfm_header_image(fetch_lastfm_html(candidate))
+
+    lastfm_web_image_cache_put(cache_key, f"{image_url}\u241f{album_name}")
+    return image_url, album_name
+
+
+def enrich_lastfm_chart_images(username: str, mode: str, items: list[dict[str, Any]]) -> None:
+    if not items:
+        return
+
+    if mode == "artists":
+        # Artist photos are deliberately resolved lazily by /api/lastfm-artist-image
+        # as their tiles enter the browser viewport. Resolving hundreds or 1,000
+        # public Last.fm artist pages here would make the chart request block for
+        # far too long.
+        for item in items:
+            item["image"] = ""
+        return
+
+    missing = [item for item in items if not useful_lastfm_image_url(item.get("image"))]
+    if not missing:
+        return
+
+    def resolve_song(item: dict[str, Any]) -> tuple[str, str]:
+        return lastfm_track_album_image_url(
+            str(item.get("artist") or ""),
+            str(item.get("title") or ""),
+            str(item.get("url") or ""),
+        )
+
+    workers = min(8, len(missing))
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [(item, pool.submit(resolve_song, item)) for item in missing]
+        for item, future in futures:
+            try:
+                image_url, album_name = future.result()
+            except Exception:
+                image_url, album_name = "", ""
+            if image_url:
+                item["image"] = image_url
+                item["imageSource"] = "Last.fm album/release page"
+            if album_name and not str(item.get("album") or "").strip():
+                item["album"] = album_name
+
+
+
+def lastfm_text_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("name") or value.get("#text") or "").strip()
+    return str(value or "").strip()
+
+
+def lastfm_int_value(value: Any, fallback: int = 0) -> int:
+    try:
+        return int(str(value or fallback).strip())
+    except (TypeError, ValueError):
+        return fallback
+
+
+def lastfm_recent_track_rows(
+    username: str,
+    from_ts: int | None = None,
+    to_ts: int | None = None,
+    max_scrobbles: int = LASTFM_RECENT_MAX_SCROBBLES,
+) -> tuple[list[dict[str, Any]], bool]:
+    rows: list[dict[str, Any]] = []
+    page = 1
+    truncated = False
+
+    while len(rows) < max_scrobbles:
+        params: dict[str, Any] = {
+            "method": "user.getRecentTracks",
+            "user": username,
+            "limit": 200,
+            "page": page,
+            "extended": 0,
+        }
+        if from_ts is not None:
+            params["from"] = int(from_ts)
+        if to_ts is not None:
+            params["to"] = int(to_ts)
+
+        payload = lastfm_json_request(params)
+        recent = payload.get("recenttracks") if isinstance(payload.get("recenttracks"), dict) else {}
+        raw_tracks = recent.get("track")
+        if isinstance(raw_tracks, dict):
+            raw_tracks = [raw_tracks]
+        if not isinstance(raw_tracks, list):
+            raw_tracks = []
+
+        for raw in raw_tracks:
+            if not isinstance(raw, dict):
+                continue
+            attrs = raw.get("@attr") if isinstance(raw.get("@attr"), dict) else {}
+            now_playing = str(attrs.get("nowplaying") or "").lower() == "true"
+            date_data = raw.get("date") if isinstance(raw.get("date"), dict) else {}
+            uts = lastfm_int_value(date_data.get("uts"), 0)
+            artist = lastfm_text_value(raw.get("artist"))
+            track_name = str(raw.get("name") or "").strip()
+            album = lastfm_text_value(raw.get("album"))
+            if not artist or not track_name:
+                continue
+            rows.append(
+                {
+                    "artist": artist,
+                    "track": track_name,
+                    "album": album,
+                    "image": best_lastfm_image_url(raw.get("image")),
+                    "url": str(raw.get("url") or "").strip(),
+                    "timestamp": uts,
+                    "nowPlaying": now_playing,
+                }
+            )
+            if len(rows) >= max_scrobbles:
+                truncated = True
+                break
+
+        attrs = recent.get("@attr") if isinstance(recent.get("@attr"), dict) else {}
+        total_pages = max(1, lastfm_int_value(attrs.get("totalPages"), 1))
+        if page >= total_pages or not raw_tracks or truncated:
+            break
+        page += 1
+
+    return rows, truncated
+
+
+def lastfm_period_bounds(period: str, custom_from: int | None = None, custom_to: int | None = None) -> tuple[int | None, int | None]:
+    now_ts = int(time.time())
+    if period == "1day":
+        return now_ts - 24 * 60 * 60, now_ts
+    if period == "14day":
+        return now_ts - 14 * 24 * 60 * 60, now_ts
+    if period == "custom":
+        return custom_from, custom_to
+    return None, None
+
+
+def lastfm_direct_period(period: str) -> str | None:
+    return {
+        "7day": "7day",
+        "1month": "1month",
+        "3month": "3month",
+        "6month": "6month",
+        "12month": "12month",
+        "overall": "overall",
+    }.get(period)
+
+
+def lastfm_direct_chart(username: str, mode: str, period: str, limit: int) -> list[dict[str, Any]]:
+    method_map = {
+        "albums": ("user.getTopAlbums", "topalbums", "album"),
+        "songs": ("user.getTopTracks", "toptracks", "track"),
+        "artists": ("user.getTopArtists", "topartists", "artist"),
+    }
+    method, root_key, item_key = method_map[mode]
+    requested = min(LASTFM_CHART_MAX_ITEMS, max(1, int(limit)))
+    items: list[dict[str, Any]] = []
+    page = 1
+
+    # The top-chart methods expose page + limit. Use conservative 100-item pages
+    # rather than relying on an undocumented very-large per-page limit.
+    while len(items) < requested:
+        per_page = min(100, requested - len(items))
+        payload = lastfm_json_request(
+            {
+                "method": method,
+                "user": username,
+                "period": period,
+                "limit": per_page,
+                "page": page,
+            }
+        )
+        root = payload.get(root_key) if isinstance(payload.get(root_key), dict) else {}
+        raw_items = root.get(item_key)
+        if isinstance(raw_items, dict):
+            raw_items = [raw_items]
+        if not isinstance(raw_items, list) or not raw_items:
+            break
+
+        before = len(items)
+        for raw in raw_items:
+            if len(items) >= requested:
+                break
+            if not isinstance(raw, dict):
+                continue
+            playcount = max(0, lastfm_int_value(raw.get("playcount"), 0))
+            image = best_lastfm_image_url(raw.get("image"))
+            if mode == "albums":
+                title = str(raw.get("name") or "").strip()
+                artist = lastfm_text_value(raw.get("artist"))
+                album = title
+            elif mode == "songs":
+                title = str(raw.get("name") or "").strip()
+                artist = lastfm_text_value(raw.get("artist"))
+                album = ""
+            else:
+                artist = str(raw.get("name") or "").strip()
+                title = artist
+                album = ""
+            if not title:
+                continue
+            items.append(
+                {
+                    "rank": len(items) + 1,
+                    "artist": artist,
+                    "title": title,
+                    "album": album,
+                    "playcount": playcount,
+                    "image": image,
+                    "url": str(raw.get("url") or "").strip(),
+                    "timestamp": 0,
+                    "nowPlaying": False,
+                }
+            )
+
+        attrs = root.get("@attr") if isinstance(root.get("@attr"), dict) else {}
+        total_pages = max(1, lastfm_int_value(attrs.get("totalPages"), page))
+        if page >= total_pages or len(items) == before or len(raw_items) < per_page:
+            break
+        page += 1
+
+    return items
+
+
+
+def lastfm_weekly_chart_cache_key(username: str, mode: str, from_ts: int, to_ts: int) -> str:
+    return f"{username.casefold()}\u241f{mode}\u241f{int(from_ts)}\u241f{int(to_ts)}"
+
+
+def lastfm_weekly_chart_cache_get(username: str, mode: str, from_ts: int, to_ts: int) -> list[dict[str, Any]] | None:
+    key = lastfm_weekly_chart_cache_key(username, mode, from_ts, to_ts)
+    now = time.time()
+    with LASTFM_WEEKLY_CHART_CACHE_LOCK:
+        cached = LASTFM_WEEKLY_CHART_CACHE.get(key)
+        if not isinstance(cached, dict):
+            return None
+        if now - float(cached.get("timestamp") or 0) >= LASTFM_WEEKLY_CHART_CACHE_TTL_SECONDS:
+            LASTFM_WEEKLY_CHART_CACHE.pop(key, None)
+            return None
+        items = cached.get("items")
+        if not isinstance(items, list):
+            return None
+        return [dict(item) for item in items if isinstance(item, dict)]
+
+
+def lastfm_weekly_chart_cache_put(
+    username: str,
+    mode: str,
+    from_ts: int,
+    to_ts: int,
+    items: list[dict[str, Any]],
+) -> None:
+    key = lastfm_weekly_chart_cache_key(username, mode, from_ts, to_ts)
+    with LASTFM_WEEKLY_CHART_CACHE_LOCK:
+        LASTFM_WEEKLY_CHART_CACHE[key] = {
+            "timestamp": time.time(),
+            "items": [dict(item) for item in items if isinstance(item, dict)],
+        }
+        if len(LASTFM_WEEKLY_CHART_CACHE) > LASTFM_WEEKLY_CHART_CACHE_MAX_ITEMS:
+            oldest_keys = sorted(
+                LASTFM_WEEKLY_CHART_CACHE,
+                key=lambda cache_key: float(
+                    (LASTFM_WEEKLY_CHART_CACHE.get(cache_key) or {}).get("timestamp") or 0
+                ),
+            )
+            remove_count = max(
+                1,
+                len(LASTFM_WEEKLY_CHART_CACHE) - LASTFM_WEEKLY_CHART_CACHE_MAX_ITEMS,
+            )
+            for cache_key in oldest_keys[:remove_count]:
+                LASTFM_WEEKLY_CHART_CACHE.pop(cache_key, None)
+
+
+def lastfm_weekly_chart_ranges(username: str) -> list[tuple[int, int]]:
+    payload = lastfm_json_request(
+        {
+            "method": "user.getWeeklyChartList",
+            "user": username,
+        }
+    )
+    root = payload.get("weeklychartlist") if isinstance(payload.get("weeklychartlist"), dict) else {}
+    raw_charts = root.get("chart")
+    if isinstance(raw_charts, dict):
+        raw_charts = [raw_charts]
+    if not isinstance(raw_charts, list):
+        return []
+
+    ranges: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for raw in raw_charts:
+        if not isinstance(raw, dict):
+            continue
+        start = lastfm_int_value(raw.get("from"), 0)
+        end = lastfm_int_value(raw.get("to"), 0)
+        if start <= 0 or end <= start:
+            continue
+        pair = (start, end)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        ranges.append(pair)
+
+    ranges.sort(key=lambda pair: (pair[0], pair[1]))
+    return ranges
+
+
+def lastfm_weekly_chart_items(
+    username: str,
+    mode: str,
+    from_ts: int,
+    to_ts: int,
+) -> list[dict[str, Any]]:
+    cached = lastfm_weekly_chart_cache_get(username, mode, from_ts, to_ts)
+    if cached is not None:
+        return cached
+
+    method_map = {
+        "albums": ("user.getWeeklyAlbumChart", "weeklyalbumchart", "album"),
+        "songs": ("user.getWeeklyTrackChart", "weeklytrackchart", "track"),
+        "artists": ("user.getWeeklyArtistChart", "weeklyartistchart", "artist"),
+    }
+    method, root_key, item_key = method_map[mode]
+    payload = lastfm_json_request(
+        {
+            "method": method,
+            "user": username,
+            "from": int(from_ts),
+            "to": int(to_ts),
+        }
+    )
+    root = payload.get(root_key) if isinstance(payload.get(root_key), dict) else {}
+    raw_items = root.get(item_key)
+    if isinstance(raw_items, dict):
+        raw_items = [raw_items]
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    items: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        playcount = max(0, lastfm_int_value(raw.get("playcount"), 0))
+        if playcount <= 0:
+            continue
+
+        image = best_lastfm_image_url(raw.get("image"))
+        if mode == "artists":
+            artist = str(raw.get("name") or "").strip()
+            title = artist
+            album = ""
+        elif mode == "albums":
+            title = str(raw.get("name") or "").strip()
+            artist = lastfm_text_value(raw.get("artist"))
+            album = title
+        else:
+            title = str(raw.get("name") or "").strip()
+            artist = lastfm_text_value(raw.get("artist"))
+            album = ""
+
+        if not title:
+            continue
+        items.append(
+            {
+                "artist": artist,
+                "title": title,
+                "album": album,
+                "playcount": playcount,
+                "image": image,
+                "url": str(raw.get("url") or "").strip(),
+                "timestamp": int(to_ts),
+                "nowPlaying": False,
+            }
+        )
+
+    lastfm_weekly_chart_cache_put(username, mode, from_ts, to_ts, items)
+    return items
+
+
+def lastfm_merge_counted_items(
+    buckets: dict[str, dict[str, Any]],
+    items: list[dict[str, Any]],
+    mode: str,
+) -> None:
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        artist = str(raw.get("artist") or "").strip()
+        title = str(raw.get("title") or "").strip()
+        album = str(raw.get("album") or "").strip()
+        playcount = max(0, lastfm_int_value(raw.get("playcount"), 0))
+        if playcount <= 0:
+            continue
+
+        if mode == "artists":
+            key = artist.casefold()
+            display_title = artist
+        else:
+            key = f"{artist.casefold()}\u241f{title.casefold()}"
+            display_title = title
+        if not key or not display_title:
+            continue
+
+        item = buckets.setdefault(
+            key,
+            {
+                "artist": artist,
+                "title": display_title,
+                "album": album if mode != "artists" else "",
+                "playcount": 0,
+                "image": str(raw.get("image") or ""),
+                "url": str(raw.get("url") or ""),
+                "timestamp": lastfm_int_value(raw.get("timestamp"), 0),
+                "nowPlaying": False,
+            },
+        )
+        item["playcount"] += playcount
+
+        raw_ts = lastfm_int_value(raw.get("timestamp"), 0)
+        if raw_ts >= lastfm_int_value(item.get("timestamp"), 0):
+            item["timestamp"] = raw_ts
+            if raw.get("image"):
+                item["image"] = str(raw.get("image") or "")
+            if raw.get("url"):
+                item["url"] = str(raw.get("url") or "")
+            if mode != "artists" and album:
+                item["album"] = album
+
+
+def lastfm_recent_rows_as_counted_items(rows: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
+    counted: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("nowPlaying"):
+            continue
+        artist = str(row.get("artist") or "").strip()
+        track = str(row.get("track") or "").strip()
+        album = str(row.get("album") or "").strip()
+
+        if mode == "albums":
+            if not album:
+                continue
+            title = album
+        elif mode == "songs":
+            if not track:
+                continue
+            title = track
+        else:
+            if not artist:
+                continue
+            title = artist
+
+        counted.append(
+            {
+                "artist": artist,
+                "title": title,
+                "album": album if mode != "artists" else "",
+                "playcount": 1,
+                "image": str(row.get("image") or ""),
+                "url": str(row.get("url") or ""),
+                "timestamp": lastfm_int_value(row.get("timestamp"), 0),
+                "nowPlaying": False,
+            }
+        )
+    return counted
+
+
+def lastfm_uncovered_ranges(
+    from_ts: int,
+    to_ts: int,
+    covered_ranges: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    cursor = int(from_ts)
+    end_limit = int(to_ts)
+    gaps: list[tuple[int, int]] = []
+
+    for start, end in sorted(covered_ranges, key=lambda pair: (pair[0], pair[1])):
+        if end < cursor:
+            continue
+        if start > end_limit:
+            break
+        if start > cursor:
+            gaps.append((cursor, min(end_limit, start - 1)))
+        cursor = max(cursor, end + 1)
+        if cursor > end_limit:
+            break
+
+    if cursor <= end_limit:
+        gaps.append((cursor, end_limit))
+
+    return [(start, end) for start, end in gaps if end >= start]
+
+
+def lastfm_custom_aggregate_weekly(
+    username: str,
+    mode: str,
+    from_ts: int,
+    to_ts: int,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int, bool, int, int]:
+    """
+    Build a long custom-range chart without paging through every raw scrobble.
+
+    Last.fm exposes historical weekly chart ranges explicitly. For complete weeks
+    inside the requested custom interval, fetch the already-aggregated weekly
+    artist/album/track chart. Only the partial edge ranges (and any week whose
+    weekly-chart request ultimately fails) fall back to recent-track pagination.
+
+    Returns:
+        items,
+        sampled_recent_scrobbles,
+        recent_fallback_truncated,
+        weekly_ranges_used,
+        weekly_ranges_failed
+    """
+    available_ranges = lastfm_weekly_chart_ranges(username)
+    complete_ranges = [
+        (start, end)
+        for start, end in available_ranges
+        if start >= int(from_ts) and end <= int(to_ts)
+    ]
+
+    # If there is no complete historical week in the requested window, the
+    # existing recent-track path is simpler and exact.
+    if not complete_ranges:
+        rows, truncated = lastfm_recent_track_rows(
+            username,
+            int(from_ts),
+            int(to_ts),
+            max_scrobbles=LASTFM_RECENT_MAX_SCROBBLES,
+        )
+        return (
+            lastfm_aggregate_recent(rows, mode, limit),
+            len(rows),
+            truncated,
+            0,
+            0,
+        )
+
+    buckets: dict[str, dict[str, Any]] = {}
+    failed_ranges: list[tuple[int, int]] = []
+
+    # Fetch the historical weekly aggregates concurrently, but keep the worker
+    # count deliberately modest to remain friendly to Last.fm's API.
+    max_workers = min(4, max(1, len(complete_ranges)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_rows = [
+            (
+                date_range,
+                pool.submit(
+                    lastfm_weekly_chart_items,
+                    username,
+                    mode,
+                    date_range[0],
+                    date_range[1],
+                ),
+            )
+            for date_range in complete_ranges
+        ]
+        for date_range, future in future_rows:
+            try:
+                weekly_items = future.result()
+            except Exception:
+                failed_ranges.append(date_range)
+                continue
+            lastfm_merge_counted_items(buckets, weekly_items, mode)
+
+    successful_ranges = [
+        date_range for date_range in complete_ranges if date_range not in set(failed_ranges)
+    ]
+    fallback_ranges = lastfm_uncovered_ranges(
+        int(from_ts),
+        int(to_ts),
+        successful_ranges,
+    )
+
+    sampled_recent = 0
+    truncated = False
+    for gap_from, gap_to in fallback_ranges:
+        rows, gap_truncated = lastfm_recent_track_rows(
+            username,
+            gap_from,
+            gap_to,
+            max_scrobbles=LASTFM_RECENT_MAX_SCROBBLES,
+        )
+        sampled_recent += len(rows)
+        truncated = truncated or gap_truncated
+        lastfm_merge_counted_items(
+            buckets,
+            lastfm_recent_rows_as_counted_items(rows, mode),
+            mode,
+        )
+
+    ordered = sorted(
+        buckets.values(),
+        key=lambda item: (
+            -lastfm_int_value(item.get("playcount"), 0),
+            -lastfm_int_value(item.get("timestamp"), 0),
+            str(item.get("title") or "").casefold(),
+        ),
+    )
+    final_items = ordered[:limit]
+    for index, item in enumerate(final_items, start=1):
+        item["rank"] = index
+
+    return (
+        final_items,
+        sampled_recent,
+        truncated,
+        len(successful_ranges),
+        len(failed_ranges),
+    )
+
+
+def lastfm_aggregate_recent(rows: list[dict[str, Any]], mode: str, limit: int) -> list[dict[str, Any]]:
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row.get("nowPlaying"):
+            # Current playback has not been scrobbled yet, so it should not add to
+            # a most-listened count.
+            continue
+        artist = str(row.get("artist") or "").strip()
+        track = str(row.get("track") or "").strip()
+        album = str(row.get("album") or "").strip()
+        if mode == "albums":
+            if not album:
+                continue
+            key = f"{artist.casefold()}\u241f{album.casefold()}"
+            title = album
+        elif mode == "songs":
+            key = f"{artist.casefold()}\u241f{track.casefold()}"
+            title = track
+        else:
+            key = artist.casefold()
+            title = artist
+        if not key or not title:
+            continue
+        item = buckets.setdefault(
+            key,
+            {
+                "artist": artist,
+                "title": title,
+                "album": album if mode != "artists" else "",
+                "playcount": 0,
+                "image": str(row.get("image") or ""),
+                "url": str(row.get("url") or ""),
+                "timestamp": lastfm_int_value(row.get("timestamp"), 0),
+                "nowPlaying": False,
+            },
+        )
+        item["playcount"] += 1
+        row_ts = lastfm_int_value(row.get("timestamp"), 0)
+        if row_ts >= lastfm_int_value(item.get("timestamp"), 0):
+            item["timestamp"] = row_ts
+            if row.get("image"):
+                item["image"] = str(row.get("image") or "")
+            if row.get("url"):
+                item["url"] = str(row.get("url") or "")
+            if mode == "artists" and album:
+                item["album"] = album
+
+    ordered = sorted(
+        buckets.values(),
+        key=lambda item: (-lastfm_int_value(item.get("playcount"), 0), -lastfm_int_value(item.get("timestamp"), 0), str(item.get("title") or "").casefold()),
+    )
+    for index, item in enumerate(ordered[:limit], start=1):
+        item["rank"] = index
+    return ordered[:limit]
+
+
+def lastfm_recent_items(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for raw in rows[:limit]:
+        artist = str(raw.get("artist") or "").strip()
+        track = str(raw.get("track") or "").strip()
+        if not artist or not track:
+            continue
+        items.append(
+            {
+                "rank": len(items) + 1,
+                "artist": artist,
+                "title": track,
+                "album": str(raw.get("album") or "").strip(),
+                "playcount": 1,
+                "image": str(raw.get("image") or ""),
+                "url": str(raw.get("url") or ""),
+                "timestamp": lastfm_int_value(raw.get("timestamp"), 0),
+                "nowPlaying": bool(raw.get("nowPlaying")),
+            }
+        )
+    return items
+
+
+@app.route("/api/lastfm-artist-image", methods=["GET"])
+def api_lastfm_artist_image():
+    username = str(request.args.get("user") or LASTFM_PROFILE_USERNAME).strip() or LASTFM_PROFILE_USERNAME
+    if username.casefold() != LASTFM_PROFILE_USERNAME.casefold():
+        return "Unknown Last.fm profile.", 400
+
+    artist = str(request.args.get("artist") or "").strip()
+    artist_url = str(request.args.get("url") or "").strip()
+    if not artist:
+        return "Artist is required.", 400
+
+    image_url = lastfm_artist_image_url(username, artist, artist_url)
+    if not image_url:
+        return "Artist image was not found.", 404
+
+    response = redirect(image_url, code=302)
+    # Artist-image choice may change independently of the chart. Avoid pinning a
+    # bad redirect (such as the former profile-avatar result) in the browser.
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+@app.route("/api/lastfm-cover-options", methods=["GET"])
+def api_lastfm_cover_options():
+    admin_error = require_topster_admin_response()
+    if admin_error is not None:
+        return admin_error
+
+    username = str(request.args.get("user") or LASTFM_PROFILE_USERNAME).strip() or LASTFM_PROFILE_USERNAME
+    if username.casefold() != LASTFM_PROFILE_USERNAME.casefold():
+        return jsonify({"ok": False, "error": "Unknown Last.fm profile."}), 400
+
+    mode = str(request.args.get("mode") or "albums").strip().lower()
+    if mode not in {"albums", "songs", "artists", "recent"}:
+        return jsonify({"ok": False, "error": "Unsupported Last.fm display mode."}), 400
+
+    artist = str(request.args.get("artist") or "").strip()
+    title = str(request.args.get("title") or "").strip()
+    album = str(request.args.get("album") or "").strip()
+    item_url = str(request.args.get("url") or "").strip()
+    if not artist and not title:
+        return jsonify({"ok": False, "error": "Artist or title is required."}), 400
+
+    # Top-track responses do not always include the album name. Resolve it with
+    # Last.fm's own API so the picker can also inspect the corresponding release
+    # page; no non-Last.fm image provider is queried here.
+    if mode in {"songs", "recent"} and artist and title and not album:
+        try:
+            payload = lastfm_json_request(
+                {
+                    "method": "track.getInfo",
+                    "artist": artist,
+                    "track": title,
+                    "username": username,
+                }
+            )
+            track_info = payload.get("track") if isinstance(payload.get("track"), dict) else {}
+            album_info = track_info.get("album") if isinstance(track_info.get("album"), dict) else {}
+            album = str(album_info.get("title") or "").strip()
+        except Exception:
+            pass
+
+    source_pages = lastfm_cover_option_pages(mode, artist, title, album, item_url)
+    image_urls: list[str] = []
+    for page_url in source_pages:
+        html_text = fetch_lastfm_html(page_url)
+        for image_url in extract_lastfm_page_image_candidates(
+            html_text,
+            include_artist_gallery=(mode == "artists"),
+            limit=24,
+        ):
+            if image_url not in image_urls:
+                image_urls.append(image_url)
+        if len(image_urls) >= 24:
+            break
+
+    # Last.fm API image arrays are a legitimate final Last.fm-only fallback when
+    # the public page markup exposes no usable hero image.
+    if not image_urls:
+        try:
+            if mode == "artists":
+                payload = lastfm_json_request({"method": "artist.getInfo", "artist": artist or title, "username": username})
+                info = payload.get("artist") if isinstance(payload.get("artist"), dict) else {}
+                fallback = best_lastfm_image_url(info.get("image"))
+            elif mode == "albums":
+                release = album or title
+                payload = lastfm_json_request({"method": "album.getInfo", "artist": artist, "album": release, "username": username})
+                info = payload.get("album") if isinstance(payload.get("album"), dict) else {}
+                fallback = best_lastfm_image_url(info.get("image"))
+            else:
+                payload = lastfm_json_request({"method": "track.getInfo", "artist": artist, "track": title, "username": username})
+                track_info = payload.get("track") if isinstance(payload.get("track"), dict) else {}
+                album_info = track_info.get("album") if isinstance(track_info.get("album"), dict) else {}
+                fallback = best_lastfm_image_url(album_info.get("image"))
+            fallback = useful_lastfm_image_url(fallback)
+            if fallback:
+                image_urls.append(fallback)
+        except Exception:
+            pass
+
+    return jsonify(
+        {
+            "ok": True,
+            "mode": mode,
+            "artist": artist,
+            "title": title,
+            "album": album,
+            "sourcePages": source_pages,
+            "candidates": [
+                {"imageSrc": url, "source": "Last.fm", "href": source_pages[0] if source_pages else ""}
+                for url in image_urls[:24]
+            ],
+        }
+    )
+
+
+@app.route("/api/lastfm-chart", methods=["GET"])
+def api_lastfm_chart():
+    restricted = require_topster_admin_response()
+    if restricted is not None:
+        return restricted
+
+    username = str(request.args.get("user") or LASTFM_PROFILE_USERNAME).strip() or LASTFM_PROFILE_USERNAME
+    if username.casefold() != LASTFM_PROFILE_USERNAME.casefold():
+        return jsonify({"ok": False, "error": "Only the configured Last.fm profile is available."}), 400
+
+    mode = str(request.args.get("mode") or "albums").strip().lower()
+    period = str(request.args.get("period") or "7day").strip().lower()
+    if mode not in {"albums", "songs", "artists", "recent"}:
+        return jsonify({"ok": False, "error": "Unknown Last.fm chart mode."}), 400
+    if period not in {"1day", "7day", "14day", "1month", "3month", "6month", "12month", "overall", "custom"}:
+        return jsonify({"ok": False, "error": "Unknown Last.fm period."}), 400
+
+    limit = min(LASTFM_CHART_MAX_ITEMS, max(1, lastfm_int_value(request.args.get("limit"), 100)))
+    custom_from = lastfm_int_value(request.args.get("from"), 0) or None
+    custom_to = lastfm_int_value(request.args.get("to"), 0) or None
+    if period == "custom":
+        if custom_from is None or custom_to is None or custom_from >= custom_to:
+            return jsonify({"ok": False, "error": "Custom Last.fm windows require a valid start and end time."}), 400
+
+    try:
+        direct_period = lastfm_direct_period(period)
+        truncated = False
+        sampled_scrobbles = 0
+        weekly_ranges_used = 0
+        weekly_ranges_failed = 0
+
+        if mode != "recent" and direct_period:
+            items = lastfm_direct_chart(username, mode, direct_period, limit)
+            source = "Last.fm top chart"
+        elif mode != "recent" and period == "custom":
+            (
+                items,
+                sampled_scrobbles,
+                truncated,
+                weekly_ranges_used,
+                weekly_ranges_failed,
+            ) = lastfm_custom_aggregate_weekly(
+                username,
+                mode,
+                int(custom_from),
+                int(custom_to),
+                limit,
+            )
+            source = "Last.fm weekly-chart aggregation"
+        else:
+            from_ts, to_ts = lastfm_period_bounds(period, custom_from, custom_to)
+            recent_cap = limit if mode == "recent" else LASTFM_RECENT_MAX_SCROBBLES
+            rows, truncated = lastfm_recent_track_rows(username, from_ts, to_ts, max_scrobbles=recent_cap)
+            sampled_scrobbles = len(rows)
+            if mode == "recent":
+                items = lastfm_recent_items(rows, limit)
+                # Reaching the requested display limit is normal for Recently Played;
+                # only aggregate modes need to report the 50k safety cap.
+                truncated = False
+                source = "Last.fm recent tracks"
+            else:
+                items = lastfm_aggregate_recent(rows, mode, limit)
+                source = "Last.fm recent-track aggregation"
+
+        enrich_lastfm_chart_images(username, mode, items)
+
+        return jsonify(
+            {
+                "ok": True,
+                "user": username,
+                "mode": mode,
+                "period": period,
+                "from": custom_from if period == "custom" else lastfm_period_bounds(period)[0],
+                "to": custom_to if period == "custom" else lastfm_period_bounds(period)[1],
+                "items": items,
+                "itemCount": len(items),
+                "sampledScrobbles": sampled_scrobbles,
+                "truncated": truncated,
+                "weeklyRangesUsed": weekly_ranges_used,
+                "weeklyRangesFailed": weekly_ranges_failed,
+                "source": source,
+                "generatedAt": int(time.time()),
+            }
+        )
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 502
 
 
 def lookup_lastfm_local_album_art(track: dict[str, Any]) -> dict[str, str] | None:
@@ -2353,6 +5754,13 @@ def spotify_current_track_snapshot(playback: dict[str, Any] | None) -> dict[str,
 
     album = item.get("album") if isinstance(item.get("album"), dict) else {}
     album_name = str(album.get("name") or local_metadata.get("album") or "").strip()
+    album_artists = [
+        str(artist.get("name") or "").strip()
+        for artist in (album.get("artists") or [])
+        if isinstance(artist, dict) and str(artist.get("name") or "").strip()
+    ]
+    if not album_artists:
+        album_artists = list(artists)
     album_images = album.get("images") if isinstance(album.get("images"), list) else []
     best_image = best_spotify_image(album_images)
     cover_url = str((best_image or {}).get("url") or "").strip()
@@ -2374,6 +5782,10 @@ def spotify_current_track_snapshot(playback: dict[str, Any] | None) -> dict[str,
             ]
         )
 
+    playback_context = playback.get("context") if isinstance(playback.get("context"), dict) else {}
+    context_uri = str(playback_context.get("uri") or "").strip()
+    context_type = str(playback_context.get("type") or "").strip()
+
     return {
         "key": track_key,
         "id": item.get("id"),
@@ -2381,7 +5793,13 @@ def spotify_current_track_snapshot(playback: dict[str, Any] | None) -> dict[str,
         "title": title,
         "artists": artists,
         "artist": ", ".join(artists) or "Unknown artist",
+        "albumArtists": album_artists,
+        "albumArtist": ", ".join(album_artists) or (", ".join(artists) or "Unknown artist"),
         "album": album_name or "Unknown album",
+        "albumId": album.get("id"),
+        "albumUri": str(album.get("uri") or "").strip(),
+        "contextUri": context_uri,
+        "contextType": context_type,
         "coverUrl": cover_url,
         "artworkSource": "spotify" if cover_url else "",
         "spotifyUrl": spotify_url,
@@ -2437,7 +5855,11 @@ def build_genius_song_payload(song: dict[str, Any]) -> dict[str, Any]:
 
 
 def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
-    cache_key = str(track.get("key") or "")
+    manual_result = lookup_genius_song_from_manual_album_link(track)
+    if manual_result is not None:
+        return manual_result
+
+    cache_key = f"v{GENIUS_LOOKUP_CACHE_VERSION}::" + str(track.get("key") or "")
     now = time.time()
 
     with GENIUS_LOOKUP_CACHE_LOCK:
@@ -2452,16 +5874,42 @@ def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
     album_name = str(track.get("album") or "").strip()
     primary_artist = artists[0] if artists else ""
 
-    queries = [" ".join(part for part in (title, primary_artist) if part).strip()]
     cleaned_title = clean_lyrics_track_title(title)
+    cleaned_album = clean_lyrics_album_title(album_name)
+    exact_query = " ".join(part for part in (title, primary_artist) if part).strip()
     cleaned_query = " ".join(part for part in (cleaned_title, primary_artist) if part).strip()
-    if cleaned_query and cleaned_query not in queries:
-        queries.append(cleaned_query)
+    album_query = " ".join(
+        part for part in (cleaned_title, primary_artist, cleaned_album) if part
+    ).strip()
+
+    title_was_simplified = (
+        normalize_lyrics_match_text(cleaned_title)
+        != normalize_lyrics_match_text(title)
+    )
+    album_was_simplified = (
+        normalize_lyrics_match_text(cleaned_album)
+        != normalize_lyrics_match_text(album_name)
+    )
+    versioned_track = title_was_simplified or album_was_simplified
+
+    queries: list[str] = []
+    def add_query(value: str) -> None:
+        query = str(value or "").strip()
+        if query and query not in queries:
+            queries.append(query)
+
+    # For live/remastered Spotify tracks, ask Genius for the base song + album
+    # identity first. This makes "Deuce ... 2025 Remaster" favor the Alive! page
+    # instead of a studio Deuce result or a remaster metadata stub.
+    if versioned_track:
+        add_query(album_query)
+    add_query(exact_query)
+    add_query(cleaned_query)
+    if not versioned_track:
+        add_query(album_query)
 
     candidates: dict[int, dict[str, Any]] = {}
-    for query in queries[:2]:
-        if not query:
-            continue
+    for query in queries[:3]:
         payload = genius_search_request(query)
         for song in genius_song_hits(payload):
             try:
@@ -2470,13 +5918,15 @@ def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
                 continue
             candidates[song_id] = song
         if candidates:
-            # A second query is useful only when the exact Spotify title did not
-            # produce plausible candidates.
             best_now = max(
                 score_genius_song_match(song, title, artists, album_name)
                 for song in candidates.values()
             )
-            if best_now >= 90:
+            # Normal tracks keep the fast one-query path. Versioned/live tracks
+            # require a stronger match before short-circuiting so a generic studio
+            # result cannot prevent the album-specific query from being considered.
+            threshold = 105.0 if versioned_track else 90.0
+            if best_now >= threshold:
                 break
 
     best_song: dict[str, Any] | None = None
@@ -2513,6 +5963,338 @@ def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
             GENIUS_LOOKUP_CACHE.pop(oldest_key, None)
 
     return result
+
+
+
+def lyrics_my_albums_redis_key() -> str:
+    safe_prefix = TOPSTER_REDIS_KEY_PREFIX.strip(":") or "navincitron:topster"
+    return f"{safe_prefix}:lyrics:my-albums"
+
+
+def get_lyrics_github_token() -> str:
+    return normalize_secret_text(os.getenv("LYRICS_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN"))
+
+
+def lyrics_github_repository_parts() -> tuple[str, str] | None:
+    repository = str(LYRICS_GITHUB_REPOSITORY or "").strip().strip("/")
+    if repository.startswith("https://github.com/"):
+        repository = repository[len("https://github.com/"):]
+    if repository.endswith(".git"):
+        repository = repository[:-4]
+    parts = repository.split("/", 1)
+    if len(parts) != 2 or not all(part.strip() for part in parts):
+        return None
+    return parts[0].strip(), parts[1].strip()
+
+
+def lyrics_github_is_configured() -> bool:
+    return lyrics_github_repository_parts() is not None
+
+
+def lyrics_github_contents_url() -> str:
+    parts = lyrics_github_repository_parts()
+    if parts is None:
+        raise RuntimeError(
+            "GitHub score synchronization is not configured. Set LYRICS_GITHUB_REPOSITORY to owner/repository."
+        )
+    owner, repository = parts
+    path = quote(LYRICS_GITHUB_MY_ALBUMS_PATH, safe="/")
+    return f"https://api.github.com/repos/{quote(owner)}/{quote(repository)}/contents/{path}"
+
+
+def lyrics_github_request_json(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    require_token: bool = False,
+) -> dict[str, Any]:
+    token = get_lyrics_github_token()
+    if require_token and not token:
+        raise RuntimeError(
+            "GitHub score saving requires LYRICS_GITHUB_TOKEN (or GITHUB_TOKEN) with Contents read/write access."
+        )
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "navincitron-lyrics-score-sync/1.0",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    github_request = Request(url, data=data, headers=headers, method=method)
+    try:
+        with urlopen(github_request, timeout=12) as github_response:
+            raw = github_response.read().decode("utf-8", errors="replace")
+    except HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        try:
+            detail = (json.loads(body) or {}).get("message") or body
+        except Exception:
+            detail = body
+        detail = str(detail or error.reason or f"HTTP {error.code}").strip()
+        raise RuntimeError(f"GitHub my_albums.txt request failed ({error.code}): {detail}") from error
+    except URLError as error:
+        raise RuntimeError(f"GitHub my_albums.txt request failed: {error.reason}") from error
+
+    if not raw.strip():
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("GitHub returned an invalid JSON response for my_albums.txt.") from error
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def read_lyrics_my_albums_from_github() -> tuple[str, str]:
+    if not lyrics_github_is_configured():
+        raise RuntimeError(
+            "GitHub score synchronization is not configured. Set LYRICS_GITHUB_REPOSITORY to owner/repository."
+        )
+    url = lyrics_github_contents_url() + "?" + urlencode({"ref": LYRICS_GITHUB_BRANCH})
+    payload = lyrics_github_request_json(url)
+    encoded = str(payload.get("content") or "").replace("\n", "")
+    if not encoded:
+        raise RuntimeError(
+            f"GitHub did not return {LYRICS_GITHUB_MY_ALBUMS_PATH} from branch {LYRICS_GITHUB_BRANCH}."
+        )
+    try:
+        text = base64.b64decode(encoded, validate=False).decode("utf-8")
+    except Exception as error:
+        raise RuntimeError("GitHub returned my_albums.txt in an unreadable encoding.") from error
+    return text.replace("\r\n", "\n").replace("\r", "\n"), str(payload.get("sha") or "")
+
+
+def synchronize_lyrics_my_albums_backend_text(text: str) -> tuple[list[str], list[str]]:
+    """Mirror the canonical GitHub text into Redis and the Render runtime file."""
+    written: list[str] = []
+    warnings: list[str] = []
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            warnings.append(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        else:
+            try:
+                client.set(lyrics_my_albums_redis_key(), normalized)
+                written.append("redis")
+            except RedisError as error:
+                warnings.append(f"Lyrics score Redis write failed: {error}")
+
+    try:
+        temp_path = LYRICS_MY_ALBUMS_FILE.with_suffix(LYRICS_MY_ALBUMS_FILE.suffix + ".tmp")
+        temp_path.write_text(normalized, encoding="utf-8")
+        temp_path.replace(LYRICS_MY_ALBUMS_FILE)
+        written.append("file")
+    except OSError as error:
+        warnings.append(f"Could not write runtime {LYRICS_MY_ALBUMS_FILE.name}: {error}")
+
+    return written, warnings
+
+
+def read_lyrics_my_albums_text() -> tuple[str, str, str, list[str]]:
+    """
+    Return score text, source, GitHub revision, and warnings.
+
+    When GitHub synchronization is configured, the repository copy is canonical.
+    This means a desktop edit becomes authoritative after it is committed/pushed to
+    the configured branch; the next Lyrics score read mirrors it into Redis and the
+    Render runtime file automatically.
+    """
+    warnings: list[str] = []
+    if lyrics_github_is_configured():
+        try:
+            text, revision = read_lyrics_my_albums_from_github()
+            _, sync_warnings = synchronize_lyrics_my_albums_backend_text(text)
+            warnings.extend(sync_warnings)
+            return text, "github", revision, warnings
+        except RuntimeError as error:
+            warnings.append(str(error))
+
+    if topster_redis_is_configured():
+        client = get_topster_redis_client()
+        if client is None:
+            warnings.append(TOPSTER_REDIS_CLIENT_ERROR or "Redis is configured but unavailable.")
+        else:
+            try:
+                stored = client.get(lyrics_my_albums_redis_key())
+            except RedisError as error:
+                warnings.append(f"Lyrics score Redis read failed: {error}")
+            else:
+                if stored is not None:
+                    return str(stored), "redis", "", warnings
+
+    if LYRICS_MY_ALBUMS_FILE.exists():
+        try:
+            return LYRICS_MY_ALBUMS_FILE.read_text(encoding="utf-8"), "file", "", warnings
+        except OSError as error:
+            warnings.append(f"Could not read {LYRICS_MY_ALBUMS_FILE.name}: {error}")
+
+    return "", "none", "", warnings
+
+
+def write_lyrics_my_albums_text(text: str, base_revision: str = "") -> tuple[str, str, list[str]]:
+    """
+    Save score text to GitHub first, then mirror that exact committed text to the
+    Lyrics backend stores. GitHub is therefore the canonical copy shared by GitHub
+    Pages, website edits, and later desktop commits.
+    """
+    if not lyrics_github_is_configured():
+        raise RuntimeError(
+            "Score saving is configured to update both GitHub Pages and the Lyrics backend, but "
+            "LYRICS_GITHUB_REPOSITORY is not set."
+        )
+    if not get_lyrics_github_token():
+        raise RuntimeError(
+            "Score saving requires LYRICS_GITHUB_TOKEN (or GITHUB_TOKEN) with Contents read/write access."
+        )
+
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    current_text, current_revision = read_lyrics_my_albums_from_github()
+    requested_base = str(base_revision or "").strip()
+    if requested_base and current_revision and requested_base != current_revision:
+        raise RuntimeError(
+            "my_albums.txt changed on GitHub after this page loaded. Refresh the page before saving so newer desktop/GitHub edits are not overwritten."
+        )
+
+    revision = current_revision
+    if normalized != current_text:
+        body: dict[str, Any] = {
+            "message": "Update my_albums.txt from Lyrics score editor",
+            "content": base64.b64encode(normalized.encode("utf-8")).decode("ascii"),
+            "branch": LYRICS_GITHUB_BRANCH,
+        }
+        if current_revision:
+            body["sha"] = current_revision
+        result = lyrics_github_request_json(
+            lyrics_github_contents_url(),
+            method="PUT",
+            payload=body,
+            require_token=True,
+        )
+        content = result.get("content") if isinstance(result.get("content"), dict) else {}
+        revision = str(content.get("sha") or revision)
+
+    written, warnings = synchronize_lyrics_my_albums_backend_text(normalized)
+    storage_parts = ["github", *written]
+    return "+".join(dict.fromkeys(storage_parts)), revision, warnings
+
+
+@app.route("/api/lyrics/my-albums", methods=["GET", "PUT"])
+def lyrics_my_albums():
+    if request.method == "PUT":
+        admin_error = require_topster_admin_response()
+        if admin_error is not None:
+            return admin_error
+
+        payload = request.get_json(silent=True) or {}
+        text = payload.get("text")
+        base_revision = str(payload.get("baseRevision") or "").strip()
+        if not isinstance(text, str):
+            return jsonify({"ok": False, "error": "A complete my_albums text string is required."}), 400
+        if len(text.encode("utf-8")) > 2_000_000:
+            return jsonify({"ok": False, "error": "my_albums.txt exceeds the 2 MB edit limit."}), 413
+
+        try:
+            storage, revision, warnings = write_lyrics_my_albums_text(text, base_revision=base_revision)
+        except RuntimeError as error:
+            message = str(error)
+            status_code = 409 if "changed on GitHub after this page loaded" in message else 503
+            return jsonify({"ok": False, "error": message}), status_code
+
+        response = jsonify({
+            "ok": True,
+            "text": text.replace("\r\n", "\n").replace("\r", "\n"),
+            "storage": storage,
+            "revision": revision,
+            "warnings": warnings,
+        })
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    text, storage, revision, warnings = read_lyrics_my_albums_text()
+    response = jsonify({
+        "ok": True,
+        "text": text,
+        "storage": storage,
+        "revision": revision,
+        "warnings": warnings,
+        "githubConfigured": lyrics_github_is_configured(),
+        "githubWritable": bool(lyrics_github_is_configured() and get_lyrics_github_token()),
+        "writable": is_topster_admin(),
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/api/lyrics/genius-album-link", methods=["GET", "POST"])
+def lyrics_genius_album_link():
+    if request.method == "GET":
+        artist = str(request.args.get("artist") or "").strip()
+        album = str(request.args.get("album") or "").strip()
+        if not album:
+            return jsonify({"ok": False, "error": "Album is required."}), 400
+        mapping = read_lyrics_genius_album_link(artist, album)
+        return jsonify({
+            "ok": True,
+            "linked": bool(mapping),
+            "mapping": {
+                "artist": mapping.get("artist"),
+                "album": mapping.get("album"),
+                "url": mapping.get("url"),
+                "albumId": mapping.get("albumId"),
+                "trackCount": len(mapping.get("tracks") or []),
+            } if mapping else None,
+        })
+
+    admin_error = require_topster_admin_response()
+    if admin_error is not None:
+        return admin_error
+    payload = request.get_json(silent=True) or {}
+    artist = str(payload.get("artist") or "").strip()
+    album = str(payload.get("album") or "").strip()
+    if not album:
+        return jsonify({"ok": False, "error": "The currently playing album does not have a usable title."}), 400
+    try:
+        url = validate_genius_album_url(payload.get("url"))
+        album_id = fetch_genius_album_id_from_url(url, artist, album)
+        tracks = fetch_genius_album_tracks(album_id)
+        identity = lyrics_manual_album_identity(artist, album)
+        if not identity:
+            raise ValueError("The currently playing album does not have a usable identity.")
+        saved = write_lyrics_genius_album_link({
+            "identity": identity,
+            "artist": artist,
+            "album": album,
+            "url": url,
+            "albumId": album_id,
+            "tracks": tracks,
+        })
+        with GENIUS_LOOKUP_CACHE_LOCK:
+            GENIUS_LOOKUP_CACHE.clear()
+        return jsonify({
+            "ok": True,
+            "linked": True,
+            "mapping": {
+                "artist": saved.get("artist"),
+                "album": saved.get("album"),
+                "url": saved.get("url"),
+                "albumId": saved.get("albumId"),
+                "trackCount": len(saved.get("tracks") or []),
+            },
+        })
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 502
+
 
 
 @app.route("/api/lyrics/current", methods=["GET"])
@@ -2593,6 +6375,11 @@ def current_lyrics():
             if canonical_album and str(track.get("album") or "").strip().lower() in {"", "unknown album"}:
                 track["album"] = canonical_album
 
+    track["manualCoverOverride"] = read_lyrics_album_cover_override(
+        track.get("artist") or "",
+        track.get("album") or "",
+    )
+
     genius_song = None
     genius_error = ""
     genius_error_code = ""
@@ -2633,6 +6420,272 @@ def current_lyrics():
     )
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+
+def spotify_track_part_range_signature(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.replace("–", "-").replace("—", "-").replace("−", "-")
+    match = re.search(r"\b(?:parts?|pts?\.?)\s*(\d+)\s*-\s*(\d+)\b", text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return f"{int(match.group(1))}-{int(match.group(2))}"
+
+
+def spotify_discogs_track_match_score(target_title: Any, spotify_title: Any) -> float:
+    target_part_range = spotify_track_part_range_signature(target_title)
+    spotify_part_range = spotify_track_part_range_signature(spotify_title)
+    if target_part_range and spotify_part_range and target_part_range != spotify_part_range:
+        return 0.0
+
+    target_key = normalize_lyrics_match_text(target_title)
+    spotify_key = normalize_lyrics_match_text(spotify_title)
+    if target_key and target_key == spotify_key:
+        return 1.0
+
+    score = discogs_track_title_match_score(target_title, spotify_title)
+    if target_part_range and spotify_part_range and target_part_range == spotify_part_range:
+        score = max(score, 0.98)
+    return score
+
+
+def spotify_album_name_matches(left: Any, right: Any) -> bool:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if not left_text or not right_text:
+        return True
+
+    left_key = normalize_lyrics_match_text(clean_lyrics_album_title(left_text))
+    right_key = normalize_lyrics_match_text(clean_lyrics_album_title(right_text))
+    if left_key and left_key == right_key:
+        return True
+
+    raw_left = normalize_lyrics_match_text(left_text)
+    raw_right = normalize_lyrics_match_text(right_text)
+    return bool(raw_left and raw_left == raw_right)
+
+
+def spotify_album_tracks_all(spotify_client: Any, album_id: str) -> list[dict[str, Any]]:
+    tracks: list[dict[str, Any]] = []
+    offset = 0
+    limit = 50
+    while True:
+        page = spotify_client.album_tracks(album_id, limit=limit, offset=offset)
+        items = page.get("items") if isinstance(page, dict) else None
+        if isinstance(items, list):
+            tracks.extend(item for item in items if isinstance(item, dict))
+        if not isinstance(page, dict) or not page.get("next"):
+            break
+        offset += limit
+    return tracks
+
+
+def spotify_playlist_items_all(spotify_client: Any, playlist_id: str) -> list[tuple[int, dict[str, Any]]]:
+    results: list[tuple[int, dict[str, Any]]] = []
+    offset = 0
+    limit = 100
+
+    while True:
+        try:
+            page = spotify_client.playlist_items(
+                playlist_id,
+                limit=limit,
+                offset=offset,
+                additional_types=("track",),
+            )
+        except TypeError:
+            page = spotify_client.playlist_items(
+                playlist_id,
+                limit=limit,
+                offset=offset,
+            )
+
+        raw_items = page.get("items") if isinstance(page, dict) else None
+        if not isinstance(raw_items, list):
+            break
+
+        for index, wrapper in enumerate(raw_items):
+            if not isinstance(wrapper, dict):
+                continue
+            item = wrapper.get("item")
+            if not isinstance(item, dict):
+                item = wrapper.get("track")
+            if not isinstance(item, dict):
+                continue
+            results.append((offset + index, item))
+
+        if not page.get("next"):
+            break
+        offset += limit
+
+    return results
+
+
+def spotify_best_target_track(
+    candidates: list[dict[str, Any]],
+    target_title: str,
+) -> tuple[dict[str, Any] | None, float]:
+    best_item: dict[str, Any] | None = None
+    best_score = 0.0
+    for item in candidates:
+        title = str(item.get("name") or "").strip()
+        score = spotify_discogs_track_match_score(target_title, title)
+        if score > best_score:
+            best_score = score
+            best_item = item
+    return best_item, best_score
+
+
+@app.route("/api/lyrics/play-track", methods=["POST"])
+def lyrics_play_track():
+    payload = request.get_json(silent=True) or {}
+    target_title = str(payload.get("title") or "").strip()
+    requested_album = str(payload.get("album") or "").strip()
+
+    if not target_title:
+        return jsonify({
+            "ok": False,
+            "authenticated": True,
+            "error": "A track title is required.",
+        }), 400
+
+    try:
+        spotify_client = get_spotify_client()
+    except SpotifyLoginRequired as error:
+        response = jsonify({
+            "ok": False,
+            "authenticated": False,
+            "error": str(error),
+        })
+        response.status_code = 401
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except SpotifyTokenRefreshTemporarilyUnavailable as error:
+        response = jsonify({
+            "ok": False,
+            "authenticated": True,
+            "temporarilyUnavailable": True,
+            "error": str(error),
+        })
+        response.status_code = 503
+        response.headers["Retry-After"] = "6"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    try:
+        try:
+            playback = spotify_client.current_playback(additional_types="track")
+        except TypeError:
+            playback = spotify_client.current_playback()
+
+        if not isinstance(playback, dict):
+            raise RuntimeError("Spotify does not currently have an active playback context.")
+
+        current_item = playback.get("item") if isinstance(playback.get("item"), dict) else {}
+        current_album = current_item.get("album") if isinstance(current_item.get("album"), dict) else {}
+        current_album_name = str(current_album.get("name") or requested_album or "").strip()
+        album_id = str(current_album.get("id") or "").strip()
+        album_uri = str(current_album.get("uri") or "").strip()
+        if album_id and not album_uri:
+            album_uri = f"spotify:album:{album_id}"
+
+        # Preferred path: use the current Spotify album itself. This keeps playback
+        # in album context, so selecting a Tracklist row still gives Spotify the
+        # rest of that album as the queue/context.
+        if album_id:
+            album_tracks = spotify_album_tracks_all(spotify_client, album_id)
+            matched_track, match_score = spotify_best_target_track(album_tracks, target_title)
+            matched_uri = str((matched_track or {}).get("uri") or "").strip()
+            if matched_track is not None and match_score >= 0.55 and matched_uri:
+                spotify_client.start_playback(
+                    context_uri=album_uri,
+                    offset={"uri": matched_uri},
+                    position_ms=0,
+                )
+                if process_is_running():
+                    append_log(f"[lyrics page selected album track: {matched_track.get('name') or target_title}]")
+                response = jsonify({
+                    "ok": True,
+                    "authenticated": True,
+                    "matchedTitle": str(matched_track.get("name") or target_title),
+                    "source": "album",
+                    "message": f"Playing {matched_track.get('name') or target_title} on Spotify.",
+                })
+                response.headers["Cache-Control"] = "no-store"
+                return response
+
+        # Fallback for local files or playlist-only album copies: if the current
+        # playback context is a playlist, find the requested Discogs row among
+        # playlist items belonging to the same currently playing Spotify album.
+        context = playback.get("context") if isinstance(playback.get("context"), dict) else {}
+        context_uri = str(context.get("uri") or "").strip()
+        context_type = str(context.get("type") or "").strip().lower()
+
+        if context_type == "playlist" and context_uri.startswith("spotify:playlist:"):
+            playlist_id = context_uri.rsplit(":", 1)[-1]
+            playlist_items = spotify_playlist_items_all(spotify_client, playlist_id)
+
+            best_position: int | None = None
+            best_item: dict[str, Any] | None = None
+            best_score = 0.0
+
+            for position, item in playlist_items:
+                if str(item.get("type") or "track").lower() not in {"", "track"}:
+                    continue
+
+                item_album = item.get("album") if isinstance(item.get("album"), dict) else {}
+                item_album_name = str(item_album.get("name") or "").strip()
+                if not item_album_name:
+                    local_meta = local_spotify_uri_metadata(str(item.get("uri") or ""))
+                    item_album_name = str(local_meta.get("album") or "").strip()
+                if current_album_name and item_album_name and not spotify_album_name_matches(
+                    current_album_name,
+                    item_album_name,
+                ):
+                    continue
+
+                score = spotify_discogs_track_match_score(
+                    target_title,
+                    item.get("name") or "",
+                )
+                if score > best_score:
+                    best_score = score
+                    best_position = position
+                    best_item = item
+
+            if best_item is not None and best_position is not None and best_score >= 0.55:
+                spotify_client.start_playback(
+                    context_uri=context_uri,
+                    offset={"position": int(best_position)},
+                    position_ms=0,
+                )
+                if process_is_running():
+                    append_log(f"[lyrics page selected playlist track: {best_item.get('name') or target_title}]")
+                response = jsonify({
+                    "ok": True,
+                    "authenticated": True,
+                    "matchedTitle": str(best_item.get("name") or target_title),
+                    "source": "playlist",
+                    "message": f"Playing {best_item.get('name') or target_title} on Spotify.",
+                })
+                response.headers["Cache-Control"] = "no-store"
+                return response
+
+        raise RuntimeError(
+            f'Could not find a Spotify track corresponding to "{target_title}" '
+            "in the current album or playlist context."
+        )
+
+    except Exception as error:
+        response = jsonify({
+            "ok": False,
+            "authenticated": True,
+            "error": f"Could not play the selected Spotify track: {error}",
+        })
+        response.status_code = 502
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 @app.route("/api/lyrics/control/<action>", methods=["POST"])
@@ -2894,7 +6947,12 @@ def songguesser_candidate_from_album_track(album: dict[str, Any], track: dict[st
     return {"prepared": prepared, "answer": songguesser_track_answer(prepared)}
 
 
-def songguesser_candidate_from_playlist_item(playlist_bundle: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+def songguesser_candidate_from_playlist_item(
+    playlist_bundle: dict[str, Any],
+    item: dict[str, Any],
+    cache: dict[str, Any] | None = None,
+    use_lastfm_local_cover: bool = False,
+) -> dict[str, Any]:
     configure_sampler_tools()
 
     prepared = sampler_tools.prepare_playlist_item_clip(
@@ -2903,6 +6961,8 @@ def songguesser_candidate_from_playlist_item(playlist_bundle: dict[str, Any], it
         clip_seconds=SONGGUESSER_CLIP_SECONDS,
         random_start=True,
         assumed_duration_seconds=SONGGUESSER_ASSUMED_DURATION_SECONDS,
+        cache=cache,
+        use_lastfm_local_cover=use_lastfm_local_cover,
     )
 
     return {"prepared": prepared, "answer": songguesser_track_answer(prepared)}
@@ -2915,11 +6975,13 @@ def songguesser_answer_has_unknown_album(answer: dict[str, Any]) -> bool:
 
 
 def songguesser_should_lookup_answer(answer: dict[str, Any], hints_enabled: dict[str, Any]) -> bool:
-    if not any(hints_enabled.get(key) for key in ("releaseYear", "releaseDecade", "album")):
-        return False
-
+    # Manual cover overrides are keyed by artist + album, so resolve a missing
+    # album even when the user did not enable album/year hints.
     if songguesser_answer_has_unknown_album(answer):
         return True
+
+    if not any(hints_enabled.get(key) for key in ("releaseYear", "releaseDecade", "album")):
+        return False
 
     if (hints_enabled.get("releaseYear") or hints_enabled.get("releaseDecade")) and not answer.get("releaseYear"):
         return True
@@ -3024,7 +7086,7 @@ def songguesser_summary_payload(game: dict[str, Any]) -> list[dict[str, Any]]:
     summary = []
 
     for index, candidate in enumerate(game.get("queue") or [], start=1):
-        answer = candidate.get("answer") or {}
+        answer = songguesser_answer_with_saved_cover(candidate.get("answer") or {})
         summary.append(
             {
                 "index": index,
@@ -3078,6 +7140,7 @@ def songguesser_build_playlist_candidates(
     playlist_link: str,
     used_by_source: dict[str, set[str]],
     maximum: int,
+    use_lastfm_local_cover: bool = False,
 ) -> list[dict[str, Any]]:
     configure_sampler_tools()
 
@@ -3101,7 +7164,14 @@ def songguesser_build_playlist_candidates(
         if item_key in used_keys:
             continue
         used_keys.add(item_key)
-        candidates.append(songguesser_candidate_from_playlist_item(playlist_bundle, item))
+        candidates.append(
+            songguesser_candidate_from_playlist_item(
+                playlist_bundle=playlist_bundle,
+                item=item,
+                cache=cache,
+                use_lastfm_local_cover=use_lastfm_local_cover,
+            )
+        )
         if len(candidates) >= maximum:
             break
 
@@ -3171,6 +7241,7 @@ def songguesser_build_candidates_from_single_link(sp: Any, cache: dict[str, Any]
             playlist_link=link,
             used_by_source=used_by_source,
             maximum=SONGGUESSER_SONG_COUNT,
+            use_lastfm_local_cover=True,
         )
     else:
         raise RuntimeError("Invalid Spotify album or playlist link/URI.")
@@ -3183,8 +7254,25 @@ def songguesser_build_candidates_from_single_link(sp: Any, cache: dict[str, Any]
     return candidates[:SONGGUESSER_SONG_COUNT]
 
 
+def songguesser_answer_with_saved_cover(answer: dict[str, Any]) -> dict[str, Any]:
+    public_answer = dict(answer or {})
+    default_cover_url = str(public_answer.get("coverUrl") or "").strip()
+    public_answer["defaultCoverUrl"] = default_cover_url
+    override = read_lyrics_album_cover_override(
+        public_answer.get("artist") or "",
+        public_answer.get("album") or "",
+    )
+    if override and override.get("imageUrl"):
+        public_answer["coverUrl"] = override["imageUrl"]
+        public_answer["manualCoverOverride"] = override
+    else:
+        public_answer["manualCoverOverride"] = None
+    return public_answer
+
+
 def songguesser_public_payload(game: dict[str, Any], candidate: dict[str, Any], position_ms: int) -> dict[str, Any]:
     answer = candidate.get("answer") or {}
+    public_answer = songguesser_answer_with_saved_cover(answer)
     hints_enabled = game.get("hints") or {}
     release_year = answer.get("releaseYear") or ""
     release_decade = answer.get("releaseDecade") or ""
@@ -3206,8 +7294,9 @@ def songguesser_public_payload(game: dict[str, Any], candidate: dict[str, Any], 
         "positionMs": position_ms,
         "startedAt": now,
         "endsAt": now + SONGGUESSER_CLIP_SECONDS,
-        "answer": answer,
+        "answer": public_answer,
         "hints": hints,
+        "paused": bool(game.get("paused")),
     }
 
 
@@ -3252,6 +7341,7 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
 
     game["started_at"] = time.time()
     game["position_ms"] = position_ms
+    game["paused"] = False
     return songguesser_public_payload(game, candidate, position_ms)
 
 
@@ -3354,6 +7444,31 @@ def songguesser_next():
         return jsonify(songguesser_start_current(game))
     except Exception as error:
         return jsonify({"ok": False, "error": str(error)}), 500
+
+
+@app.route("/api/songguesser/pause", methods=["POST"])
+def songguesser_pause():
+    game = get_current_songguesser_game()
+    if game is None:
+        return jsonify({"ok": False, "error": "No active Songguesser game."}), 404
+    pause_spotify()
+    game["paused"] = True
+    return jsonify({"ok": True, "paused": True})
+
+
+@app.route("/api/songguesser/play", methods=["POST"])
+def songguesser_play():
+    game = get_current_songguesser_game()
+    if game is None:
+        return jsonify({"ok": False, "error": "No active Songguesser game."}), 404
+    try:
+        sp = get_spotify_client()
+        sp.start_playback()
+        append_log("[Spotify Songguesser playback resumed]")
+    except Exception as error:
+        return jsonify({"ok": False, "error": f"Could not resume Songguesser playback: {error}"}), 502
+    game["paused"] = False
+    return jsonify({"ok": True, "paused": False})
 
 
 @app.route("/api/songguesser/stop", methods=["POST"])
@@ -3659,7 +7774,19 @@ def get_current_cover_art() -> dict[str, Any] | None:
 
     cover_art = state.get("coverArt")
     if isinstance(cover_art, dict):
-        return cover_art
+        result = dict(cover_art)
+        default_url = str(result.get("url") or "").strip()
+        result["defaultUrl"] = default_url
+        override = read_lyrics_album_cover_override(
+            result.get("artist") or "",
+            result.get("album") or "",
+        )
+        if override and override.get("imageUrl"):
+            result["url"] = override["imageUrl"]
+            result["manualCoverOverride"] = override
+        else:
+            result["manualCoverOverride"] = None
+        return result
 
     return None
 
