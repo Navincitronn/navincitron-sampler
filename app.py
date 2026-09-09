@@ -2289,7 +2289,14 @@ def discogs_composite_position_from_subtracks(sub_tracks: Any) -> str:
     if not positions:
         return ""
 
-    bases = [re.sub(r"[-.]?[IVXLCDM]+$", "", position, flags=re.IGNORECASE) for position in positions]
+    # Discogs represents composite songs in several ways:
+    # A1.1/A1.2/... and B3.1/B3.2/... use numeric child sections, while
+    # B3-I/B3-II/... uses Roman-numeral child sections. In both cases the
+    # shared parent position (A1 or B3) is the actual song position.
+    bases = [
+        re.sub(r"(?:[-.](?:\d+|[IVXLCDM]+))$", "", position, flags=re.IGNORECASE)
+        for position in positions
+    ]
     if bases[0] and all(base == bases[0] for base in bases):
         return bases[0]
 
@@ -2321,9 +2328,16 @@ def iter_discogs_release_track_titles(tracklist: Any):
         sub_tracks = entry.get("subTracks") if isinstance(entry.get("subTracks"), list) else []
 
         if entry_type == "index":
-            if title and duration:
+            composite_position = discogs_composite_position_from_subtracks(sub_tracks)
+            composite_song = bool(composite_position and re.search(r"\d", composite_position))
+            if title and (duration or composite_song):
+                # A timed index is a composite song. An untimed index is also
+                # the song when its children are sections of one numbered
+                # parent position (A1.1/A1.2 -> A1, B3.1/B3.2 -> B3).
                 yield title
             elif sub_tracks:
+                # Pure structural headings whose children are separate A1/A2,
+                # B1/B2 tracks still recurse normally.
                 yield from iter_discogs_release_track_titles(sub_tracks)
             continue
 
@@ -3645,11 +3659,22 @@ def genius_album_id_from_page_html(html: str) -> int | None:
     return None
 
 
-def fetch_genius_album_id_from_url(url: str) -> int:
+def fetch_genius_album_id_from_url(
+    url: str,
+    context_artist: str = "",
+    context_album: str = "",
+) -> int:
+    """Resolve a Genius album URL without depending on Genius page HTML.
+
+    Render/VPS requests to public genius.com album pages can receive HTTP 403.
+    The direct HTML read remains a fast path, but the durable fallback uses the
+    authenticated api.genius.com search/song endpoints and matches the returned
+    song's album metadata back to the exact album URL/title supplied by the user.
+    """
     validated_url = validate_genius_album_url(url)
     headers = {
         "Accept": "text/html,application/xhtml+xml",
-        "User-Agent": "Mozilla/5.0 (compatible; NavincitronLyrics/1.2; +https://www.navincitron.com)",
+        "User-Agent": "Mozilla/5.0 (compatible; NavincitronLyrics/1.3; +https://www.navincitron.com)",
     }
     page_error = None
     try:
@@ -3659,38 +3684,136 @@ def fetch_genius_album_id_from_url(url: str) -> int:
         if album_id:
             return album_id
     except Exception as error:
+        # Genius commonly denies datacenter HTML requests with 403. Do not
+        # consider that fatal; the official API fallback below is the primary
+        # resolution path in production.
         page_error = error
+
+    if not get_genius_access_token():
+        detail = f" ({page_error})" if page_error else ""
+        raise RuntimeError(
+            "Could not determine the Genius album ID because the album page "
+            f"could not be read and GENIUS_ACCESS_TOKEN is unavailable{detail}."
+        )
 
     parsed = urlparse(validated_url)
     parts = [unquote(part) for part in parsed.path.split("/") if part]
-    artist_hint = parts[1].replace("-", " ") if len(parts) > 1 else ""
-    album_hint = parts[2].replace("-", " ") if len(parts) > 2 else ""
-    query = " ".join(part for part in (artist_hint, album_hint) if part).strip()
-    if query and get_genius_access_token():
+    url_artist_hint = parts[1].replace("-", " ") if len(parts) > 1 else ""
+    url_album_hint = parts[2].replace("-", " ") if len(parts) > 2 else ""
+    target_path = parsed.path.rstrip("/").casefold()
+    target_artist_key = normalize_lyrics_match_text(url_artist_hint or context_artist)
+    target_album_key = normalize_lyrics_match_text(url_album_hint)
+    context_album_key = normalize_lyrics_match_text(clean_lyrics_album_title(context_album))
+
+    # Put the distinctive album-slug words first. This matters for titles such
+    # as "Live/Hhaï", where a broad "Magma Live Hhai" search can bury the album's
+    # songs beneath unrelated "live" results.
+    url_album_tokens = [token for token in normalize_lyrics_match_text(url_album_hint).split() if token]
+    distinctive_tokens = [token for token in url_album_tokens if len(token) >= 4 and token not in {"live", "album", "deluxe", "remastered"}]
+
+    queries: list[str] = []
+    def add_query(*values: Any) -> None:
+        query = " ".join(str(value or "").strip() for value in values if str(value or "").strip())
+        query = re.sub(r"\s+", " ", query).strip()
+        if query and query.casefold() not in {existing.casefold() for existing in queries}:
+            queries.append(query)
+
+    for token in distinctive_tokens:
+        add_query(url_artist_hint or context_artist, token)
+        add_query(token, url_artist_hint or context_artist)
+    add_query(url_artist_hint or context_artist, url_album_hint)
+    add_query(context_artist, context_album)
+    add_query(url_album_hint, url_artist_hint or context_artist)
+    add_query(url_artist_hint or context_artist, clean_lyrics_album_title(context_album))
+
+    best_candidate: tuple[float, int] | None = None
+    seen_song_ids: set[int] = set()
+
+    for query in queries[:8]:
         try:
             search_payload = genius_search_request(query)
-            for hit in genius_song_hits(search_payload)[:10]:
-                song_id_raw = hit.get("id")
-                if not str(song_id_raw or "").isdigit():
-                    continue
-                try:
-                    details_payload = genius_song_request(int(song_id_raw))
-                    response = details_payload.get("response")
-                    song = response.get("song") if isinstance(response, dict) else None
-                    album_data = song.get("album") if isinstance(song, dict) and isinstance(song.get("album"), dict) else None
-                    if not album_data:
-                        continue
-                    album_url = str(album_data.get("url") or "").strip()
-                    album_id_raw = album_data.get("id")
-                    if album_url and urlparse(album_url).path.rstrip("/").casefold() == parsed.path.rstrip("/").casefold():
-                        if str(album_id_raw or "").isdigit() and int(album_id_raw) > 0:
-                            return int(album_id_raw)
-                except Exception:
-                    continue
         except Exception:
-            pass
-    detail = f" ({page_error})" if page_error else ""
-    raise RuntimeError(f"Could not determine the Genius album ID from that album page{detail}.")
+            continue
+
+        for hit in genius_song_hits(search_payload)[:20]:
+            song_id_raw = hit.get("id")
+            if not str(song_id_raw or "").isdigit():
+                continue
+            song_id = int(song_id_raw)
+            if song_id in seen_song_ids:
+                continue
+            seen_song_ids.add(song_id)
+
+            song = hit
+            album_data = hit.get("album") if isinstance(hit.get("album"), dict) else None
+            if not album_data:
+                try:
+                    details_payload = genius_song_request(song_id)
+                    response = details_payload.get("response")
+                    detailed_song = response.get("song") if isinstance(response, dict) else None
+                    if isinstance(detailed_song, dict):
+                        song = detailed_song
+                        album_data = song.get("album") if isinstance(song.get("album"), dict) else None
+                except Exception:
+                    album_data = None
+            if not album_data:
+                continue
+
+            album_id_raw = album_data.get("id")
+            if not str(album_id_raw or "").isdigit() or int(album_id_raw) <= 0:
+                continue
+            album_id = int(album_id_raw)
+            album_url = str(album_data.get("url") or "").strip()
+            album_name = str(album_data.get("name") or album_data.get("full_title") or "").strip()
+
+            if album_url:
+                try:
+                    if urlparse(album_url).path.rstrip("/").casefold() == target_path:
+                        return album_id
+                except Exception:
+                    pass
+
+            candidate_album_key = normalize_lyrics_match_text(album_name)
+            candidate_artist_names: list[str] = []
+            album_artist = album_data.get("artist")
+            if isinstance(album_artist, dict) and album_artist.get("name"):
+                candidate_artist_names.append(str(album_artist.get("name")))
+            primary_artist = song.get("primary_artist")
+            if isinstance(primary_artist, dict) and primary_artist.get("name"):
+                candidate_artist_names.append(str(primary_artist.get("name")))
+            candidate_artist_key = normalize_lyrics_match_text(" ".join(candidate_artist_names))
+
+            album_score = 0.0
+            if target_album_key and candidate_album_key == target_album_key:
+                album_score = 1.0
+            elif target_album_key:
+                album_score = lyrics_token_overlap(target_album_key, candidate_album_key)
+            if context_album_key and candidate_album_key == context_album_key:
+                album_score = max(album_score, 0.92)
+
+            artist_score = 0.0
+            if target_artist_key and candidate_artist_key:
+                if target_artist_key == candidate_artist_key:
+                    artist_score = 1.0
+                elif target_artist_key in candidate_artist_key or candidate_artist_key in target_artist_key:
+                    artist_score = 0.9
+                else:
+                    artist_score = lyrics_token_overlap(target_artist_key, candidate_artist_key)
+
+            total_score = album_score * 0.75 + artist_score * 0.25
+            if album_score >= 0.92 and artist_score >= 0.75:
+                return album_id
+            if best_candidate is None or total_score > best_candidate[0]:
+                best_candidate = (total_score, album_id)
+
+    if best_candidate and best_candidate[0] >= 0.82:
+        return best_candidate[1]
+
+    detail = f" The direct Genius page request failed with {page_error}." if page_error else ""
+    raise RuntimeError(
+        "Could not determine the Genius album ID from that link using either "
+        f"the album page or the Genius API.{detail}"
+    )
 
 
 def fetch_genius_album_tracks(album_id: int) -> list[dict[str, Any]]:
@@ -6133,7 +6256,7 @@ def lyrics_genius_album_link():
         return jsonify({"ok": False, "error": "The currently playing album does not have a usable title."}), 400
     try:
         url = validate_genius_album_url(payload.get("url"))
-        album_id = fetch_genius_album_id_from_url(url)
+        album_id = fetch_genius_album_id_from_url(url, artist, album)
         tracks = fetch_genius_album_tracks(album_id)
         identity = lyrics_manual_album_identity(artist, album)
         if not identity:
