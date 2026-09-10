@@ -7120,6 +7120,49 @@ def api_lyrics_genius_content(song_id: int):
         return response
 
 
+@app.route("/api/lyrics/genius-referents/<int:song_id>", methods=["GET"])
+def api_lyrics_genius_referents(song_id: int):
+    """Return all non-description Genius referents for one song.
+
+    The official Genius embed is cross-origin, so the frontend cannot read the
+    clicked lyric anchor out of the embedded frame. Keeping the referents
+    available through our same-origin API lets the host page show annotations
+    without scraping genius.com or depending on a second lyrics provider.
+    """
+    if song_id <= 0:
+        return jsonify({"ok": False, "error": "Invalid Genius song ID."}), 400
+    try:
+        raw_referents = genius_song_referents(song_id)
+        referents: list[dict[str, Any]] = []
+        for raw_referent in raw_referents:
+            try:
+                referent_id = int(raw_referent.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if referent_id <= 0:
+                continue
+            referent = build_genius_referent_payload(
+                {"response": {"referent": raw_referent}},
+                referent_id,
+            )
+            if referent.get("fragment") and referent.get("annotations"):
+                referents.append(referent)
+
+        response = jsonify({
+            "ok": True,
+            "songId": int(song_id),
+            "referents": referents,
+            "count": len(referents),
+        })
+        response.headers["Cache-Control"] = "public, max-age=3600"
+        return response
+    except Exception as error:
+        response = jsonify({"ok": False, "error": str(error)})
+        response.status_code = 502
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
 @app.route("/api/lyrics/genius-referent/<int:referent_id>", methods=["GET"])
 def api_lyrics_genius_referent(referent_id: int):
     if referent_id <= 0:
