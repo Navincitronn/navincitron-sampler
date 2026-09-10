@@ -4486,6 +4486,86 @@ def fetch_lyrics_ovh(song: dict[str, Any]) -> tuple[str, str]:
     return lyrics, "https://lyrics.ovh/"
 
 
+def fetch_lyrics_ovh_suggested(song: dict[str, Any]) -> tuple[str, str]:
+    """Resolve lyrics.ovh using its Deezer-backed suggestion search.
+
+    The direct /v1/{artist}/{title} endpoint is exact-string sensitive.  This
+    fallback asks /suggest for close catalog matches, ranks them against the
+    Genius song metadata, and retries only the strongest few candidates.
+    """
+    title = clean_lyrics_track_title(song.get("title") or song.get("title_with_featured") or "")
+    primary_artist = song.get("primary_artist") if isinstance(song.get("primary_artist"), dict) else {}
+    artist = str(primary_artist.get("name") or song.get("artist_names") or "").strip()
+    album = song.get("album") if isinstance(song.get("album"), dict) else {}
+    album_name = str(album.get("name") or "").strip()
+    if not title or not artist:
+        raise RuntimeError("Genius song metadata did not contain enough information for lyrics.ovh suggestions.")
+
+    suggestion_url = "https://api.lyrics.ovh/suggest/" + quote(f"{artist} {title}", safe="")
+    payload = generic_json_request(
+        suggestion_url,
+        "NavincitronLyrics/1.3 (+https://www.navincitron.com)",
+    )
+    raw_items = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(raw_items, list):
+        raise RuntimeError("lyrics.ovh suggestions returned an invalid response.")
+
+    ranked: list[tuple[float, str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        item_title = clean_lyrics_track_title(item.get("title") or item.get("title_short") or "")
+        item_artist_obj = item.get("artist") if isinstance(item.get("artist"), dict) else {}
+        item_album_obj = item.get("album") if isinstance(item.get("album"), dict) else {}
+        item_artist = str(item_artist_obj.get("name") or "").strip()
+        item_album = str(item_album_obj.get("title") or "").strip()
+        if not item_title or not item_artist:
+            continue
+        identity = (normalize_lyrics_match_text(item_artist), normalize_lyrics_match_text(item_title))
+        if not all(identity) or identity in seen:
+            continue
+        seen.add(identity)
+        score = score_external_lyrics_candidate(
+            {
+                "trackName": item_title,
+                "artistName": item_artist,
+                "albumName": item_album,
+                "plainLyrics": "candidate",
+            },
+            song,
+        )
+        ranked.append((score, item_artist, item_title, item_album))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    errors: list[str] = []
+    original_identity = (normalize_lyrics_match_text(artist), normalize_lyrics_match_text(title))
+    for score, candidate_artist, candidate_title, candidate_album in ranked[:6]:
+        if score < 95.0:
+            continue
+        candidate_identity = (
+            normalize_lyrics_match_text(candidate_artist),
+            normalize_lyrics_match_text(candidate_title),
+        )
+        if candidate_identity == original_identity:
+            continue
+        url = f"https://api.lyrics.ovh/v1/{quote(candidate_artist, safe='')}/{quote(candidate_title, safe='')}"
+        try:
+            candidate_payload = generic_json_request(
+                url,
+                "NavincitronLyrics/1.3 (+https://www.navincitron.com)",
+            )
+        except Exception as error:
+            errors.append(str(error))
+            continue
+        lyrics = str(candidate_payload.get("lyrics") or "").strip() if isinstance(candidate_payload, dict) else ""
+        if lyrics:
+            return lyrics, url
+
+    detail = f" ({'; '.join(errors[:3])})" if errors else ""
+    raise RuntimeError(f"lyrics.ovh suggestions did not produce usable lyric text{detail}.")
+
+
 def genius_song_referents(song_id: int) -> list[dict[str, Any]]:
     access_token = get_genius_access_token()
     referents: list[dict[str, Any]] = []
@@ -4638,11 +4718,18 @@ def build_genius_annotated_lyrics_html(lyrics_text: str, referents: list[dict[st
 
 
 def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
-    """Compose clickable Genius annotations without making any request to genius.com.
+    """Return same-origin lyric HTML with exact Genius referent IDs embedded.
 
-    Genius's documented developer API supplies song metadata and referents/annotations,
-    but not the complete lyric text. The complete text is therefore obtained from a
-    lyrics-text provider and the Genius referent fragments are mapped back onto it.
+    Preferred source order:
+      1. Genius public page_data (true Genius lyric markup)
+      2. Genius normal song HTML (true Genius lyric markup)
+      3. LRCLIB text + Genius API referents
+      4. lyrics.ovh exact text + Genius API referents
+      5. lyrics.ovh catalog suggestion + Genius API referents
+
+    The deployed host has previously received HTTP 403 from genius.com, so the
+    official api.genius.com referents remain the authoritative annotation data
+    even when complete lyric text must come from a fallback provider.
     """
     details_payload = genius_song_request(song_id)
     response = details_payload.get("response")
@@ -4651,34 +4738,67 @@ def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
         raise RuntimeError("Genius did not return song metadata for the requested song.")
 
     referents = genius_song_referents(song_id)
-    lyric_errors: list[str] = []
+    song_payload = build_genius_song_payload(song)
+    source_errors: list[str] = []
+
+    # First try actual Genius lyric markup. GeniusLyricsPageParser sanitizes the
+    # result and converts every annotation anchor to data-genius-referent-id so
+    # the browser can handle the click locally without an iframe.
+    for source_name, reader in (
+        ("genius_page_data", lambda: fetch_genius_song_page_data(song)),
+        ("genius_song_page", lambda: fetch_genius_song_html_fallback(song, song_id)),
+    ):
+        try:
+            lyrics_html, source_url = reader()
+            referent_ids = {
+                int(value)
+                for value in re.findall(r"data-genius-referent-id=[\'\"](\d+)[\'\"]", lyrics_html)
+                if str(value).isdigit() and int(value) > 0
+            }
+            return {
+                "song": song_payload,
+                "lyricsHtml": lyrics_html,
+                "url": str(song.get("url") or source_url or ""),
+                "lyricsSource": source_name,
+                "lyricsTextSourceUrl": source_url,
+                "geniusReferentCount": len(referents),
+                "annotationMatchCount": len(referent_ids),
+                "sourceErrors": source_errors,
+            }
+        except Exception as error:
+            source_errors.append(f"{source_name}: {error}")
+
+    # If genius.com blocks the cloud host, reconstruct only the transcription;
+    # annotation identities and bodies still come from api.genius.com referents.
+    lyric_text_readers = (
+        ("lrclib_text+genius_api_annotations", fetch_lrclib_lyrics),
+        ("lyrics_ovh_text+genius_api_annotations", fetch_lyrics_ovh),
+        ("lyrics_ovh_suggested_text+genius_api_annotations", fetch_lyrics_ovh_suggested),
+    )
     lyrics_text = ""
     source_url = ""
     source = ""
-
-    try:
-        lyrics_text, source_url = fetch_lrclib_lyrics(song)
-        source = "lrclib_text+genius_api_annotations"
-    except Exception as error:
-        lyric_errors.append(f"LRCLIB: {error}")
+    for source_name, reader in lyric_text_readers:
         try:
-            lyrics_text, source_url = fetch_lyrics_ovh(song)
-            source = "lyrics_ovh_text+genius_api_annotations"
-        except Exception as fallback_error:
-            lyric_errors.append(f"lyrics.ovh: {fallback_error}")
+            lyrics_text, source_url = reader(song)
+            source = source_name
+            if lyrics_text:
+                break
+        except Exception as error:
+            source_errors.append(f"{source_name}: {error}")
 
     if not lyrics_text:
         raise RuntimeError(
-            "Genius API metadata/annotations were reachable, but no complete lyric-text "
-            "provider returned this song. " + " ".join(lyric_errors)
+            "Could not obtain complete lyric text for native annotation rendering. "
+            + " ".join(source_errors)
         )
 
     lyrics_html, annotation_match_count = build_genius_annotated_lyrics_html(lyrics_text, referents)
-    song_payload = build_genius_song_payload(song)
     if referents and annotation_match_count == 0:
         raise RuntimeError(
             "Lyric text was found, but none of the Genius annotation fragments matched it. "
-            "This usually means the text provider returned a different version/transcription of the song."
+            "This transcription differs too much from Genius to anchor annotations safely. "
+            + " ".join(source_errors)
         )
 
     return {
@@ -4689,6 +4809,7 @@ def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
         "lyricsTextSourceUrl": source_url,
         "geniusReferentCount": len(referents),
         "annotationMatchCount": annotation_match_count,
+        "sourceErrors": source_errors,
     }
 
 
