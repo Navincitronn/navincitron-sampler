@@ -4148,13 +4148,132 @@ def extract_genius_lyrics_html(page_html: str) -> str:
     return "\n".join(f'<div class="lyrics-genius-verse">{content}</div>' for content in parser.containers)
 
 
-def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
-    details_payload = genius_song_request(song_id)
-    response = details_payload.get("response")
-    song = response.get("song") if isinstance(response, dict) else None
-    if not isinstance(song, dict):
-        raise RuntimeError("Genius did not return song metadata for the requested song.")
+def genius_public_json_request(url: str) -> dict[str, Any]:
+    """Read one of Genius's public genius.com/api JSON endpoints.
 
+    These endpoints do not require the developer Client Access Token.  Keeping
+    lyrics retrieval on a JSON endpoint avoids depending on the normal Genius
+    HTML song page, which may be challenged/blocked for server-side requests.
+    """
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://genius.com/",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+        ),
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    public_request = Request(url, headers=headers)
+    try:
+        with urlopen(public_request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except HTTPError as error:
+        raise RuntimeError(f"Genius public API request failed with HTTP {error.code}.") from error
+    except URLError as error:
+        raise RuntimeError(f"Could not reach the Genius public API: {error.reason}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Genius public API returned unreadable JSON.") from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("Genius public API returned an invalid JSON response.")
+
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        try:
+            status = int(meta.get("status") or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if status >= 400:
+            message = str(meta.get("message") or "Genius public API request failed.").strip()
+            raise RuntimeError(f"Genius public API error {status}: {message}")
+    return payload
+
+
+def genius_page_data_path(song: dict[str, Any]) -> str:
+    """Build the page_path expected by Genius's public /api/page_data endpoint."""
+    song_path = str(song.get("path") or "").strip()
+    if not song_path:
+        try:
+            song_path = urlparse(str(song.get("url") or "")).path
+        except Exception:
+            song_path = ""
+    song_path = "/" + song_path.lstrip("/") if song_path else ""
+
+    primary_artist = song.get("primary_artist")
+    artist_slug = ""
+    if isinstance(primary_artist, dict):
+        artist_slug = str(primary_artist.get("slug") or "").strip().strip("/")
+        if not artist_slug:
+            artist_url = str(primary_artist.get("url") or "").strip()
+            try:
+                artist_path = urlparse(artist_url).path.strip("/")
+            except Exception:
+                artist_path = ""
+            if artist_path.casefold().startswith("artists/"):
+                artist_slug = artist_path.split("/", 1)[1].strip("/")
+
+    raw_song_path = song_path.lstrip("/")
+    if raw_song_path.casefold().endswith("-lyrics"):
+        raw_song_path = raw_song_path[:-7]
+
+    if not raw_song_path:
+        raise RuntimeError("Genius song metadata did not include a usable song path.")
+    if not artist_slug:
+        raise RuntimeError("Genius song metadata did not include the primary artist slug needed for page data.")
+
+    prefix = artist_slug + "-"
+    if raw_song_path.casefold().startswith(prefix.casefold()):
+        title_slug = raw_song_path[len(prefix):]
+    else:
+        # Match LyricsGenius's public page_data convention as closely as possible.
+        # A rare Genius path whose prefix differs from primary_artist.slug may still
+        # fail here, in which case the legacy HTML-page fallback below gets a turn.
+        marker = raw_song_path.casefold().find(prefix.casefold())
+        title_slug = raw_song_path[marker + len(prefix):] if marker >= 0 else raw_song_path
+
+    title_slug = title_slug.strip("/")
+    if not title_slug:
+        raise RuntimeError("Could not derive the Genius title slug needed for page data.")
+    return f"/songs/{artist_slug}/{title_slug}"
+
+
+def extract_genius_page_data_lyrics(payload: dict[str, Any]) -> str:
+    """Extract and sanitize lyrics_data.body.html from Genius page_data JSON."""
+    response = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+    page_data = response.get("page_data") if isinstance(response, dict) else None
+    if not isinstance(page_data, dict):
+        page_data = payload.get("page_data")
+    if not isinstance(page_data, dict):
+        raise RuntimeError("Genius page data did not contain page_data.")
+
+    lyrics_data = page_data.get("lyrics_data")
+    if not isinstance(lyrics_data, dict):
+        raise RuntimeError("Genius page data did not contain lyrics_data.")
+    body = lyrics_data.get("body")
+    if isinstance(body, dict):
+        body_html = str(body.get("html") or "")
+    else:
+        body_html = str(body or "")
+    if not body_html.strip():
+        raise RuntimeError("Genius page data did not contain lyric HTML.")
+
+    # Reuse the same allowlist parser by presenting the page-data body as one lyric
+    # container. Annotation hrefs/referent IDs are rebuilt into local clickable links.
+    wrapped = f'<div data-lyrics-container="true">{body_html}</div>'
+    return extract_genius_lyrics_html(wrapped)
+
+
+def fetch_genius_song_page_data(song: dict[str, Any]) -> tuple[str, str]:
+    page_path = genius_page_data_path(song)
+    page_data_url = "https://genius.com/api/page_data?" + urlencode({"page_path": page_path})
+    payload = genius_public_json_request(page_data_url)
+    return extract_genius_page_data_lyrics(payload), page_data_url
+
+
+def fetch_genius_song_html_fallback(song: dict[str, Any], song_id: int) -> tuple[str, str]:
+    """Legacy last-resort reader for Genius's normal HTML song page."""
     page_url = normalize_genius_page_url(song.get("url") or song.get("path"), song_id)
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -4164,7 +4283,7 @@ def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
         "Referer": "https://genius.com/",
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
         ),
     }
     try:
@@ -4181,22 +4300,66 @@ def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
 
     if len(raw) > GENIUS_PAGE_MAX_BYTES:
         raise RuntimeError("Genius song page exceeded the allowed response size.")
-
     page_html = raw.decode("utf-8", errors="replace")
-    lyrics_html = extract_genius_lyrics_html(page_html)
+    return extract_genius_lyrics_html(page_html), page_url
+
+
+def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
+    details_payload = genius_song_request(song_id)
+    response = details_payload.get("response")
+    song = response.get("song") if isinstance(response, dict) else None
+    if not isinstance(song, dict):
+        raise RuntimeError("Genius did not return song metadata for the requested song.")
+
+    page_data_error = ""
+    try:
+        lyrics_html, source_url = fetch_genius_song_page_data(song)
+        source = "genius_page_data"
+    except Exception as error:
+        page_data_error = str(error)
+        try:
+            lyrics_html, source_url = fetch_genius_song_html_fallback(song, song_id)
+            source = "genius_html_fallback"
+        except Exception as fallback_error:
+            raise RuntimeError(
+                "Could not retrieve Genius lyrics through either backend path. "
+                f"Public page_data: {page_data_error} HTML fallback: {fallback_error}"
+            ) from fallback_error
+
     return {
         "song": build_genius_song_payload(song),
         "lyricsHtml": lyrics_html,
-        "url": page_url,
+        "url": str(song.get("url") or source_url or ""),
+        "lyricsSource": source,
     }
 
 
 def genius_referent_request(referent_id: int) -> dict[str, Any]:
     access_token = get_genius_access_token()
-    return genius_json_request(
-        f"https://api.genius.com/referents/{int(referent_id)}?text_format=plain",
-        access_token,
-    )
+    authenticated_error = ""
+    if access_token:
+        try:
+            return genius_json_request(
+                f"https://api.genius.com/referents/{int(referent_id)}?text_format=plain",
+                access_token,
+            )
+        except Exception as error:
+            authenticated_error = str(error)
+
+    # Genius also exposes read-only referent data on its public genius.com/api
+    # surface. This fallback keeps annotation reads independent of OAuth/client
+    # credentials after a song has already been identified.
+    try:
+        return genius_public_json_request(
+            f"https://genius.com/api/referents/{int(referent_id)}?text_format=plain"
+        )
+    except Exception as public_error:
+        if authenticated_error:
+            raise RuntimeError(
+                f"Genius referent lookup failed. Developer API: {authenticated_error} "
+                f"Public API: {public_error}"
+            ) from public_error
+        raise
 
 
 def build_genius_referent_payload(payload: dict[str, Any], referent_id: int) -> dict[str, Any]:
