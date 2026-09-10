@@ -4304,62 +4304,392 @@ def fetch_genius_song_html_fallback(song: dict[str, Any], song_id: int) -> tuple
     return extract_genius_lyrics_html(page_html), page_url
 
 
+LYRICS_TEXT_MAX_BYTES = 4 * 1024 * 1024
+GENIUS_REFERENTS_MAX_PAGES = 10
+
+
+def generic_json_request(url: str, user_agent: str, timeout: int = 15) -> Any:
+    request_headers = {
+        "Accept": "application/json",
+        "User-Agent": user_agent,
+    }
+    try:
+        with urlopen(Request(url, headers=request_headers), timeout=timeout) as response:
+            raw = response.read(LYRICS_TEXT_MAX_BYTES + 1)
+    except HTTPError as error:
+        raise RuntimeError(f"Request failed with HTTP {error.code} for {urlparse(url).netloc}.") from error
+    except URLError as error:
+        raise RuntimeError(f"Could not reach {urlparse(url).netloc}: {error.reason}") from error
+
+    if len(raw) > LYRICS_TEXT_MAX_BYTES:
+        raise RuntimeError(f"Response from {urlparse(url).netloc} exceeded the allowed size.")
+    try:
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{urlparse(url).netloc} returned unreadable JSON.") from error
+
+
+def lyrics_text_from_synced(value: Any) -> str:
+    lines: list[str] = []
+    for raw_line in str(value or "").splitlines():
+        line = re.sub(r"^(?:\[[^\]]+\])+\s*", "", raw_line).rstrip()
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def token_overlap_score(left: Any, right: Any) -> float:
+    left_tokens = set(normalize_lyrics_match_text(left).split())
+    right_tokens = set(normalize_lyrics_match_text(right).split())
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / max(len(left_tokens), len(right_tokens))
+
+
+def score_external_lyrics_candidate(candidate: dict[str, Any], song: dict[str, Any]) -> float:
+    target_title = clean_lyrics_track_title(song.get("title") or song.get("title_with_featured") or "")
+    primary_artist = song.get("primary_artist") if isinstance(song.get("primary_artist"), dict) else {}
+    target_artist = str(primary_artist.get("name") or song.get("artist_names") or "").strip()
+    album = song.get("album") if isinstance(song.get("album"), dict) else {}
+    target_album = str(album.get("name") or "").strip()
+
+    candidate_title = clean_lyrics_track_title(candidate.get("trackName") or candidate.get("name") or "")
+    candidate_artist = str(candidate.get("artistName") or "").strip()
+    candidate_album = str(candidate.get("albumName") or "").strip()
+
+    title_norm = normalize_lyrics_match_text(target_title)
+    candidate_title_norm = normalize_lyrics_match_text(candidate_title)
+    artist_norm = normalize_lyrics_match_text(target_artist)
+    candidate_artist_norm = normalize_lyrics_match_text(candidate_artist)
+    album_norm = normalize_lyrics_match_text(target_album)
+    candidate_album_norm = normalize_lyrics_match_text(candidate_album)
+
+    score = 0.0
+    if title_norm and candidate_title_norm:
+        if title_norm == candidate_title_norm:
+            score += 100.0
+        elif title_norm in candidate_title_norm or candidate_title_norm in title_norm:
+            score += 72.0
+        else:
+            score += 60.0 * token_overlap_score(target_title, candidate_title)
+
+    if artist_norm and candidate_artist_norm:
+        if artist_norm == candidate_artist_norm:
+            score += 70.0
+        elif artist_norm in candidate_artist_norm or candidate_artist_norm in artist_norm:
+            score += 52.0
+        else:
+            score += 45.0 * token_overlap_score(target_artist, candidate_artist)
+
+    if album_norm and candidate_album_norm:
+        if album_norm == candidate_album_norm:
+            score += 20.0
+        elif album_norm in candidate_album_norm or candidate_album_norm in album_norm:
+            score += 12.0
+        else:
+            score += 8.0 * token_overlap_score(target_album, candidate_album)
+
+    if str(candidate.get("plainLyrics") or "").strip() or str(candidate.get("syncedLyrics") or "").strip():
+        score += 5.0
+    return score
+
+
+def fetch_lrclib_lyrics(song: dict[str, Any]) -> tuple[str, str]:
+    title = clean_lyrics_track_title(song.get("title") or song.get("title_with_featured") or "")
+    primary_artist = song.get("primary_artist") if isinstance(song.get("primary_artist"), dict) else {}
+    artist = str(primary_artist.get("name") or song.get("artist_names") or "").strip()
+    album = song.get("album") if isinstance(song.get("album"), dict) else {}
+    album_name = str(album.get("name") or "").strip()
+    if not title or not artist:
+        raise RuntimeError("Genius song metadata did not contain enough information to find lyric text.")
+
+    searches = [
+        {"track_name": title, "artist_name": artist, **({"album_name": album_name} if album_name else {})},
+        {"q": f"{artist} {title}"},
+    ]
+    seen_ids: set[str] = set()
+    candidates: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for params in searches:
+        url = "https://lrclib.net/api/search?" + urlencode(params)
+        try:
+            payload = generic_json_request(
+                url,
+                "NavincitronLyrics/1.2 (+https://www.navincitron.com)",
+            )
+        except Exception as error:
+            errors.append(str(error))
+            continue
+        if not isinstance(payload, list):
+            continue
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "")
+            if item_id and item_id in seen_ids:
+                continue
+            if item_id:
+                seen_ids.add(item_id)
+            candidates.append(item)
+        if candidates:
+            break
+
+    usable: list[tuple[float, dict[str, Any], str]] = []
+    for candidate in candidates:
+        plain = str(candidate.get("plainLyrics") or "").strip()
+        if not plain:
+            plain = lyrics_text_from_synced(candidate.get("syncedLyrics"))
+        if not plain or bool(candidate.get("instrumental")):
+            continue
+        usable.append((score_external_lyrics_candidate(candidate, song), candidate, plain))
+
+    if not usable:
+        detail = f" ({'; '.join(errors)})" if errors else ""
+        raise RuntimeError(f"LRCLIB did not return lyric text for this song{detail}.")
+
+    usable.sort(key=lambda item: item[0], reverse=True)
+    score, candidate, plain = usable[0]
+    if score < 80.0:
+        raise RuntimeError(
+            "LRCLIB returned candidates, but none matched the Genius song confidently enough "
+            f"(best score {score:.1f})."
+        )
+    source_id = str(candidate.get("id") or "").strip()
+    source_url = f"https://lrclib.net/tracks/{source_id}" if source_id else "https://lrclib.net/"
+    return plain, source_url
+
+
+def fetch_lyrics_ovh(song: dict[str, Any]) -> tuple[str, str]:
+    title = clean_lyrics_track_title(song.get("title") or song.get("title_with_featured") or "")
+    primary_artist = song.get("primary_artist") if isinstance(song.get("primary_artist"), dict) else {}
+    artist = str(primary_artist.get("name") or song.get("artist_names") or "").strip()
+    if not title or not artist:
+        raise RuntimeError("Genius song metadata did not contain enough information for lyrics.ovh.")
+    url = f"https://api.lyrics.ovh/v1/{quote(artist, safe='')}/{quote(title, safe='')}"
+    payload = generic_json_request(url, "NavincitronLyrics/1.2 (+https://www.navincitron.com)")
+    if not isinstance(payload, dict):
+        raise RuntimeError("lyrics.ovh returned an invalid response.")
+    lyrics = str(payload.get("lyrics") or "").strip()
+    if not lyrics:
+        raise RuntimeError(str(payload.get("error") or "lyrics.ovh did not return lyric text."))
+    return lyrics, "https://lyrics.ovh/"
+
+
+def genius_song_referents(song_id: int) -> list[dict[str, Any]]:
+    access_token = get_genius_access_token()
+    referents: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+
+    for page in range(1, GENIUS_REFERENTS_MAX_PAGES + 1):
+        url = (
+            "https://api.genius.com/referents?"
+            + urlencode({
+                "song_id": int(song_id),
+                "per_page": 50,
+                "page": page,
+                "text_format": "plain",
+            })
+        )
+        payload = genius_json_request(url, access_token)
+        response = payload.get("response")
+        page_referents = response.get("referents") if isinstance(response, dict) else None
+        if not isinstance(page_referents, list) or not page_referents:
+            break
+        for referent in page_referents:
+            if not isinstance(referent, dict) or bool(referent.get("is_description")):
+                continue
+            try:
+                referent_id = int(referent.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if referent_id <= 0 or referent_id in seen_ids:
+                continue
+            fragment = str(referent.get("fragment") or "").strip()
+            annotations = referent.get("annotations")
+            if not fragment or not isinstance(annotations, list) or not annotations:
+                continue
+            seen_ids.add(referent_id)
+            referents.append(referent)
+        if len(page_referents) < 50:
+            break
+
+    return referents
+
+
+def lyrics_match_projection(value: Any) -> tuple[str, list[int]]:
+    original = str(value or "")
+    chars: list[str] = []
+    indexes: list[int] = []
+
+    for original_index, original_char in enumerate(original):
+        expanded = " and " if original_char == "&" else unicodedata.normalize("NFKD", original_char.casefold())
+        for character in expanded:
+            if unicodedata.combining(character) or character in {"’", "'"}:
+                continue
+            output = character if character.isalnum() else " "
+            if output == " ":
+                if not chars or chars[-1] == " ":
+                    continue
+                chars.append(" ")
+                indexes.append(original_index)
+                continue
+            chars.append(output)
+            indexes.append(original_index)
+
+    while chars and chars[-1] == " ":
+        chars.pop()
+        indexes.pop()
+    return "".join(chars), indexes
+
+
+def find_referent_span(
+    lyrics_projection: str,
+    projection_indexes: list[int],
+    fragment_projection: str,
+    start_at: int = 0,
+) -> tuple[int, int, int] | None:
+    search_at = max(0, int(start_at))
+    while fragment_projection and search_at <= len(lyrics_projection):
+        position = lyrics_projection.find(fragment_projection, search_at)
+        if position < 0:
+            return None
+        end_position = position + len(fragment_projection)
+        left_ok = position == 0 or lyrics_projection[position - 1] == " " or fragment_projection[0] == " "
+        right_ok = end_position == len(lyrics_projection) or lyrics_projection[end_position:end_position + 1] == " " or fragment_projection[-1:] == " "
+        if left_ok and right_ok and end_position - 1 < len(projection_indexes):
+            original_start = projection_indexes[position]
+            original_end = projection_indexes[end_position - 1] + 1
+            return original_start, original_end, end_position
+        search_at = position + 1
+    return None
+
+
+def spans_overlap(start: int, end: int, intervals: list[tuple[int, int, dict[str, Any]]]) -> bool:
+    return any(start < existing_end and end > existing_start for existing_start, existing_end, _ in intervals)
+
+
+def build_genius_annotated_lyrics_html(lyrics_text: str, referents: list[dict[str, Any]]) -> tuple[str, int]:
+    lyrics_projection, projection_indexes = lyrics_match_projection(lyrics_text)
+    prepared: list[tuple[int, int, dict[str, Any], str]] = []
+    for order, referent in enumerate(referents):
+        fragment_projection, _ = lyrics_match_projection(referent.get("fragment") or "")
+        if not fragment_projection:
+            continue
+        prepared.append((len(fragment_projection), order, referent, fragment_projection))
+
+    # Longer referents are anchored first so a one-word annotation cannot consume
+    # the location needed by a more specific multi-line/multi-word referent.
+    prepared.sort(key=lambda item: (-item[0], item[1]))
+    intervals: list[tuple[int, int, dict[str, Any]]] = []
+    fragment_cursors: dict[str, int] = {}
+
+    for _, _, referent, fragment_projection in prepared:
+        cursor = fragment_cursors.get(fragment_projection, 0)
+        while True:
+            match = find_referent_span(lyrics_projection, projection_indexes, fragment_projection, cursor)
+            if match is None:
+                break
+            start, end, next_cursor = match
+            fragment_cursors[fragment_projection] = next_cursor
+            cursor = next_cursor
+            if not spans_overlap(start, end, intervals):
+                intervals.append((start, end, referent))
+                break
+
+    intervals.sort(key=lambda item: item[0])
+    pieces: list[str] = []
+    position = 0
+
+    def escaped_lyrics(value: str) -> str:
+        return html_escape(value, quote=False).replace("\n", "<br>\n")
+
+    for start, end, referent in intervals:
+        if start < position:
+            continue
+        pieces.append(escaped_lyrics(lyrics_text[position:start]))
+        try:
+            referent_id = int(referent.get("id") or 0)
+        except (TypeError, ValueError):
+            referent_id = 0
+        referent_url = str(referent.get("url") or "").strip()
+        href = html_escape(referent_url or "https://genius.com", quote=True)
+        fragment_html = escaped_lyrics(lyrics_text[start:end])
+        pieces.append(
+            f'<a class="lyrics-genius-annotated-fragment" '
+            f'data-genius-referent-id="{referent_id}" href="{href}" '
+            f'target="_blank" rel="noopener noreferrer">{fragment_html}</a>'
+        )
+        position = end
+
+    pieces.append(escaped_lyrics(lyrics_text[position:]))
+    html = '<div class="lyrics-genius-verse">' + "".join(pieces) + "</div>"
+    return html, len(intervals)
+
+
 def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
+    """Compose clickable Genius annotations without making any request to genius.com.
+
+    Genius's documented developer API supplies song metadata and referents/annotations,
+    but not the complete lyric text. The complete text is therefore obtained from a
+    lyrics-text provider and the Genius referent fragments are mapped back onto it.
+    """
     details_payload = genius_song_request(song_id)
     response = details_payload.get("response")
     song = response.get("song") if isinstance(response, dict) else None
     if not isinstance(song, dict):
         raise RuntimeError("Genius did not return song metadata for the requested song.")
 
-    page_data_error = ""
+    referents = genius_song_referents(song_id)
+    lyric_errors: list[str] = []
+    lyrics_text = ""
+    source_url = ""
+    source = ""
+
     try:
-        lyrics_html, source_url = fetch_genius_song_page_data(song)
-        source = "genius_page_data"
+        lyrics_text, source_url = fetch_lrclib_lyrics(song)
+        source = "lrclib_text+genius_api_annotations"
     except Exception as error:
-        page_data_error = str(error)
+        lyric_errors.append(f"LRCLIB: {error}")
         try:
-            lyrics_html, source_url = fetch_genius_song_html_fallback(song, song_id)
-            source = "genius_html_fallback"
+            lyrics_text, source_url = fetch_lyrics_ovh(song)
+            source = "lyrics_ovh_text+genius_api_annotations"
         except Exception as fallback_error:
-            raise RuntimeError(
-                "Could not retrieve Genius lyrics through either backend path. "
-                f"Public page_data: {page_data_error} HTML fallback: {fallback_error}"
-            ) from fallback_error
+            lyric_errors.append(f"lyrics.ovh: {fallback_error}")
+
+    if not lyrics_text:
+        raise RuntimeError(
+            "Genius API metadata/annotations were reachable, but no complete lyric-text "
+            "provider returned this song. " + " ".join(lyric_errors)
+        )
+
+    lyrics_html, annotation_match_count = build_genius_annotated_lyrics_html(lyrics_text, referents)
+    song_payload = build_genius_song_payload(song)
+    if referents and annotation_match_count == 0:
+        raise RuntimeError(
+            "Lyric text was found, but none of the Genius annotation fragments matched it. "
+            "This usually means the text provider returned a different version/transcription of the song."
+        )
 
     return {
-        "song": build_genius_song_payload(song),
+        "song": song_payload,
         "lyricsHtml": lyrics_html,
         "url": str(song.get("url") or source_url or ""),
         "lyricsSource": source,
+        "lyricsTextSourceUrl": source_url,
+        "geniusReferentCount": len(referents),
+        "annotationMatchCount": annotation_match_count,
     }
 
 
 def genius_referent_request(referent_id: int) -> dict[str, Any]:
+    # Do not fall back to genius.com/api here. The deployed backend is receiving
+    # HTTP 403 from genius.com, while api.genius.com is already working for song
+    # matching. Referent/annotation reads are supported by the authenticated API.
     access_token = get_genius_access_token()
-    authenticated_error = ""
-    if access_token:
-        try:
-            return genius_json_request(
-                f"https://api.genius.com/referents/{int(referent_id)}?text_format=plain",
-                access_token,
-            )
-        except Exception as error:
-            authenticated_error = str(error)
-
-    # Genius also exposes read-only referent data on its public genius.com/api
-    # surface. This fallback keeps annotation reads independent of OAuth/client
-    # credentials after a song has already been identified.
-    try:
-        return genius_public_json_request(
-            f"https://genius.com/api/referents/{int(referent_id)}?text_format=plain"
-        )
-    except Exception as public_error:
-        if authenticated_error:
-            raise RuntimeError(
-                f"Genius referent lookup failed. Developer API: {authenticated_error} "
-                f"Public API: {public_error}"
-            ) from public_error
-        raise
+    return genius_json_request(
+        f"https://api.genius.com/referents/{int(referent_id)}?text_format=plain",
+        access_token,
+    )
 
 
 def build_genius_referent_payload(payload: dict[str, Any], referent_id: int) -> dict[str, Any]:
