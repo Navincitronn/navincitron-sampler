@@ -3937,11 +3937,22 @@ def genius_json_request(url: str, access_token: str) -> dict[str, Any]:
         with urlopen(genius_request, timeout=12) as response:
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
     except HTTPError as error:
-        if error.code in {401, 403}:
+        if error.code == 401:
             raise RuntimeError(
-                f"Genius rejected the configured access token (HTTP {error.code}). "
+                "Genius rejected the configured access token (HTTP 401). "
                 "Generate a Client Access Token in the Genius API Clients dashboard "
                 "and update GENIUS_ACCESS_TOKEN."
+            ) from error
+        if error.code == 429:
+            retry_after = str(error.headers.get("Retry-After") or "").strip() if error.headers else ""
+            retry_note = f" Retry-After: {retry_after}." if retry_after else ""
+            raise RuntimeError(
+                "Genius API rate limit reached (HTTP 429)." + retry_note
+            ) from error
+        if error.code == 403:
+            raise RuntimeError(
+                "Genius API request was forbidden (HTTP 403). This is distinct from HTTP 401 "
+                "and is not automatically classified as token expiration."
             ) from error
         raise RuntimeError(f"Genius API request failed with HTTP {error.code}.") from error
     except URLError as error:
@@ -6638,19 +6649,31 @@ def build_genius_song_payload(song: dict[str, Any]) -> dict[str, Any]:
 
 
 def lookup_genius_song(track: dict[str, Any]) -> dict[str, Any] | None:
-    manual_result = lookup_genius_song_from_manual_album_link(track)
-    if manual_result is not None:
-        return manual_result
-
     cache_key = f"v{GENIUS_LOOKUP_CACHE_VERSION}::" + str(track.get("key") or "")
     now = time.time()
 
+    # Check the per-track cache before the manual album mapping path. A manually
+    # linked Genius album resolves a song ID and then performs /songs/{id}; with
+    # /api/lyrics/current polled every few seconds, doing manual resolution first
+    # caused that details request to bypass the normal seven-day cache entirely.
     with GENIUS_LOOKUP_CACHE_LOCK:
         cached = GENIUS_LOOKUP_CACHE.get(cache_key)
         if isinstance(cached, dict):
             ttl = GENIUS_MATCH_TTL_SECONDS if cached.get("value") else GENIUS_MISS_TTL_SECONDS
             if now - float(cached.get("timestamp") or 0) < ttl:
                 return cached.get("value")
+
+    manual_result = lookup_genius_song_from_manual_album_link(track)
+    if manual_result is not None:
+        with GENIUS_LOOKUP_CACHE_LOCK:
+            GENIUS_LOOKUP_CACHE[cache_key] = {"timestamp": now, "value": manual_result}
+            if len(GENIUS_LOOKUP_CACHE) > GENIUS_LOOKUP_CACHE_MAX_ITEMS:
+                oldest_key = min(
+                    GENIUS_LOOKUP_CACHE,
+                    key=lambda key: float(GENIUS_LOOKUP_CACHE[key].get("timestamp") or 0),
+                )
+                GENIUS_LOOKUP_CACHE.pop(oldest_key, None)
+        return manual_result
 
     title = str(track.get("title") or "").strip()
     artists = [str(value).strip() for value in (track.get("artists") or []) if str(value).strip()]
