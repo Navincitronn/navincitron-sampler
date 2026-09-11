@@ -4662,7 +4662,7 @@ def genius_song_referents(song_id: int) -> list[dict[str, Any]]:
                 "song_id": int(song_id),
                 "per_page": 50,
                 "page": page,
-                "text_format": "plain",
+                "text_format": "html,plain",
             })
         )
         payload = genius_json_request(url, access_token)
@@ -4907,10 +4907,145 @@ def genius_referent_request(referent_id: int) -> dict[str, Any]:
     # matching. Referent/annotation reads are supported by the authenticated API.
     access_token = get_genius_access_token()
     return genius_json_request(
-        f"https://api.genius.com/referents/{int(referent_id)}?text_format=plain",
+        f"https://api.genius.com/referents/{int(referent_id)}?text_format=html%2Cplain",
         access_token,
     )
 
+
+
+GENIUS_ANNOTATION_ALLOWED_TAGS = {
+    "a", "b", "blockquote", "br", "code", "div", "em", "figcaption", "figure",
+    "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i", "img", "li", "ol", "p",
+    "pre", "span", "strong", "u", "ul",
+}
+GENIUS_ANNOTATION_VOID_TAGS = {"br", "hr", "img"}
+GENIUS_ANNOTATION_BLOCKED_TAGS = {"script", "style", "noscript", "svg", "object", "embed", "form", "input", "textarea", "button"}
+
+
+def _safe_genius_annotation_url(value: Any, *, image: bool = False) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return parsed.geturl()
+
+
+class GeniusAnnotationHTMLSanitizer(HTMLParser):
+    """Keep Genius annotation presentation HTML while stripping active content.
+
+    This preserves paragraph/line-break structure and ordinary embedded images so
+    NAVINCITRON can display the annotation as Genius authored it without executing
+    Genius scripts or arbitrary event handlers.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.parts: list[str] = []
+        self.skip_depth = 0
+        self.open_tags: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = str(tag or "").casefold()
+        if self.skip_depth:
+            if tag not in GENIUS_ANNOTATION_VOID_TAGS:
+                self.skip_depth += 1
+            return
+        if tag in GENIUS_ANNOTATION_BLOCKED_TAGS:
+            if tag not in GENIUS_ANNOTATION_VOID_TAGS:
+                self.skip_depth = 1
+            return
+        if tag not in GENIUS_ANNOTATION_ALLOWED_TAGS:
+            return
+
+        attr_map = {str(key or "").casefold(): str(value or "") for key, value in attrs}
+        safe_attrs: list[str] = []
+        if tag == "a":
+            href = _safe_genius_annotation_url(attr_map.get("href"))
+            if href:
+                safe_attrs.extend([
+                    f'href="{html_escape(href, quote=True)}"',
+                    'target="_blank"',
+                    'rel="noopener noreferrer"',
+                ])
+            title = attr_map.get("title", "").strip()
+            if title:
+                safe_attrs.append(f'title="{html_escape(title, quote=True)}"')
+        elif tag == "img":
+            src = _safe_genius_annotation_url(attr_map.get("src"), image=True)
+            if not src:
+                return
+            safe_attrs.append(f'src="{html_escape(src, quote=True)}"')
+            for attr_name in ("alt", "title"):
+                value = attr_map.get(attr_name, "").strip()
+                if value:
+                    safe_attrs.append(f'{attr_name}="{html_escape(value, quote=True)}"')
+            for attr_name in ("width", "height"):
+                value = attr_map.get(attr_name, "").strip()
+                if value.isdigit() and 0 < int(value) <= 5000:
+                    safe_attrs.append(f'{attr_name}="{value}"')
+            safe_attrs.extend(['loading="lazy"', 'decoding="async"'])
+
+        suffix = (" " + " ".join(safe_attrs)) if safe_attrs else ""
+        self.parts.append(f"<{tag}{suffix}>")
+        if tag not in GENIUS_ANNOTATION_VOID_TAGS:
+            self.open_tags.append(tag)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = str(tag or "").casefold()
+        if self.skip_depth:
+            self.skip_depth -= 1
+            return
+        if tag not in GENIUS_ANNOTATION_ALLOWED_TAGS or tag in GENIUS_ANNOTATION_VOID_TAGS:
+            return
+        if tag in self.open_tags:
+            # Close only tags we emitted. Pop back to this tag to keep malformed
+            # upstream markup from producing an invalid local tree.
+            while self.open_tags:
+                open_tag = self.open_tags.pop()
+                self.parts.append(f"</{open_tag}>")
+                if open_tag == tag:
+                    break
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip_depth:
+            self.parts.append(html_escape(str(data or ""), quote=False))
+
+    def handle_entityref(self, name: str) -> None:
+        if not self.skip_depth:
+            self.parts.append(f"&{html_escape(str(name or ''), quote=False)};")
+
+    def handle_charref(self, name: str) -> None:
+        if not self.skip_depth:
+            self.parts.append(f"&#{html_escape(str(name or ''), quote=False)};")
+
+    def html(self) -> str:
+        while self.open_tags:
+            self.parts.append(f"</{self.open_tags.pop()}>")
+        return "".join(self.parts).strip()
+
+
+def sanitized_genius_annotation_html(value: Any) -> str:
+    raw_html = ""
+    if isinstance(value, dict):
+        raw_html = str(value.get("html") or "")
+    elif isinstance(value, str) and "<" in value:
+        raw_html = value
+    if not raw_html.strip():
+        return ""
+    parser = GeniusAnnotationHTMLSanitizer()
+    parser.feed(raw_html)
+    parser.close()
+    return parser.html()
 
 def build_genius_referent_payload(payload: dict[str, Any], referent_id: int) -> dict[str, Any]:
     response = payload.get("response")
@@ -4930,8 +5065,10 @@ def build_genius_referent_payload(payload: dict[str, Any], referent_id: int) -> 
         for annotation in annotations:
             if not isinstance(annotation, dict):
                 continue
-            body = plain_text_from_genius_value(annotation.get("body"))
-            if not body:
+            annotation_body = annotation.get("body")
+            body = plain_text_from_genius_value(annotation_body)
+            body_html = sanitized_genius_annotation_html(annotation_body)
+            if not body and not body_html:
                 continue
             authors: list[str] = []
             raw_authors = annotation.get("authors")
@@ -4950,6 +5087,7 @@ def build_genius_referent_payload(payload: dict[str, Any], referent_id: int) -> 
             annotations_payload.append({
                 "id": annotation.get("id"),
                 "body": body,
+                "bodyHtml": body_html,
                 "authors": authors,
                 "verified": bool(annotation.get("verified")),
                 "votesTotal": int(annotation.get("votes_total") or 0),
@@ -7361,7 +7499,7 @@ def api_lyrics_genius_referents(song_id: int):
             "ok": True,
             "songId": int(song_id),
             "referents": referents,
-            "count": len(referents),
+            "count": sum(len(item.get("annotations") or []) for item in referents),
         })
         response.headers["Cache-Control"] = "public, max-age=3600"
         return response
