@@ -3633,15 +3633,36 @@ def write_lyrics_genius_album_link(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_genius_album_url(raw_url: Any) -> str:
+    """Validate and canonicalize a Genius album URL.
+
+    Genius commonly exposes both /albums/... and /amp/albums/... variants.  The
+    latter is a valid public Genius URL, but the album API/matching code should
+    operate on the canonical non-AMP path so URL comparisons remain stable.
+    """
     url = str(raw_url or "").strip()
     try:
         parsed = urlparse(url)
     except Exception as error:
         raise ValueError("Enter a valid Genius album URL.") from error
+
     host = (parsed.hostname or "").casefold().rstrip(".")
-    if host not in {"genius.com", "www.genius.com"} or not parsed.path.casefold().startswith("/albums/"):
+    path = parsed.path or ""
+    path_folded = path.casefold()
+
+    if host not in {"genius.com", "www.genius.com"}:
         raise ValueError("Enter a Genius album URL in the form https://genius.com/albums/Artist/Album.")
-    return url
+
+    if path_folded.startswith("/amp/albums/"):
+        path = path[4:]  # /amp/albums/... -> /albums/...
+        path_folded = path.casefold()
+
+    if not path_folded.startswith("/albums/"):
+        raise ValueError("Enter a Genius album URL in the form https://genius.com/albums/Artist/Album.")
+
+    # Store a stable canonical Genius URL. Query/fragment components are not
+    # needed for album identity and can make exact-path matching unreliable.
+    canonical = parsed._replace(scheme="https", netloc="genius.com", path=path.rstrip("/"), params="", query="", fragment="")
+    return canonical.geturl()
 
 
 def genius_album_id_from_page_html(html: str) -> int | None:
@@ -3664,6 +3685,7 @@ def fetch_genius_album_id_from_url(
     url: str,
     context_artist: str = "",
     context_album: str = "",
+    context_track: str = "",
 ) -> int:
     """Resolve a Genius album URL without depending on Genius page HTML.
 
@@ -3712,12 +3734,33 @@ def fetch_genius_album_id_from_url(
     url_album_tokens = [token for token in normalize_lyrics_match_text(url_album_hint).split() if token]
     distinctive_tokens = [token for token in url_album_tokens if len(token) >= 4 and token not in {"live", "album", "deluxe", "remastered"}]
 
+    # Genius search is song-centric, not album-centric.  When the user links the
+    # album from lyrics.html we already know the currently playing track, which
+    # is a much stronger way to discover one song from the requested album and
+    # then read its album.id from /songs/<id>.  Strip common featured-artist
+    # suffixes used by Spotify so they do not dilute that exact-song query.
+    track_hint = clean_lyrics_track_title(context_track)
+    track_hint = re.sub(
+        r"\s*[\[(](?:feat(?:uring)?\.?|ft\.?|with)\b[^\])]*[\])]\s*",
+        " ",
+        track_hint,
+        flags=re.IGNORECASE,
+    )
+    track_hint = re.sub(r"\s+", " ", track_hint).strip()
+
     queries: list[str] = []
     def add_query(*values: Any) -> None:
         query = " ".join(str(value or "").strip() for value in values if str(value or "").strip())
         query = re.sub(r"\s+", " ", query).strip()
         if query and query.casefold() not in {existing.casefold() for existing in queries}:
             queries.append(query)
+
+    if track_hint:
+        # Exact current-track searches go first because /search ranks songs, not
+        # albums.  A matching song's detailed API payload contains album.id.
+        add_query(context_artist or url_artist_hint, track_hint)
+        add_query(track_hint, context_artist or url_artist_hint)
+        add_query(track_hint)
 
     for token in distinctive_tokens:
         add_query(url_artist_hint or context_artist, token)
@@ -3730,7 +3773,7 @@ def fetch_genius_album_id_from_url(
     best_candidate: tuple[float, int] | None = None
     seen_song_ids: set[int] = set()
 
-    for query in queries[:8]:
+    for query in queries[:12]:
         try:
             search_payload = genius_search_request(query)
         except Exception:
@@ -7413,11 +7456,12 @@ def lyrics_genius_album_link():
     payload = request.get_json(silent=True) or {}
     artist = str(payload.get("artist") or "").strip()
     album = str(payload.get("album") or "").strip()
+    track = str(payload.get("track") or "").strip()
     if not album:
         return jsonify({"ok": False, "error": "The currently playing album does not have a usable title."}), 400
     try:
         url = validate_genius_album_url(payload.get("url"))
-        album_id = fetch_genius_album_id_from_url(url, artist, album)
+        album_id = fetch_genius_album_id_from_url(url, artist, album, track)
         tracks = fetch_genius_album_tracks(album_id)
         identity = lyrics_manual_album_identity(artist, album)
         if not identity:
