@@ -135,7 +135,7 @@ TOPSTER_ADMIN_ALLOWED_IPS = {
     if item.strip()
 }
 
-TOPSTER_STORE_KEYS = {"grid", "ranked", "draft", "checklist", "rolling_stone_500_albums_2003", "rolling_stone_500_albums_2012", "rolling_stone_500_albums_2020", "rolling_stone_500_albums_2023", "nme_500_albums", "1001_albums_you_must_hear_before_you_die", "rate_your_music", "rolling_stone_greatest_singers_of_all_time_2023", "rolling_stone_greatest_singers_of_all_time_2008"}
+TOPSTER_STORE_KEYS = {"grid", "ranked", "draft", "checklist", "rolling_stone_500_albums_2003", "rolling_stone_500_albums_2012", "rolling_stone_500_albums_2020", "rolling_stone_500_albums_2023", "nme_500_albums", "1001_albums_you_must_hear_before_you_die", "rate_your_music", "rolling_stone_greatest_singers_of_all_time_2023", "rolling_stone_greatest_singers_of_all_time_2008", "rolling_stone_greatest_artists_2010"}
 TOPSTER_STORE_ALIASES = {
     "grid": "grid",
     "grid-file": "grid",
@@ -194,6 +194,11 @@ TOPSTER_STORE_ALIASES = {
     "rolling-stone-greatest-singers-of-all-time-2023-file": "rolling_stone_greatest_singers_of_all_time_2023",
     "rolling_stone_greatest_singers_of_all_time_2023_draft": "rolling_stone_greatest_singers_of_all_time_2023",
     "rolling_stone_greatest_singers_of_all_time_2023_list": "rolling_stone_greatest_singers_of_all_time_2023",
+    "rolling_stone_greatest_artists_2010": "rolling_stone_greatest_artists_2010",
+    "rolling-stone-greatest-artists-2010": "rolling_stone_greatest_artists_2010",
+    "rolling-stone-greatest-artists-2010-file": "rolling_stone_greatest_artists_2010",
+    "rolling_stone_greatest_artists_2010_draft": "rolling_stone_greatest_artists_2010",
+    "rolling_stone_greatest_artists_2010_list": "rolling_stone_greatest_artists_2010",
     "rolling_stone_greatest_singers_of_all_time_2008": "rolling_stone_greatest_singers_of_all_time_2008",
     "rolling-stone-greatest-singers-of-all-time-2008": "rolling_stone_greatest_singers_of_all_time_2008",
     "rolling-stone-greatest-singers-of-all-time-2008-file": "rolling_stone_greatest_singers_of_all_time_2008",
@@ -234,6 +239,7 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
             "1001_albums_you_must_hear_before_you_die": data.get("1001_albums_you_must_hear_before_you_die") if isinstance(data.get("1001_albums_you_must_hear_before_you_die"), dict) else {},
             "rate_your_music": data.get("rate_your_music") if isinstance(data.get("rate_your_music"), dict) else {},
             "rolling_stone_greatest_singers_of_all_time_2023": data.get("rolling_stone_greatest_singers_of_all_time_2023") if isinstance(data.get("rolling_stone_greatest_singers_of_all_time_2023"), dict) else {},
+            "rolling_stone_greatest_artists_2010": data.get("rolling_stone_greatest_artists_2010") if isinstance(data.get("rolling_stone_greatest_artists_2010"), dict) else {},
             "rolling_stone_greatest_singers_of_all_time_2008": data.get("rolling_stone_greatest_singers_of_all_time_2008") if isinstance(data.get("rolling_stone_greatest_singers_of_all_time_2008"), dict) else {},
         }
 
@@ -253,6 +259,7 @@ def get_topster_source_map(path: Path) -> dict[str, dict[str, Any]]:
         "1001_albums_you_must_hear_before_you_die": {},
         "rate_your_music": {},
         "rolling_stone_greatest_singers_of_all_time_2023": {},
+        "rolling_stone_greatest_artists_2010": {},
         "rolling_stone_greatest_singers_of_all_time_2008": {},
     }
 
@@ -682,6 +689,16 @@ def redirect_rolling_stone_greatest_singers_2023_draft_html():
 @app.route("/rolling_stone_greatest_singers_of_all_time_2023_list.html")
 def redirect_rolling_stone_greatest_singers_2023_list_html():
     return redirect_topster_frontend_page("rolling_stone_greatest_singers_of_all_time_2023_list.html")
+
+
+@app.route("/rolling_stone_greatest_artists_2010_draft.html")
+def redirect_rolling_stone_greatest_artists_2010_draft_html():
+    return redirect_topster_frontend_page("rolling_stone_greatest_artists_2010_draft.html")
+
+
+@app.route("/rolling_stone_greatest_artists_2010_list.html")
+def redirect_rolling_stone_greatest_artists_2010_list_html():
+    return redirect_topster_frontend_page("rolling_stone_greatest_artists_2010_list.html")
 
 
 @app.route("/rolling_stone_greatest_singers_of_all_time_2008_draft.html")
