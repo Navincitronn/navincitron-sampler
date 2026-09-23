@@ -4400,7 +4400,7 @@ def genius_payload_says_instrumental(value: Any) -> bool:
 def genius_instrumental_lyrics_html() -> str:
     return (
         '<div class="lyrics-genius-verse lyrics-genius-instrumental" '
-        'data-genius-instrumental="true">This song is an instrumental.</div>'
+        'data-genius-instrumental="true">This song is an instrumental track.</div>'
     )
 
 
@@ -5090,22 +5090,20 @@ def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
             source_errors.append(f"{source_name}: {error}")
 
     if not lyrics_text:
-        if genius_payload_says_instrumental(song):
-            return {
-                "song": song_payload,
-                "lyricsHtml": genius_instrumental_lyrics_html(),
-                "url": str(song.get("url") or ""),
-                "lyricsSource": "genius_instrumental_metadata",
-                "lyricsTextSourceUrl": str(song.get("url") or ""),
-                "geniusReferentCount": 0,
-                "annotationMatchCount": 0,
-                "instrumental": True,
-                "sourceErrors": source_errors,
-            }
-        raise RuntimeError(
-            "Could not obtain complete lyric text within the bounded native-lyrics request. "
-            + " ".join(source_errors)
-        )
+        # If every bounded lyrics source fails to return usable text, treat the
+        # track as instrumental instead of exposing a provider/network failure to
+        # the lyrics UI. This is intentionally the final no-lyrics fallback.
+        return {
+            "song": song_payload,
+            "lyricsHtml": genius_instrumental_lyrics_html(),
+            "url": str(song.get("url") or ""),
+            "lyricsSource": "no_lyrics_default_instrumental",
+            "lyricsTextSourceUrl": str(song.get("url") or ""),
+            "geniusReferentCount": 0,
+            "annotationMatchCount": 0,
+            "instrumental": True,
+            "sourceErrors": source_errors,
+        }
 
     lyrics_html, annotation_match_count = build_genius_annotated_lyrics_html(lyrics_text, referents)
     if referents and annotation_match_count == 0:
