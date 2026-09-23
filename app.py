@@ -4343,6 +4343,33 @@ def genius_page_data_path(song: dict[str, Any]) -> str:
     return f"/songs/{artist_slug}/{title_slug}"
 
 
+
+GENIUS_INSTRUMENTAL_TEXT_PATTERN = re.compile(
+    r"\bthis\s+song\s+is\s+an\s+instrumental\b",
+    flags=re.IGNORECASE,
+)
+
+
+def genius_payload_says_instrumental(value: Any) -> bool:
+    """Return True only when Genius data explicitly says the song is instrumental."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(GENIUS_INSTRUMENTAL_TEXT_PATTERN.search(html_unescape(value)))
+    if isinstance(value, dict):
+        return any(genius_payload_says_instrumental(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(genius_payload_says_instrumental(item) for item in value)
+    return False
+
+
+def genius_instrumental_lyrics_html() -> str:
+    return (
+        '<div class="lyrics-genius-verse lyrics-genius-instrumental" '
+        'data-genius-instrumental="true">This song is an instrumental.</div>'
+    )
+
+
 def extract_genius_page_data_lyrics(payload: dict[str, Any]) -> str:
     """Extract and sanitize lyrics_data.body.html from Genius page_data JSON."""
     response = payload.get("response") if isinstance(payload.get("response"), dict) else payload
@@ -4350,7 +4377,12 @@ def extract_genius_page_data_lyrics(payload: dict[str, Any]) -> str:
     if not isinstance(page_data, dict):
         page_data = payload.get("page_data")
     if not isinstance(page_data, dict):
+        if genius_payload_says_instrumental(payload):
+            return genius_instrumental_lyrics_html()
         raise RuntimeError("Genius page data did not contain page_data.")
+
+    if genius_payload_says_instrumental(page_data):
+        return genius_instrumental_lyrics_html()
 
     lyrics_data = page_data.get("lyrics_data")
     if not isinstance(lyrics_data, dict):
@@ -4903,14 +4935,16 @@ def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
                 for value in re.findall(r"data-genius-referent-id=['\"](\d+)['\"]", lyrics_html)
                 if str(value).isdigit() and int(value) > 0
             }
+            instrumental = 'data-genius-instrumental="true"' in lyrics_html
             return {
                 "song": song_payload,
                 "lyricsHtml": lyrics_html,
                 "url": str(song.get("url") or source_url or ""),
                 "lyricsSource": source_name,
                 "lyricsTextSourceUrl": source_url,
-                "geniusReferentCount": int(song_payload.get("annotationCount") or len(referent_ids)),
-                "annotationMatchCount": len(referent_ids),
+                "geniusReferentCount": 0 if instrumental else int(song_payload.get("annotationCount") or len(referent_ids)),
+                "annotationMatchCount": 0 if instrumental else len(referent_ids),
+                "instrumental": instrumental,
                 "sourceErrors": source_errors,
             }
         except Exception as error:
@@ -4937,6 +4971,18 @@ def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
             source_errors.append(f"{source_name}: {error}")
 
     if not lyrics_text:
+        if genius_payload_says_instrumental(song):
+            return {
+                "song": song_payload,
+                "lyricsHtml": genius_instrumental_lyrics_html(),
+                "url": str(song.get("url") or ""),
+                "lyricsSource": "genius_instrumental_metadata",
+                "lyricsTextSourceUrl": str(song.get("url") or ""),
+                "geniusReferentCount": 0,
+                "annotationMatchCount": 0,
+                "instrumental": True,
+                "sourceErrors": source_errors,
+            }
         raise RuntimeError(
             "Could not obtain complete lyric text within the bounded native-lyrics request. "
             + " ".join(source_errors)
