@@ -4404,6 +4404,60 @@ def genius_instrumental_lyrics_html() -> str:
     )
 
 
+def genius_reader_confirms_instrumental(song: dict[str, Any]) -> bool:
+    """Check the exact Genius song page through Jina Reader for the instrumental notice.
+
+    The Render backend is routinely denied by genius.com (HTTP 403), and the
+    authenticated /songs API does not consistently include Genius's web-only
+    instrumental designation for older catalog pages.  Reader renders the exact
+    public Genius URL without sending our Genius token, cookies, Spotify data, or
+    user credentials.  This is deliberately only a yes/no fallback; it is not used
+    as a lyrics source.
+    """
+    raw_url = str(song.get("url") or "").strip()
+    if not raw_url:
+        path = str(song.get("path") or "").strip()
+        if path:
+            raw_url = "https://genius.com" + (path if path.startswith("/") else "/" + path)
+    if not raw_url:
+        return False
+
+    try:
+        parsed = urlparse(raw_url)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if parsed.scheme != "https" or host not in {"genius.com", "www.genius.com"}:
+        return False
+
+    # Jina Reader's documented URL form is https://r.jina.ai/<target-url>.
+    reader_url = "https://r.jina.ai/" + raw_url
+    headers = {
+        "Accept": "text/plain, text/markdown, */*",
+        "User-Agent": "NavincitronLyrics/1.6 (+https://www.navincitron.com)",
+    }
+    try:
+        with urlopen(Request(reader_url, headers=headers), timeout=8) as response:
+            raw = response.read(2 * 1024 * 1024 + 1)
+    except (HTTPError, URLError, TimeoutError, OSError):
+        return False
+
+    if not raw or len(raw) > 2 * 1024 * 1024:
+        return False
+    rendered = html_unescape(raw.decode("utf-8", errors="replace"))
+    if GENIUS_INSTRUMENTAL_TEXT_PATTERN.search(rendered):
+        return True
+
+    # Reader may normalize the Genius empty-lyrics notice to a standalone
+    # "Instrumental" / "[Instrumental]" line rather than the full sentence.
+    for line in rendered.splitlines():
+        normalized = re.sub(r"[\s*_`>#-]+", " ", line).strip().casefold()
+        normalized = normalized.strip("[](){}.:;!?")
+        if normalized in {"instrumental", "this song is instrumental", "this song is an instrumental"}:
+            return True
+    return False
+
+
 def extract_genius_page_data_lyrics(payload: dict[str, Any]) -> str:
     """Extract and sanitize lyrics_data.body.html from Genius page_data JSON."""
     response = payload.get("response") if isinstance(payload.get("response"), dict) else payload
@@ -4955,6 +5009,20 @@ def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
     song_payload = build_genius_song_payload(song)
     source_errors: list[str] = []
 
+    # Check the authenticated Genius song payload before any scraping/fallbacks.
+    if genius_payload_says_instrumental(song):
+        return {
+            "song": song_payload,
+            "lyricsHtml": genius_instrumental_lyrics_html(),
+            "url": str(song.get("url") or ""),
+            "lyricsSource": "genius_instrumental_metadata",
+            "lyricsTextSourceUrl": str(song.get("url") or ""),
+            "geniusReferentCount": 0,
+            "annotationMatchCount": 0,
+            "instrumental": True,
+            "sourceErrors": source_errors,
+        }
+
     # Prefer the actual Genius transcription, including section headings and
     # Genius's own annotation boundaries.  Only page_data is needed; trying the
     # entire song HTML as a second and fourth long-running path was redundant.
@@ -4983,6 +5051,23 @@ def fetch_genius_song_lyrics(song_id: int) -> dict[str, Any]:
             }
         except Exception as error:
             source_errors.append(f"{source_name}: {error}")
+
+    # The exact Genius page can explicitly say that a track is instrumental even
+    # when /songs/{id} omits that flag and Render cannot read genius.com directly.
+    # Verify that notice through a browser-rendering reader before treating the
+    # absence of lyric text as an error.
+    if genius_reader_confirms_instrumental(song):
+        return {
+            "song": song_payload,
+            "lyricsHtml": genius_instrumental_lyrics_html(),
+            "url": str(song.get("url") or ""),
+            "lyricsSource": "genius_instrumental_page_notice",
+            "lyricsTextSourceUrl": str(song.get("url") or ""),
+            "geniusReferentCount": 0,
+            "annotationMatchCount": 0,
+            "instrumental": True,
+            "sourceErrors": source_errors,
+        }
 
     # Genius's authenticated API remains reachable on this deployment.  Fetch
     # referents only now, because they are required to anchor annotations onto a
