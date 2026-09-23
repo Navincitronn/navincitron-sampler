@@ -4351,15 +4351,49 @@ GENIUS_INSTRUMENTAL_TEXT_PATTERN = re.compile(
 
 
 def genius_payload_says_instrumental(value: Any) -> bool:
-    """Return True only when Genius data explicitly says the song is instrumental."""
+    """Return True only when Genius data explicitly identifies an instrumental.
+
+    Genius can expose the designation in more than one representation:
+      * visible text such as "This song is an instrumental"
+      * an ``instrumental`` boolean on song/page data
+      * a lyrics placeholder reason whose value names an instrumental
+
+    The previous detector only searched string values, so ``{"instrumental": true}``
+    was silently ignored and genuine instrumental pages fell through to LRCLIB /
+    lyrics.ovh before surfacing the generic no-lyrics error.
+    """
     if value is None:
         return False
+
     if isinstance(value, str):
-        return bool(GENIUS_INSTRUMENTAL_TEXT_PATTERN.search(html_unescape(value)))
+        normalized = html_unescape(value).strip()
+        return bool(
+            GENIUS_INSTRUMENTAL_TEXT_PATTERN.search(normalized)
+            or normalized.casefold() in {"instrumental", "[instrumental]"}
+        )
+
     if isinstance(value, dict):
+        # Current Genius song/page payloads may carry an explicit boolean.
+        for key, raw in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]+", "", str(key or "").casefold())
+            if normalized_key == "instrumental":
+                if raw is True:
+                    return True
+                if isinstance(raw, (int, float)) and raw == 1:
+                    return True
+                if isinstance(raw, str) and raw.strip().casefold() in {"true", "1", "yes", "instrumental"}:
+                    return True
+
+            # Genius web data has also used lyrics_placeholder_reason /
+            # lyricsPlaceholderReason for pages that intentionally have no lyrics.
+            if normalized_key == "lyricsplaceholderreason" and genius_payload_says_instrumental(raw):
+                return True
+
         return any(genius_payload_says_instrumental(item) for item in value.values())
+
     if isinstance(value, (list, tuple)):
         return any(genius_payload_says_instrumental(item) for item in value)
+
     return False
 
 
