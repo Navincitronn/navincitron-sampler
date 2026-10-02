@@ -1781,6 +1781,72 @@ def start_playback_with_device_retry(
 
 
 
+
+def playback_matches_prepared(playback: dict | None, prepared: dict) -> bool:
+    """
+    Confirms that Spotify actually began the clip sampler.py requested.
+
+    Spotify's playback command can occasionally return successfully before the
+    Connect player has actually switched/started. The sampler must not start its
+    clip timer or publish sampler_state.json until playback is observable.
+    """
+
+    if not isinstance(playback, dict) or not playback.get("is_playing"):
+        return False
+
+    current_item = playback.get("item") if isinstance(playback.get("item"), dict) else {}
+    current_uri = str(current_item.get("uri") or "")
+    expected_track = prepared.get("track") if isinstance(prepared.get("track"), dict) else {}
+    expected_uri = str(expected_track.get("uri") or "")
+
+    # Direct album tracks and most playlist tracks have a stable Spotify URI.
+    if expected_uri and current_uri:
+        return current_uri == expected_uri
+
+    if prepared.get("kind") == "playlist_context":
+        expected_context_uri = f"spotify:playlist:{prepared.get('playlist_id')}"
+        context = playback.get("context") if isinstance(playback.get("context"), dict) else {}
+        current_context_uri = str(context.get("uri") or "")
+
+        # Local files and blind public-playlist placeholders can lack a useful
+        # item URI in the Web API. In those cases an actively playing matching
+        # playlist context is the strongest available confirmation.
+        if current_context_uri:
+            return current_context_uri == expected_context_uri
+
+        if prepared.get("is_local") or prepared.get("blind_public_playlist"):
+            return True
+
+    return False
+
+
+def wait_for_prepared_playback(
+    sp: spotipy.Spotify,
+    prepared: dict,
+    timeout_seconds: float = 1.75,
+) -> bool:
+    """
+    Wait briefly for Spotify Connect's asynchronous state to reflect a successful
+    start command. This is deliberately bounded so normal transitions stay fast.
+    """
+
+    deadline = time.monotonic() + max(0.25, float(timeout_seconds))
+
+    while time.monotonic() < deadline:
+        time.sleep(0.25)
+
+        try:
+            playback = sp.current_playback()
+        except Exception:
+            continue
+
+        if playback_matches_prepared(playback, prepared):
+            return True
+
+    return False
+
+
+
 def start_prepared_clip(
     sp: spotipy.Spotify,
     device_id: str,
@@ -1788,11 +1854,14 @@ def start_prepared_clip(
     local_seek_delay_seconds: float,
 ) -> int:
     """
-    Starts an already prepared clip immediately.
+    Starts an already prepared clip and verifies that Spotify actually began it.
 
-    If Spotify rejects the previously cached Spotify Connect device ID, this
-    refreshes the device and retries instead of letting every later clip fail
-    with Device not found.
+    A Spotify Web API start_playback() call can occasionally return without an
+    HTTP error even though the Connect player never starts/switches tracks. The
+    old implementation immediately wrote sampler_state.json and began the clip
+    timer, which made shuffle.html claim a song was playing while Spotify was
+    silent. This version confirms observable playback first and retries once on
+    a freshly resolved device when necessary.
     """
 
     global ACTIVE_DEVICE_ID_OVERRIDE
@@ -1800,61 +1869,88 @@ def start_prepared_clip(
     position_ms = int(prepared.get("position_ms") or 0)
     effective_device_id = ACTIVE_DEVICE_ID_OVERRIDE or device_id
 
-    save_sampler_state(prepared, position_ms)
-
     if prepared["kind"] == "track_uri":
         track = prepared["track"]
-        used_device_id = start_playback_with_device_retry(
-            sp=sp,
-            device_id=effective_device_id,
-            playback_kwargs={
-                "uris": [track["uri"]],
-                "position_ms": position_ms,
-            },
-        )
+        playback_kwargs = {
+            "uris": [track["uri"]],
+            "position_ms": position_ms,
+        }
+        is_local = False
 
-        if used_device_id:
-            ACTIVE_DEVICE_ID_OVERRIDE = used_device_id
-
-        return position_ms
-
-    if prepared["kind"] == "playlist_context":
+    elif prepared["kind"] == "playlist_context":
         track = prepared["track"]
         is_local = bool(prepared.get("is_local")) or str(track.get("uri") or "").startswith("spotify:local:")
-
         start_position_ms = 0 if is_local else position_ms
+        playback_kwargs = {
+            "context_uri": f"spotify:playlist:{prepared['playlist_id']}",
+            "offset": {"position": prepared["playlist_position"]},
+            "position_ms": start_position_ms,
+        }
 
+    else:
+        raise RuntimeError(f"Unknown prepared clip kind: {prepared.get('kind')!r}")
+
+    used_device_id: str | None = None
+
+    for attempt in range(2):
         used_device_id = start_playback_with_device_retry(
             sp=sp,
             device_id=effective_device_id,
-            playback_kwargs={
-                "context_uri": f"spotify:playlist:{prepared['playlist_id']}",
-                "offset": {"position": prepared["playlist_position"]},
-                "position_ms": start_position_ms,
-            },
+            playback_kwargs=playback_kwargs,
         )
 
         if used_device_id:
             ACTIVE_DEVICE_ID_OVERRIDE = used_device_id
+            effective_device_id = used_device_id
 
-        if prepared.get("blind_public_playlist"):
-            update_prepared_from_current_playback(sp, prepared, position_ms)
+        if wait_for_prepared_playback(sp, prepared):
+            break
 
-        if is_local and position_ms > 0:
-            time.sleep(local_seek_delay_seconds)
+        if attempt == 0:
+            print(
+                "WARNING: Spotify accepted the playback command, but the requested "
+                "track was not actually observed playing. Refreshing the Spotify "
+                "Connect device and retrying once."
+            )
 
             try:
-                sp.seek_track(position_ms=position_ms, device_id=ACTIVE_DEVICE_ID_OVERRIDE or used_device_id or effective_device_id)
-            except Exception as error:
-                print(
-                    "WARNING: Spotify started the local file but rejected the seek request. "
-                    f"Falling back to 0:00 for this item. Error: {error}"
-                )
-                position_ms = 0
+                refreshed_device_id = get_device_id(sp, None)
+                if refreshed_device_id:
+                    ACTIVE_DEVICE_ID_OVERRIDE = refreshed_device_id
+                    effective_device_id = refreshed_device_id
+            except Exception as refresh_error:
+                print(f"WARNING: Could not refresh Spotify device before playback retry: {refresh_error}")
 
-        return position_ms
+            time.sleep(0.25)
+            continue
 
-    raise RuntimeError(f"Unknown prepared clip kind: {prepared.get('kind')!r}")
+        raise RuntimeError(
+            "Spotify accepted the playback command but the requested track did "
+            "not begin playing after a retry. The sampler will skip this item "
+            "instead of counting a silent clip as successfully played."
+        )
+
+    # Only publish the track to shuffle.html after Spotify has actually started it.
+    if prepared["kind"] == "playlist_context" and prepared.get("blind_public_playlist"):
+        update_prepared_from_current_playback(sp, prepared, position_ms)
+
+    if prepared["kind"] == "playlist_context" and is_local and position_ms > 0:
+        time.sleep(local_seek_delay_seconds)
+
+        try:
+            sp.seek_track(
+                position_ms=position_ms,
+                device_id=ACTIVE_DEVICE_ID_OVERRIDE or used_device_id or effective_device_id,
+            )
+        except Exception as error:
+            print(
+                "WARNING: Spotify started the local file but rejected the seek request. "
+                f"Falling back to 0:00 for this item. Error: {error}"
+            )
+            position_ms = 0
+
+    save_sampler_state(prepared, position_ms)
+    return position_ms
 
 
 
