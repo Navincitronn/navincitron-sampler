@@ -448,18 +448,73 @@ def get_album_tracks_cached(sp: spotipy.Spotify, album: dict, cache: dict) -> li
 
 
 def get_playlist_bundle_cached(sp: spotipy.Spotify, playlist_id: str, cache: dict) -> dict:
+    """
+    Returns a cached playlist bundle only while Spotify reports the same playlist
+    snapshot_id. Spotify changes snapshot_id whenever the playlist contents/order
+    changes, so this prevents stale cached metadata from being paired with the
+    current playlist-context offset during playback.
+
+    This matters especially for Songguesser: playback uses the live Spotify
+    playlist position, while the guessed answer comes from this bundle. Reusing
+    an old item list after tracks were added/removed/reordered can therefore make
+    the audible song and the displayed answer refer to different positions.
+    """
+
     cache_key = f"playlist::{playlist_id}"
     cached = cache.get(cache_key)
 
-    # Prefer zero extra API calls once a playlist has already been hydrated.
-    # If the playlist changes, delete album_cache.json to refresh this cache.
-    if isinstance(cached, dict) and isinstance(cached.get("items"), list):
-        return cached
-
+    # This metadata request is intentionally lightweight. It lets us validate the
+    # persistent album_cache.json entry without re-downloading every playlist item
+    # when the playlist has not changed.
     playlist = sp.playlist(
         playlist_id,
         fields="id,name,owner(display_name),external_urls,images,snapshot_id,tracks(total)",
     )
+
+    current_snapshot_id = playlist.get("snapshot_id")
+    current_tracks_total = int(((playlist.get("tracks") or {}).get("total") or 0))
+
+    if isinstance(cached, dict) and isinstance(cached.get("items"), list):
+        cached_snapshot_id = cached.get("snapshot_id")
+        cached_tracks_total = cached.get("tracks_total")
+
+        snapshot_matches = bool(
+            current_snapshot_id
+            and cached_snapshot_id
+            and current_snapshot_id == cached_snapshot_id
+        )
+
+        # track total is an additional guard. Older cache files may not have
+        # tracks_total, so snapshot_id remains authoritative for those entries.
+        total_matches = (
+            cached_tracks_total is None
+            or int(cached_tracks_total or 0) == current_tracks_total
+        )
+
+        if snapshot_matches and total_matches:
+            # Refresh cheap display metadata even when the item list remains valid.
+            cached["name"] = playlist.get("name", cached.get("name", "Unknown playlist"))
+            cached["owner_name"] = (playlist.get("owner") or {}).get(
+                "display_name",
+                cached.get("owner_name", "Unknown owner"),
+            )
+            cached["external_url"] = (
+                (playlist.get("external_urls") or {}).get("spotify")
+                or cached.get("external_url")
+            )
+            cached["images"] = playlist.get("images") or cached.get("images") or []
+            cached["cover_url"] = best_image_url(cached["images"]) or cached.get("cover_url")
+            cached["tracks_total"] = current_tracks_total
+            cache[cache_key] = cached
+            save_cache(cache)
+            return cached
+
+        print(
+            "Playlist cache is stale; refreshing playlist items "
+            f"(playlist={playlist_id}, cached_snapshot={cached_snapshot_id!r}, "
+            f"current_snapshot={current_snapshot_id!r}, "
+            f"cached_total={cached_tracks_total!r}, current_total={current_tracks_total})."
+        )
 
     public_items_inaccessible = False
 
@@ -469,15 +524,14 @@ def get_playlist_bundle_cached(sp: spotipy.Spotify, playlist_id: str, cache: dic
         if not spotify_error_is_forbidden(error):
             raise
 
-        total = ((playlist.get("tracks") or {}).get("total") or 0)
-        if not total:
+        if not current_tracks_total:
             raise RuntimeError(
                 "Spotify returned 403 for this playlist's items and did not "
                 "return a playlist track count, so this public playlist cannot "
                 "be sampled through the Web API."
             ) from error
 
-        playlist_items = make_public_playlist_placeholder_items(total)
+        playlist_items = make_public_playlist_placeholder_items(current_tracks_total)
         public_items_inaccessible = True
         print(
             "WARNING: Spotify returned 403 for this public playlist's items. "
@@ -488,11 +542,12 @@ def get_playlist_bundle_cached(sp: spotipy.Spotify, playlist_id: str, cache: dic
     bundle = {
         "id": playlist_id,
         "name": playlist.get("name", "Unknown playlist"),
-        "owner_name": playlist.get("owner", {}).get("display_name", "Unknown owner"),
+        "owner_name": (playlist.get("owner") or {}).get("display_name", "Unknown owner"),
         "external_url": (playlist.get("external_urls") or {}).get("spotify"),
         "images": playlist.get("images") or [],
         "cover_url": best_image_url(playlist.get("images") or []),
-        "snapshot_id": playlist.get("snapshot_id"),
+        "snapshot_id": current_snapshot_id,
+        "tracks_total": current_tracks_total,
         "items": playlist_items,
         "public_items_inaccessible": public_items_inaccessible,
     }
