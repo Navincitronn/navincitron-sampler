@@ -3527,6 +3527,9 @@ log_lines: deque[str] = deque(maxlen=300)
 last_command: list[str] = []
 current_cover_cache: dict[str, Any] = {"timestamp": 0.0, "data": None}
 songguesser_games: dict[str, dict[str, Any]] = {}
+# History is scoped to each *loaded* shuffle.html page (not each 5-track game).
+# A page refresh generates a fresh pageSessionId, resetting the no-repeat rule.
+songguesser_page_histories: dict[str, dict[str, Any]] = {}
 SONGGUESSER_CLIP_SECONDS = 30
 SONGGUESSER_ASSUMED_DURATION_SECONDS = 180
 SONGGUESSER_LOCAL_SEEK_DELAY_SECONDS = 0.0
@@ -8397,6 +8400,62 @@ def songguesser_release_decade_from_year(year: str) -> str:
     return ""
 
 
+def songguesser_track_identity_keys(track: dict[str, Any], fallback: str = "") -> set[str]:
+    """Match both Spotify URIs and song identities across playlist/album sources."""
+    configure_sampler_tools()
+    keys: set[str] = set()
+    uri = str(track.get("uri") or "").strip()
+    if uri:
+        keys.add(f"uri::{uri}")
+
+    title = str(sampler_tools.format_track_name(track) or "").strip()
+    artist = str(sampler_tools.format_track_artist(track) or "").strip()
+    is_placeholder = (
+        title.lower().startswith("public playlist item at position")
+        or title.lower().startswith("local file at playlist position")
+        or title.lower() == "unknown track"
+        or artist.lower() == "unknown artist"
+    )
+    if title and artist and not is_placeholder:
+        def norm(value: str, is_artist: bool = False) -> str:
+            # Ignore dots/hyphens/spaces: "L.A. Blues" and "LA Blues"
+            # are the same title for no-repeat matching.
+            ascii_text = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii").lower()
+            if is_artist:
+                ascii_text = re.sub(r"^the\s+", "", ascii_text)
+            return "".join(re.findall(r"[a-z0-9]+", ascii_text))
+        artist_id, title_id = norm(artist, True), norm(title)
+        if artist_id and title_id:
+            keys.add(f"song::{artist_id}::{title_id}")
+    if not keys and fallback:
+        keys.add(f"position::{fallback}")
+    return keys
+
+
+def songguesser_candidate_identity_keys(candidate: dict[str, Any]) -> set[str]:
+    prepared = candidate.get("prepared") or {}
+    fallback = ""
+    if prepared.get("kind") == "playlist_context":
+        fallback = f"{prepared.get('playlist_id')}::{prepared.get('playlist_position')}"
+    return songguesser_track_identity_keys(prepared.get("track") or {}, fallback)
+
+
+def songguesser_get_page_history(page_id: str) -> dict[str, Any]:
+    """Keep an in-memory no-repeat history until this shuffle.html tab reloads."""
+    now = time.time()
+    # Limit stale histories and memory consumption, independent of Topster caches.
+    for key, history in list(songguesser_page_histories.items()):
+        if now - float(history.get("updated_at", 0)) > 24 * 60 * 60:
+            songguesser_page_histories.pop(key, None)
+    if len(songguesser_page_histories) > 512 and page_id not in songguesser_page_histories:
+        oldest = min(songguesser_page_histories, key=lambda key: songguesser_page_histories[key].get("updated_at", 0))
+        songguesser_page_histories.pop(oldest, None)
+
+    history = songguesser_page_histories.setdefault(page_id, {"keys": set(), "updated_at": now})
+    history["updated_at"] = now
+    return history
+
+
 def songguesser_track_answer(prepared: dict[str, Any]) -> dict[str, Any]:
     configure_sampler_tools()
 
@@ -8600,6 +8659,7 @@ def songguesser_build_album_candidates(
     album_line: str,
     used_by_source: dict[str, set[str]],
     maximum: int,
+    excluded_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     configure_sampler_tools()
 
@@ -8617,9 +8677,12 @@ def songguesser_build_album_candidates(
 
     for track in playable_tracks:
         track_key = sampler_tools.track_dedupe_key(track)
-        if track_key in used_keys:
+        identity_keys = songguesser_track_identity_keys(track)
+        if track_key in used_keys or (excluded_keys is not None and not identity_keys.isdisjoint(excluded_keys)):
             continue
         used_keys.add(track_key)
+        if excluded_keys is not None:
+            excluded_keys.update(identity_keys)
         candidates.append(songguesser_candidate_from_album_track(album, track))
         if len(candidates) >= maximum:
             break
@@ -8634,6 +8697,7 @@ def songguesser_build_playlist_candidates(
     used_by_source: dict[str, set[str]],
     maximum: int,
     use_lastfm_local_cover: bool = False,
+    excluded_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     configure_sampler_tools()
 
@@ -8654,9 +8718,15 @@ def songguesser_build_playlist_candidates(
 
     for item in playlist_items:
         item_key = sampler_tools.playlist_item_dedupe_key(item)
-        if item_key in used_keys:
+        identity_keys = songguesser_track_identity_keys(
+            item.get("track") or {},
+            f"{playlist_id}::{item.get('playlist_position')}",
+        )
+        if item_key in used_keys or (excluded_keys is not None and not identity_keys.isdisjoint(excluded_keys)):
             continue
         used_keys.add(item_key)
+        if excluded_keys is not None:
+            excluded_keys.update(identity_keys)
         candidates.append(
             songguesser_candidate_from_playlist_item(
                 playlist_bundle=playlist_bundle,
@@ -8671,7 +8741,9 @@ def songguesser_build_playlist_candidates(
     return candidates
 
 
-def songguesser_build_candidates_from_file(sp: Any, cache: dict[str, Any], albums_file: Path) -> list[dict[str, Any]]:
+def songguesser_build_candidates_from_file(
+    sp: Any, cache: dict[str, Any], albums_file: Path, excluded_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
     configure_sampler_tools()
 
     lines = sampler_tools.load_album_lines(str(albums_file))
@@ -8680,6 +8752,7 @@ def songguesser_build_candidates_from_file(sp: Any, cache: dict[str, Any], album
 
     used_by_source: dict[str, set[str]] = {}
     candidates: list[dict[str, Any]] = []
+    reserved_keys = set(excluded_keys or set())
 
     # Multiple passes allow a short file to contribute more than one unique song
     # from the same album/playlist while still preventing repeats from that source.
@@ -8695,9 +8768,13 @@ def songguesser_build_candidates_from_file(sp: Any, cache: dict[str, Any], album
 
             try:
                 if sampler_tools.extract_spotify_playlist_id(line):
-                    candidates.extend(songguesser_build_playlist_candidates(sp, cache, line, used_by_source, 1))
+                    candidates.extend(songguesser_build_playlist_candidates(
+                        sp, cache, line, used_by_source, 1, excluded_keys=reserved_keys,
+                    ))
                 else:
-                    candidates.extend(songguesser_build_album_candidates(sp, cache, line, used_by_source, 1))
+                    candidates.extend(songguesser_build_album_candidates(
+                        sp, cache, line, used_by_source, 1, excluded_keys=reserved_keys,
+                    ))
             except Exception as error:
                 append_log(f"[songguesser warning: skipped source {line!r}: {error}]")
 
@@ -8708,16 +8785,21 @@ def songguesser_build_candidates_from_file(sp: Any, cache: dict[str, Any], album
 
     if len(candidates) < SONGGUESSER_SONG_COUNT:
         raise RuntimeError(
-            f"Songguesser requires five playable unique songs, but only found {len(candidates)} in the uploaded text file."
+            f"Songguesser needs five tracks that have not played since the last page refresh, "
+            f"but only {len(candidates)} are available in the uploaded text file. "
+            "Choose more sources or refresh shuffle.html to reset the no-repeat history."
         )
 
     return candidates[:SONGGUESSER_SONG_COUNT]
 
 
-def songguesser_build_candidates_from_single_link(sp: Any, cache: dict[str, Any], link: str) -> list[dict[str, Any]]:
+def songguesser_build_candidates_from_single_link(
+    sp: Any, cache: dict[str, Any], link: str, excluded_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
     configure_sampler_tools()
 
     used_by_source: dict[str, set[str]] = {}
+    reserved_keys = set(excluded_keys or set())
 
     if sampler_tools.extract_spotify_album_id(link):
         candidates = songguesser_build_album_candidates(
@@ -8726,6 +8808,7 @@ def songguesser_build_candidates_from_single_link(sp: Any, cache: dict[str, Any]
             album_line=link,
             used_by_source=used_by_source,
             maximum=SONGGUESSER_SONG_COUNT,
+            excluded_keys=reserved_keys,
         )
     elif sampler_tools.extract_spotify_playlist_id(link):
         candidates = songguesser_build_playlist_candidates(
@@ -8735,13 +8818,16 @@ def songguesser_build_candidates_from_single_link(sp: Any, cache: dict[str, Any]
             used_by_source=used_by_source,
             maximum=SONGGUESSER_SONG_COUNT,
             use_lastfm_local_cover=True,
+            excluded_keys=reserved_keys,
         )
     else:
         raise RuntimeError("Invalid Spotify album or playlist link/URI.")
 
     if len(candidates) < SONGGUESSER_SONG_COUNT:
         raise RuntimeError(
-            f"Songguesser requires five playable unique songs, but only found {len(candidates)} in that album/playlist."
+            f"Songguesser needs five tracks that have not played since the last page refresh, "
+            f"but only {len(candidates)} remain available in that album/playlist. "
+            "Choose a larger source or refresh shuffle.html to reset the no-repeat history."
         )
 
     return candidates[:SONGGUESSER_SONG_COUNT]
@@ -8903,6 +8989,9 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
     device_id = sampler_tools.get_device_id(sp, None)
     candidate = queue[current_index]
     prepared = candidate["prepared"]
+    # Preserve the original playlist position identity even if Spotify skips
+    # this entry and we replace prepared.track with the real playing item.
+    initial_candidate_keys = songguesser_candidate_identity_keys(candidate)
     is_playlist = prepared.get("kind") == "playlist_context"
     before = songguesser_current_spotify_playback(sp) if is_playlist else None
     track = prepared.get("track") or {}
@@ -9014,6 +9103,25 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
             prepared["cover_url"] = cover or prepared.get("playlist_cover_url")
         sampler_tools.save_sampler_state(prepared, position_ms)
 
+    # Record the track Spotify actually played, not merely its queued offset.
+    # This prevents a skipped playlist entry from repeating a previously heard
+    # track and ensures restarts on this page do not reuse it.
+    history = game.get("page_history")
+    if isinstance(history, dict):
+        actual_keys = songguesser_candidate_identity_keys(candidate)
+        if actual_keys and not actual_keys.isdisjoint(history["keys"]):
+            try:
+                sp.pause_playback()
+            except Exception:
+                pass
+            raise RuntimeError(
+                "Spotify played a track already heard on this page. The duplicate "
+                "was not accepted as a Songguesser round. Choose another source "
+                "or refresh shuffle.html to reset the no-repeat history."
+            )
+        history["keys"].update(actual_keys | initial_candidate_keys)
+        history["updated_at"] = time.time()
+
     candidate["answer"] = songguesser_track_answer(prepared)
     try:
         songguesser_enrich_queue_answers(
@@ -9046,6 +9154,11 @@ def songguesser_start():
         is_form_request = bool(request.form or request.files)
         data = request.form if is_form_request else (request.get_json(silent=True) or {})
         source_mode = str(data.get("sourceMode", "file")).strip().lower()
+        page_id = str(data.get("pageSessionId") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,100}", page_id):
+            # Legacy clients receive a fresh history per game; the updated
+            # shuffle.js always supplies a fresh token once per page load.
+            page_id = secrets.token_urlsafe(24)
         if source_mode not in {"file", "playlist"}:
             return jsonify({"ok": False, "error": "Invalid source mode."}), 400
 
@@ -9065,18 +9178,30 @@ def songguesser_start():
 
         configure_sampler_tools()
         cache = sampler_tools.load_cache()
+        history = songguesser_get_page_history(page_id)
+        # Mirror browser-held history: if Render restarted without a page
+        # refresh, the frontend still knows which songs were already heard.
+        try:
+            client_seen = json.loads(str(data.get("previousTracks") or "[]")[:150000])
+            if isinstance(client_seen, list):
+                for key in client_seen[:5000]:
+                    if isinstance(key, str) and len(key) <= 256 and re.fullmatch(r"song::[a-z0-9]+::[a-z0-9]+", key):
+                        history["keys"].add(key)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        excluded_keys = set(history["keys"])
 
         try:
             if source_mode == "playlist":
                 link = str(data.get("playlistLink", "")).strip()
                 if not link:
                     return jsonify({"ok": False, "error": "Enter a Spotify album or playlist link first."}), 400
-                queue = songguesser_build_candidates_from_single_link(sp, cache, link)
+                queue = songguesser_build_candidates_from_single_link(sp, cache, link, excluded_keys)
             else:
                 uploaded_albums_file = save_uploaded_albums_file()
                 if uploaded_albums_file is None:
                     return jsonify({"ok": False, "error": "Upload a .txt file containing album or playlist links."}), 400
-                queue = songguesser_build_candidates_from_file(sp, cache, uploaded_albums_file)
+                queue = songguesser_build_candidates_from_file(sp, cache, uploaded_albums_file, excluded_keys)
         except Exception as error:
             return jsonify({"ok": False, "error": str(error)}), 400
 
@@ -9090,6 +9215,7 @@ def songguesser_start():
             "current_index": 0,
             "hints": hints,
             "source_mode": source_mode,
+            "page_history": history,
             "created_at": time.time(),
         }
         songguesser_games[game_id] = game
