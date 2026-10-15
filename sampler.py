@@ -1852,16 +1852,17 @@ def start_prepared_clip(
     device_id: str,
     prepared: dict,
     local_seek_delay_seconds: float,
+    verify_playback: bool = True,
 ) -> int:
     """
-    Starts an already prepared clip and verifies that Spotify actually began it.
+    Starts an already prepared clip on Spotify Connect.
 
-    A Spotify Web API start_playback() call can occasionally return without an
-    HTTP error even though the Connect player never starts/switches tracks. The
-    old implementation immediately wrote sampler_state.json and began the clip
-    timer, which made shuffle.html claim a song was playing while Spotify was
-    silent. This version confirms observable playback first and retries once on
-    a freshly resolved device when necessary.
+    In normal Sampler mode (the default), verify that Spotify started the
+    expected track and retry an unconfirmed start once. Songguesser opts out of
+    status-based verification/replay: Spotify's current_playback response can
+    lag behind audible playback, and retrying then restarts the same short clip.
+    Explicit Spotify HTTP device errors still use device-id refresh/retry in
+    start_playback_with_device_retry(), regardless of this setting.
     """
 
     global ACTIVE_DEVICE_ID_OVERRIDE
@@ -1902,6 +1903,12 @@ def start_prepared_clip(
         if used_device_id:
             ACTIVE_DEVICE_ID_OVERRIDE = used_device_id
             effective_device_id = used_device_id
+
+        # Songguesser starts on an HTTP-success response: do not issue a second
+        # start solely because Spotify Connect's playback status is still stale.
+        # Strict verification remains the default for normal Sampler playback.
+        if not verify_playback:
+            break
 
         if wait_for_prepared_playback(sp, prepared):
             break

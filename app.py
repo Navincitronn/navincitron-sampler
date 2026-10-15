@@ -8811,6 +8811,7 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
         device_id=device_id,
         prepared=prepared,
         local_seek_delay_seconds=SONGGUESSER_LOCAL_SEEK_DELAY_SECONDS,
+        verify_playback=False,
     )
 
     # Public playlists owned by other users can be playable but not item-readable
@@ -8822,7 +8823,6 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
             sp=sp,
             queue=[candidate],
             hints_enabled=game.get("hints") or {},
-            prefer_grid=False,
         )
     except Exception as error:
         append_log(f"[songguesser warning: could not enrich discovered public playlist track: {error}]")
