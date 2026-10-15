@@ -8810,28 +8810,24 @@ def songguesser_confirm_playlist_playback(
     prepared: dict[str, Any],
     previous_playback: dict[str, Any] | None,
     direct_track_uri: str = "",
-    timeout_seconds: float = 6.0,
+    timeout_seconds: float = 5.0,
 ) -> dict[str, Any]:
-    """
-    Ensure the Songguesser answer belongs to the track actually playing.
+    """Confirm the *actual* Spotify track rather than trusting playlist offsets.
 
-    A playlist-context offset isn't a reliable track identity: Spotify Connect
-    can skip local/unavailable entries or resolve a different offset. Public
-    playlists sometimes expose positions but no readable items. For these
-    cases, wait for an observable track change in the requested playlist.
-
-    For regular catalog tracks, Songguesser plays the exact URI instead, and
-    requires that URI to appear in Spotify's current playback state. In either
-    case we never reveal or grade a different, unconfirmed song.
+    The Spotify API may skip unavailable/local playlist entries. Conversely, the
+    playback context can be omitted in the status response. Exact URI matches
+    are reliable without a context; other tracks are accepted only when their
+    live playback is confirmed inside the requested playlist context.
     """
     previous = previous_playback or {}
     previous_item = previous.get("item") if isinstance(previous.get("item"), dict) else {}
     previous_uri = str(previous_item.get("uri") or "")
     previous_progress = previous.get("progress_ms")
+    previous_context = previous.get("context") if isinstance(previous.get("context"), dict) else {}
     expected_context_uri = f"spotify:playlist:{prepared['playlist_id']}"
     expected_uri = str((prepared.get("track") or {}).get("uri") or "")
     expected_position = int(prepared.get("position_ms") or 0)
-    deadline = time.monotonic() + max(1.0, timeout_seconds)
+    deadline = time.monotonic() + max(0.2, timeout_seconds)
     stable_uri = ""
     stable_count = 0
 
@@ -8848,55 +8844,45 @@ def songguesser_confirm_playlist_playback(
         if not uri:
             continue
 
+        # Direct-URI fallback is verified only by that exact Spotify track.
         if direct_track_uri:
             if uri == direct_track_uri:
                 return playback
             continue
 
-        # Spotify sometimes omits the playback context for a local file. An
-        # exact local URI match is sufficient, even without that context.
-        if expected_uri.startswith("spotify:local:") and uri == expected_uri:
+        # An exact match is safe even when Spotify omits playlist context.
+        if expected_uri and uri == expected_uri:
             return playback
 
         context = playback.get("context") if isinstance(playback.get("context"), dict) else {}
-        if context.get("uri") != expected_context_uri:
+        if str(context.get("uri") or "") != expected_context_uri:
             continue
 
-        # The selected local file may have been skipped, so don't require its
-        # URI to match. Confirm an actual context/track transition instead.
+        # Spotify may skip a playlist entry. Require proof this is a new start
+        # before adopting an otherwise unexpected song as the correct answer.
         if uri != stable_uri:
             stable_uri, stable_count = uri, 1
         else:
             stable_count += 1
 
         progress = playback.get("progress_ms")
-        progress_is_near_start = (
-            isinstance(progress, (int, float))
-            and abs(progress - expected_position) <= 12000
-        )
-        previous_progress_is_different = (
+        near_start = isinstance(progress, (int, float)) and abs(progress - expected_position) <= 12000
+        progress_changed = (
             isinstance(previous_progress, (int, float))
             and isinstance(progress, (int, float))
             and abs(previous_progress - progress) > 4500
         )
-        new_track = bool(uri != previous_uri)
-        known_local_track_matched = bool(expected_uri and uri == expected_uri)
-        fresh_context = not previous or (
-            (previous.get("context") or {}).get("uri") != expected_context_uri
-        )
-
+        different_track = bool(uri != previous_uri)
+        different_context = not previous or str(previous_context.get("uri") or "") != expected_context_uri
         if stable_count >= 2 and (
-            new_track
-            or known_local_track_matched and (progress_is_near_start or previous_progress_is_different)
-            or fresh_context and progress_is_near_start
-            or previous_progress_is_different and progress_is_near_start
+            different_track or (different_context and near_start)
+            or (progress_changed and near_start)
         ):
             return playback
 
     raise RuntimeError(
-        "Songguesser could not confirm which playlist track Spotify actually "
-        "started. This round was not graded to avoid revealing the wrong answer. "
-        "Please retry with Spotify Connect active."
+        "Spotify did not report a new playing track for the requested playlist. "
+        "Songguesser cannot safely determine an answer for this round."
     )
 
 
@@ -8905,7 +8891,6 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
 
     queue = game.get("queue") or []
     current_index = int(game.get("current_index", 0))
-
     if current_index >= len(queue):
         return {
             "ok": True,
@@ -8919,24 +8904,17 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
     candidate = queue[current_index]
     prepared = candidate["prepared"]
     is_playlist = prepared.get("kind") == "playlist_context"
-    previous_playback = songguesser_current_spotify_playback(sp) if is_playlist else None
+    before = songguesser_current_spotify_playback(sp) if is_playlist else None
     track = prepared.get("track") or {}
     track_uri = str(track.get("uri") or "")
 
-    # Crucial: Spotify playlist offsets are not dependable track identities.
-    # A local or unavailable entry may be skipped on the Connect player. Play
-    # catalog tracks by their EXACT URI rather than by playlist position.
-    direct_track_uri = (
-        track_uri if is_playlist and track_uri.startswith("spotify:track:")
-        and not prepared.get("is_local") and not prepared.get("blind_public_playlist")
-        else ""
-    )
+    # Restore the Spotify playlist-context start that worked before the last
+    # patch. The *answer* is reconciled to the actual Spotify playback, so
+    # skipped/unavailable entries cannot create an incorrect Songguesser answer.
     playback_prepared = dict(prepared) if is_playlist else prepared
-    if direct_track_uri:
-        playback_prepared["kind"] = "track_uri"
-    elif is_playlist and prepared.get("blind_public_playlist"):
-        # Don't let sampler.py prematurely adopt a stale current_playback item.
-        # The Songguesser synchronization below determines the actual track.
+    if is_playlist and prepared.get("blind_public_playlist"):
+        # Do not adopt a stale previous playback item in sampler.py; the
+        # synchronization check below decides which track actually began.
         playback_prepared["blind_public_playlist"] = False
 
     position_ms = sampler_tools.start_prepared_clip(
@@ -8947,20 +8925,76 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
         verify_playback=False,
     )
 
+    used_exact_uri_fallback = False
     if is_playlist:
-        observed = songguesser_confirm_playlist_playback(
-            sp=sp,
-            prepared=prepared,
-            previous_playback=previous_playback,
-            direct_track_uri=direct_track_uri,
-        )
-        if not direct_track_uri:
-            # Spotify used playlist-context playback (local file or blind public
-            # playlist). Grade the track Spotify actually played, NOT the item
-            # that happened to occupy the requested API playlist offset.
+        try:
+            observed = songguesser_confirm_playlist_playback(
+                sp=sp,
+                prepared=prepared,
+                previous_playback=before,
+            )
+        except RuntimeError as first_error:
+            # Spotify can acknowledge a context start yet remain idle. A direct
+            # catalog-track start is a recovery *only*, not the default, and
+            # does not depend on playlist offsets to determine its identity.
+            if track_uri.startswith("spotify:track:") and not prepared.get("is_local") and not prepared.get("blind_public_playlist"):
+                append_log("[songguesser: playlist context did not start; trying exact Spotify track URI]")
+                recovery = dict(prepared)
+                recovery["kind"] = "track_uri"
+                position_ms = sampler_tools.start_prepared_clip(
+                    sp=sp,
+                    device_id=device_id,
+                    prepared=recovery,
+                    local_seek_delay_seconds=SONGGUESSER_LOCAL_SEEK_DELAY_SECONDS,
+                    verify_playback=False,
+                )
+                used_exact_uri_fallback = True
+                try:
+                    observed = songguesser_confirm_playlist_playback(
+                        sp=sp,
+                        prepared=prepared,
+                        previous_playback=before,
+                        direct_track_uri=track_uri,
+                    )
+                except RuntimeError as second_error:
+                    raise RuntimeError(
+                        "Spotify did not start the selected Songguesser track using "
+                        "either playlist-context or direct-track playback. Make sure "
+                        "the intended Spotify Connect device is active and the track "
+                        "is playable on that device. No answer was graded."
+                    ) from second_error
+            else:
+                # Local files and inaccessible public-playlist positions cannot
+                # safely be started by a regular track URI. Try reactivating
+                # the selected Connect device, then the playlist context again.
+                live = songguesser_current_spotify_playback(sp)
+                if live and live.get("is_playing"):
+                    raise first_error
+                append_log("[songguesser: no live playlist playback; reactivating Spotify Connect device]")
+                try:
+                    sp.transfer_playback(device_id=device_id, force_play=True)
+                    time.sleep(0.5)
+                except Exception as error:
+                    append_log(f"[songguesser warning: device reactivation unsuccessful: {error}]")
+                position_ms = sampler_tools.start_prepared_clip(
+                    sp=sp,
+                    device_id=device_id,
+                    prepared=playback_prepared,
+                    local_seek_delay_seconds=SONGGUESSER_LOCAL_SEEK_DELAY_SECONDS,
+                    verify_playback=False,
+                )
+                observed = songguesser_confirm_playlist_playback(
+                    sp=sp,
+                    prepared=prepared,
+                    previous_playback=before,
+                )
+
+        if not used_exact_uri_fallback:
+            # Playlist-context playback may have skipped the selected position.
+            # Adopt the actual track metadata, never the cached position's song.
             observed_track = sampler_tools.simplify_track(observed["item"])
             if not observed_track.get("uri") and not observed_track.get("name"):
-                raise RuntimeError("Could not determine the actual Spotify track for this Songguesser round.")
+                raise RuntimeError("Spotify did not expose the actual track for this Songguesser round.")
             old_uri = track_uri
             prepared["track"] = observed_track
             prepared["is_local"] = bool(observed_track.get("is_local"))
@@ -8988,7 +9022,7 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
             hints_enabled=game.get("hints") or {},
         )
     except Exception as error:
-        append_log(f"[songguesser warning: could not enrich discovered public playlist track: {error}]")
+        append_log(f"[songguesser warning: could not enrich current track: {error}]")
 
     game["started_at"] = time.time()
     game["position_ms"] = position_ms
