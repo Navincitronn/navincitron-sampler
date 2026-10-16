@@ -21,6 +21,7 @@ CACHE_FILE = "album_cache.json"
 STATE_FILE = "sampler_state.json"
 CONTROL_FILE = "sampler_control.json"
 ACTIVE_DEVICE_ID_OVERRIDE: str | None = None
+MANUALLY_SELECTED_DEVICE_ID: str | None = None
 
 SCOPE = (
     "user-read-playback-state "
@@ -1178,10 +1179,33 @@ def choose_random_playlist_item(playlist_items: list[dict], clip_seconds: int) -
     return random.choice(playable_items)
 
 
-def get_device_id(sp: spotipy.Spotify, preferred_device_name: str | None = None) -> str:
-    devices_response = sp.devices()
-    devices = devices_response.get("devices", [])
+def get_device_id(
+    sp: spotipy.Spotify,
+    preferred_device_name: str | None = None,
+    preferred_device_id: str | None = None,
+) -> str:
+    global ACTIVE_DEVICE_ID_OVERRIDE, MANUALLY_SELECTED_DEVICE_ID
 
+    devices_response = sp.devices() or {}
+    devices = devices_response.get("devices", []) or []
+
+    if preferred_device_id:
+        selected = next((device for device in devices if device.get("id") == preferred_device_id), None)
+        if not selected:
+            raise RuntimeError(
+                "The manually selected Spotify device is no longer available. "
+                "Refresh the device picker on shuffle.html and choose another player."
+            )
+        if selected.get("is_restricted"):
+            raise RuntimeError("The manually selected Spotify device cannot receive playback commands (restricted).")
+        MANUALLY_SELECTED_DEVICE_ID = preferred_device_id
+        ACTIVE_DEVICE_ID_OVERRIDE = preferred_device_id
+        print(f"Using selected Spotify device: {selected.get('name') or 'Unnamed device'} ({preferred_device_id})")
+        # Do not call transfer_playback: it may interrupt the user's current song.
+        return preferred_device_id
+
+    MANUALLY_SELECTED_DEVICE_ID = None
+    ACTIVE_DEVICE_ID_OVERRIDE = None
     if not devices:
         raise RuntimeError(
             "No Spotify devices found. Open Spotify on your computer/phone/browser, "
@@ -1736,6 +1760,18 @@ def start_playback_with_device_retry(
     rejects the explicit ID, it makes one final attempt without a device_id so
     Spotify can use the currently active device.
     """
+
+    if MANUALLY_SELECTED_DEVICE_ID:
+        try:
+            sp.start_playback(device_id=MANUALLY_SELECTED_DEVICE_ID, **playback_kwargs)
+            return MANUALLY_SELECTED_DEVICE_ID
+        except Exception as error:
+            raise RuntimeError(
+                "Spotify could not start playback on the manually selected device. "
+                "Refresh the device picker on shuffle.html, ensure Spotify is open "
+                "on that device, or choose a different player. "
+                f"Spotify returned: {error}"
+            ) from error
 
     attempted_device_ids: set[str | None] = set()
     candidate_device_ids: list[str | None] = [device_id]
@@ -2316,7 +2352,7 @@ def run_single_album_mode(
     if args.single_link_order == "random":
         random.shuffle(playable_tracks)
 
-    device_id = get_device_id(sp, args.device_name)
+    device_id = get_device_id(sp, args.device_name, args.device_id)
     album_artist = ", ".join(album.get("artists") or ["Unknown artist"])
 
     print(f"Loaded album: {album.get('name', 'Unknown album')} - {album_artist}")
@@ -2396,7 +2432,7 @@ def run_single_playlist_mode(
     if args.single_link_order == "random":
         random.shuffle(playable_items)
 
-    device_id = get_device_id(sp, args.device_name)
+    device_id = get_device_id(sp, args.device_name, args.device_id)
 
     playlist_name = playlist_bundle.get("name", "Unknown playlist")
     owner_name = playlist_bundle.get("owner_name", "Unknown owner")
@@ -2552,6 +2588,13 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--device-id",
+        type=str,
+        default=None,
+        help="Exact Spotify Connect device ID explicitly selected in shuffle.html.",
+    )
+
+    parser.add_argument(
         "--device-name",
         type=str,
         default=None,
@@ -2673,7 +2716,7 @@ def main() -> None:
     if args.preload_albums:
         preload_album_cache(sp, lines, cache)
 
-    device_id = get_device_id(sp, args.device_name)
+    device_id = get_device_id(sp, args.device_name, args.device_id)
 
     print(f"Loaded {len(all_lines)} total album/playlist lines.")
     print(f"Starting at usable line index: {args.start_index}")

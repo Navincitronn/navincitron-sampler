@@ -3562,6 +3562,94 @@ def get_spotify_client():
     return spotipy.Spotify(auth=token_info["access_token"])
 
 
+def spotify_accessible_playback_devices(sp: Any) -> list[dict[str, Any]]:
+    """Only devices returned for the account authorized by this browser."""
+    payload = sp.devices() or {}
+    devices = payload.get("devices") if isinstance(payload, dict) else []
+    return [device for device in (devices or []) if isinstance(device, dict) and device.get("id")]
+
+
+def spotify_account_identity(sp: Any) -> tuple[str, str]:
+    account = sp.me() or {}
+    return (str(account.get("id") or ""), str(account.get("display_name") or account.get("id") or "Spotify account"))
+
+
+def spotify_selected_device_id_for_account(sp: Any, validate_presence: bool = True) -> str | None:
+    """Never use a stored device selected while a different account was logged in."""
+    selected = str(session.get("spotify_playback_device_id") or "").strip()
+    if not selected:
+        return None
+    account_id, _ = spotify_account_identity(sp)
+    if not account_id or account_id != str(session.get("spotify_playback_account_id") or ""):
+        session.pop("spotify_playback_device_id", None)
+        session.pop("spotify_playback_account_id", None)
+        return None
+    if validate_presence:
+        matching = next((d for d in spotify_accessible_playback_devices(sp) if d.get("id") == selected), None)
+        if not matching:
+            raise RuntimeError("The selected Spotify device is no longer available to this Spotify account. Refresh the device list and select an available player.")
+        if matching.get("is_restricted"):
+            raise RuntimeError("The selected Spotify device is restricted and cannot receive Spotify playback commands. Select another player.")
+    return selected
+
+
+@app.route("/api/spotify/devices", methods=["GET"])
+def spotify_available_playback_devices():
+    try:
+        sp = get_spotify_client()
+        account_id, display_name = spotify_account_identity(sp)
+        devices = spotify_accessible_playback_devices(sp)
+        selected_id = spotify_selected_device_id_for_account(sp, validate_presence=False)
+        return jsonify({
+            "ok": True,
+            "accountName": display_name,
+            "devices": [
+                {
+                    "id": str(device["id"]),
+                    "name": str(device.get("name") or "Unnamed Spotify device"),
+                    "type": str(device.get("type") or ""),
+                    "isActive": bool(device.get("is_active")),
+                    "isRestricted": bool(device.get("is_restricted")),
+                }
+                for device in devices
+            ],
+            "selectedDeviceId": selected_id or "",
+        })
+    except SpotifyLoginRequired as error:
+        return jsonify({"ok": False, "error": str(error)}), 401
+    except Exception as error:
+        return jsonify({"ok": False, "error": f"Could not list Spotify playback devices: {error}"}), 503
+
+
+@app.route("/api/spotify/device", methods=["POST"])
+def spotify_choose_playback_device():
+    try:
+        sp = get_spotify_client()
+        payload = request.get_json(silent=True) or {}
+        selected = str(payload.get("deviceId") or "").strip()
+        account_id, _ = spotify_account_identity(sp)
+        if selected:
+            device = next((d for d in spotify_accessible_playback_devices(sp) if str(d.get("id")) == selected), None)
+            if not device:
+                return jsonify({"ok": False, "error": "That Spotify device was not found under the current account. Refresh devices and try again."}), 400
+            if device.get("is_restricted"):
+                return jsonify({"ok": False, "error": "Spotify marks that device as restricted. Choose another player."}), 400
+            session["spotify_playback_device_id"] = selected
+            session["spotify_playback_account_id"] = account_id
+            session.permanent = True
+            device_name = str(device.get("name") or "Unnamed Spotify device")
+        else:
+            session.pop("spotify_playback_device_id", None)
+            session.pop("spotify_playback_account_id", None)
+            device_name = "Automatic (Spotify active device)"
+        # Selection is routing only. Do not transfer playback or interrupt audio.
+        return jsonify({"ok": True, "selectedDeviceId": selected, "name": device_name})
+    except SpotifyLoginRequired as error:
+        return jsonify({"ok": False, "error": str(error)}), 401
+    except Exception as error:
+        return jsonify({"ok": False, "error": f"Could not select Spotify device: {error}"}), 503
+
+
 # lyrics.html uses Spotify only to identify the user's current track. Genius
 # metadata and the official Genius lyrics/annotation embed are resolved here so
 # no Spotify or Genius credentials are exposed to browser JavaScript.
@@ -9201,7 +9289,10 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
         }
 
     sp = get_spotify_client()
-    device_id = sampler_tools.get_device_id(sp, None)
+    selected_device_id = spotify_selected_device_id_for_account(sp)
+    device_id = sampler_tools.get_device_id(sp, None, selected_device_id)
+    if selected_device_id:
+        append_log(f"[songguesser: using manually selected Spotify device {device_id}]")
     candidate = queue[current_index]
     prepared = candidate["prepared"]
     # Preserve the original playlist position identity even if Spotify skips
@@ -9628,6 +9719,11 @@ def start_sampler():
         except Exception as error:
             return jsonify({"ok": False, "error": f"Could not prepare Spotify token cache: {error}"}), 500
 
+        try:
+            selected_device_id = spotify_selected_device_id_for_account(get_spotify_client())
+        except Exception as error:
+            return jsonify({"ok": False, "error": str(error)}), 409
+
         cmd = [
             sys.executable,
             "-u",
@@ -9643,6 +9739,9 @@ def start_sampler():
             "--control-file",
             str(CONTROL_FILE),
         ]
+
+        if selected_device_id:
+            cmd.extend(["--device-id", selected_device_id])
 
         if source_mode == "playlist":
             cmd.extend(["--single-link", playlist_link])
