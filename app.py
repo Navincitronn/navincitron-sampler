@@ -17,6 +17,7 @@ import time
 import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from html import escape as html_escape, unescape as html_unescape
 from html.parser import HTMLParser
 from collections import deque
@@ -8400,6 +8401,137 @@ def songguesser_release_decade_from_year(year: str) -> str:
     return ""
 
 
+def songguesser_grid_normalize_artist(value: Any) -> str:
+    """Normalized artist identity; tolerate 'The', accents and &/and."""
+    text = unicodedata.normalize("NFKD", str(value or "").casefold())
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = re.sub(r"^the\s+", "", text)
+    text = text.replace("&", " and ")
+    return "".join(re.findall(r"[a-z0-9]+", text))
+
+
+def songguesser_grid_normalize_album(value: Any) -> str:
+    """Normalize edition labels without discarding meaningful album title text."""
+    title = str(value or "").strip()
+    # A grid entry like 'Arthur (Or The Decline ...)' is preserved. Only
+    # recognizable reissue / edition suffixes are removed.
+    edition = (
+        r"remaster(?:ed|ing)?|deluxe|expanded|anniversary|edition|"
+        r"reissue|re-release|re release|bonus|stereo|mono|(?:19|20)\d{2}\s+mix"
+    )
+    previous = None
+    while title != previous:
+        previous = title
+        title = re.sub(
+            rf"\s*[\[(][^\])]*(?:{edition})[^\])]*[\])]\s*$",
+            "", title, flags=re.IGNORECASE,
+        )
+        title = re.sub(
+            rf"\s+[-–—]\s+(?:(?:19|20)\d{{2}}\s+)?(?:{edition})\b.*$",
+            "", title, flags=re.IGNORECASE,
+        )
+        title = re.sub(
+            rf"\s+[-–—]\s+(?:19|20)\d{{2}}\s+(?:remaster(?:ed)?|edition|deluxe|mix)\b.*$",
+            "", title, flags=re.IGNORECASE,
+        )
+        title = title.strip()
+    text = unicodedata.normalize("NFKD", title.casefold())
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = text.replace("&", " and ")
+    return "".join(re.findall(r"[a-z0-9]+", text))
+
+
+@lru_cache(maxsize=4)
+def songguesser_grid_release_year_index(
+    path: str, modified_ns: int, file_size: int,
+) -> tuple[dict[tuple[str, str], str], dict[str, str]]:
+    """Parse backend grid.txt once per version; conflicting titles remain unmatched."""
+    by_artist_album: dict[tuple[str, str], str] = {}
+    by_album: dict[str, tuple[str, str] | None] = {}
+
+    for line in Path(path).read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        # 'The Beatles - Abbey Road (September 26, 1969)'
+        match = re.match(r"^(.+?)\s+-\s+(.+?)\s+\([^()]*\b((?:18|19|20)\d{2})\)\s*$", line)
+        if not match:
+            continue
+        artist, title, year = match.groups()
+        artist_key = songguesser_grid_normalize_artist(artist)
+        album_key = songguesser_grid_normalize_album(title)
+        if not artist_key or not album_key:
+            continue
+
+        key = (artist_key, album_key)
+        if key not in by_artist_album:
+            by_artist_album[key] = year
+        elif by_artist_album[key] != year:
+            by_artist_album[key] = ""  # Do not guess among conflicting dates.
+
+        current = by_album.get(album_key)
+        if album_key not in by_album:
+            by_album[album_key] = (artist_key, year)
+        elif current is not None and current != (artist_key, year):
+            by_album[album_key] = None  # Album name alone is ambiguous.
+
+    # Only permit title-only matching when we have no usable artist identity.
+    unique_titles = {
+        album_key: item[1] for album_key, item in by_album.items()
+        if item is not None and by_artist_album.get((item[0], album_key)) == item[1]
+    }
+    return by_artist_album, unique_titles
+
+
+def songguesser_grid_year(artist: Any, album: Any, album_artist: Any = None) -> str:
+    """Prefer original grid.txt year; leave Spotify untouched if no safe match."""
+    album_key = songguesser_grid_normalize_album(album)
+    if not album_key:
+        return ""
+    try:
+        stat = GRID_FILE.stat()
+        by_pair, unique_titles = songguesser_grid_release_year_index(
+            str(GRID_FILE), stat.st_mtime_ns, stat.st_size,
+        )
+    except (OSError, UnicodeError):
+        return ""
+
+    names: list[str] = []
+    if isinstance(album_artist, str):
+        names.append(album_artist)
+    elif isinstance(album_artist, list):
+        names.extend(
+            item.get("name", "") if isinstance(item, dict) else str(item)
+            for item in album_artist
+        )
+    if artist:
+        names.append(str(artist))
+        # Songguesser's formatted track artist may contain multiple performers.
+        names.extend(re.split(r",\s*|\s+feat(?:uring)?\.?\s+", str(artist), flags=re.IGNORECASE))
+
+    has_artist = False
+    for name in names:
+        artist_key = songguesser_grid_normalize_artist(name)
+        if not artist_key or artist_key in {"unknownartist", "variousartists"}:
+            continue
+        has_artist = True
+        match = by_pair.get((artist_key, album_key))
+        if match:
+            return match
+
+    return unique_titles.get(album_key, "") if not has_artist else ""
+
+
+def songguesser_apply_grid_release_year(answer: dict[str, Any], prepared: dict[str, Any]) -> None:
+    album_artist = prepared.get("grid_album_artist")
+    track = prepared.get("track") if isinstance(prepared.get("track"), dict) else {}
+    track_album = track.get("album") if isinstance(track.get("album"), dict) else {}
+    if not album_artist:
+        album_artist = track_album.get("artists")
+    year = songguesser_grid_year(answer.get("artist"), answer.get("album"), album_artist)
+    if year:
+        answer["releaseYear"] = year
+        answer["releaseDecade"] = songguesser_release_decade_from_year(year)
+
+
 def songguesser_track_identity_keys(track: dict[str, Any], fallback: str = "") -> set[str]:
     """Match both Spotify URIs and song identities across playlist/album sources."""
     configure_sampler_tools()
@@ -8469,7 +8601,7 @@ def songguesser_track_answer(prepared: dict[str, Any]) -> dict[str, Any]:
     release_year = songguesser_release_year_from_text(album.get("release_date") or prepared.get("release_date"))
     release_decade = songguesser_release_decade_from_year(release_year)
 
-    return {
+    answer = {
         "artist": artist,
         "album": album_name,
         "song": song,
@@ -8477,6 +8609,8 @@ def songguesser_track_answer(prepared: dict[str, Any]) -> dict[str, Any]:
         "releaseDecade": release_decade,
         "coverUrl": cover_url,
     }
+    songguesser_apply_grid_release_year(answer, prepared)
+    return answer
 
 
 def songguesser_candidate_from_album_track(album: dict[str, Any], track: dict[str, Any]) -> dict[str, Any]:
@@ -8490,6 +8624,7 @@ def songguesser_candidate_from_album_track(album: dict[str, Any], track: dict[st
         assumed_duration_seconds=SONGGUESSER_ASSUMED_DURATION_SECONDS,
     )
     prepared["release_date"] = album.get("release_date")
+    prepared["grid_album_artist"] = album.get("artists") or []
 
     return {"prepared": prepared, "answer": songguesser_track_answer(prepared)}
 
@@ -8516,6 +8651,9 @@ def songguesser_candidate_from_playlist_item(
     # starts a different item, the fallback artwork must not belong to the
     # originally selected local file.
     prepared["playlist_cover_url"] = playlist_bundle.get("cover_url")
+    item_track = item.get("track") or {}
+    item_album = item_track.get("album") if isinstance(item_track.get("album"), dict) else {}
+    prepared["grid_album_artist"] = item_album.get("artists") or []
 
     return {"prepared": prepared, "answer": songguesser_track_answer(prepared)}
 
@@ -8621,17 +8759,17 @@ def songguesser_enrich_queue_answers(sp: Any, queue: list[dict[str, Any]], hints
         if not isinstance(answer, dict):
             continue
 
-        if not songguesser_should_lookup_answer(answer, hints_enabled):
-            continue
+        if songguesser_should_lookup_answer(answer, hints_enabled):
+            looked_up = songguesser_search_track_metadata(sp, answer)
+            if looked_up:
+                for key in ("artist", "album", "song", "releaseYear", "releaseDecade", "coverUrl"):
+                    value = looked_up.get(key)
+                    if value and (key not in answer or not answer.get(key) or (key == "album" and songguesser_answer_has_unknown_album(answer))):
+                        answer[key] = value
 
-        looked_up = songguesser_search_track_metadata(sp, answer)
-        if not looked_up:
-            continue
-
-        for key in ("artist", "album", "song", "releaseYear", "releaseDecade", "coverUrl"):
-            value = looked_up.get(key)
-            if value and (key not in answer or not answer.get(key) or (key == "album" and songguesser_answer_has_unknown_album(answer))):
-                answer[key] = value
+        # Spotify enrichment can fill a previously unknown album. Reapply the
+        # grid override afterward so Spotify's reissue year never wins.
+        songguesser_apply_grid_release_year(answer, candidate.get("prepared") or {})
 
 
 def songguesser_summary_payload(game: dict[str, Any]) -> list[dict[str, Any]]:
@@ -9081,7 +9219,10 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
         if not used_exact_uri_fallback:
             # Playlist-context playback may have skipped the selected position.
             # Adopt the actual track metadata, never the cached position's song.
-            observed_track = sampler_tools.simplify_track(observed["item"])
+            observed_item = observed["item"]
+            observed_track = sampler_tools.simplify_track(observed_item)
+            observed_album = observed_item.get("album") if isinstance(observed_item.get("album"), dict) else {}
+            prepared["grid_album_artist"] = observed_album.get("artists") or []
             if not observed_track.get("uri") and not observed_track.get("name"):
                 raise RuntimeError("Spotify did not expose the actual track for this Songguesser round.")
             old_uri = track_uri
