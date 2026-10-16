@@ -1852,16 +1852,15 @@ def start_prepared_clip(
     device_id: str,
     prepared: dict,
     local_seek_delay_seconds: float,
-    verify_playback: bool = True,
+    verify_playback: bool = False,
 ) -> int:
     """
-    Starts an already prepared clip on Spotify Connect.
+    Starts an already prepared clip on Spotify Connect exactly once after an
+    accepted HTTP playback command. Optional status verification is advisory:
+    Spotify's current_playback() can lag behind audible playback, so an
+    unconfirmed status must never restart an already playing clip or skip it.
 
-    In normal Sampler mode (the default), verify that Spotify started the
-    expected track and retry an unconfirmed start once. Songguesser opts out of
-    status-based verification/replay: Spotify's current_playback response can
-    lag behind audible playback, and retrying then restarts the same short clip.
-    Explicit Spotify HTTP device errors still use device-id refresh/retry in
+    Genuine Spotify HTTP device errors still use device-id refresh/retry in
     start_playback_with_device_retry(), regardless of this setting.
     """
 
@@ -1891,53 +1890,27 @@ def start_prepared_clip(
     else:
         raise RuntimeError(f"Unknown prepared clip kind: {prepared.get('kind')!r}")
 
-    used_device_id: str | None = None
+    # Only retry when Spotify explicitly rejects a stale/unavailable device.
+    # A successful start_playback() response is not an invitation to send a
+    # duplicate command just because current_playback() is briefly stale.
+    used_device_id = start_playback_with_device_retry(
+        sp=sp,
+        device_id=effective_device_id,
+        playback_kwargs=playback_kwargs,
+    )
+    if used_device_id:
+        ACTIVE_DEVICE_ID_OVERRIDE = used_device_id
+        effective_device_id = used_device_id
 
-    for attempt in range(2):
-        used_device_id = start_playback_with_device_retry(
-            sp=sp,
-            device_id=effective_device_id,
-            playback_kwargs=playback_kwargs,
+    if verify_playback and not wait_for_prepared_playback(sp, prepared):
+        print(
+            "NOTE: Spotify accepted the playback command, but its playback "
+            "status has not yet confirmed the requested track. Continuing "
+            "without restarting or skipping it."
         )
 
-        if used_device_id:
-            ACTIVE_DEVICE_ID_OVERRIDE = used_device_id
-            effective_device_id = used_device_id
-
-        # Songguesser starts on an HTTP-success response: do not issue a second
-        # start solely because Spotify Connect's playback status is still stale.
-        # Strict verification remains the default for normal Sampler playback.
-        if not verify_playback:
-            break
-
-        if wait_for_prepared_playback(sp, prepared):
-            break
-
-        if attempt == 0:
-            print(
-                "WARNING: Spotify accepted the playback command, but the requested "
-                "track was not actually observed playing. Refreshing the Spotify "
-                "Connect device and retrying once."
-            )
-
-            try:
-                refreshed_device_id = get_device_id(sp, None)
-                if refreshed_device_id:
-                    ACTIVE_DEVICE_ID_OVERRIDE = refreshed_device_id
-                    effective_device_id = refreshed_device_id
-            except Exception as refresh_error:
-                print(f"WARNING: Could not refresh Spotify device before playback retry: {refresh_error}")
-
-            time.sleep(0.25)
-            continue
-
-        raise RuntimeError(
-            "Spotify accepted the playback command but the requested track did "
-            "not begin playing after a retry. The sampler will skip this item "
-            "instead of counting a silent clip as successfully played."
-        )
-
-    # Only publish the track to shuffle.html after Spotify has actually started it.
+    # The command was accepted by Spotify. State is requested-track metadata,
+    # not proof that Spotify's asynchronously reported player state caught up.
     if prepared["kind"] == "playlist_context" and prepared.get("blind_public_playlist"):
         update_prepared_from_current_playback(sp, prepared, position_ms)
 
