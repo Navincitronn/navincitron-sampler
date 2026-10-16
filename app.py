@@ -9261,7 +9261,9 @@ def songguesser_confirm_album_playback(
         if not playback:
             continue
         item = playback.get("item") if isinstance(playback.get("item"), dict) else {}
-        if playback.get("is_playing") and str(item.get("uri") or "") == expected_uri:
+        linked_from = item.get("linked_from") if isinstance(item.get("linked_from"), dict) else {}
+        actual_uris = {str(item.get("uri") or ""), str(linked_from.get("uri") or "")}
+        if playback.get("is_playing") and expected_uri in actual_uris:
             return playback
         last_observed = (
             f"status={'playing' if playback.get('is_playing') else 'paused'}, "

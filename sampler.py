@@ -222,6 +222,8 @@ def simplify_track(track: dict, album_context: dict | None = None) -> dict:
         "artists": simplify_artists(track.get("artists")),
         "album": {
             "name": album_name,
+            "id": album.get("id") or (album_context or {}).get("id"),
+            "uri": album.get("uri") or (album_context or {}).get("uri"),
             "release_date": album.get("release_date") or (album_context or {}).get("release_date"),
             "release_date_precision": album.get("release_date_precision") or (album_context or {}).get("release_date_precision"),
             "images": album_images,
@@ -1293,11 +1295,20 @@ def play_track_uri_clip(
         random_start=random_start,
     )
 
-    sp.start_playback(
-        device_id=device_id,
-        uris=[track["uri"]],
-        position_ms=position_ms,
-    )
+    album_uri = album_context_for_catalog_track(sp, track)
+    if album_uri:
+        sp.start_playback(
+            device_id=device_id,
+            context_uri=album_uri,
+            offset={"uri": track["uri"]},
+            position_ms=position_ms,
+        )
+    else:
+        sp.start_playback(
+            device_id=device_id,
+            uris=[track["uri"]],
+            position_ms=position_ms,
+        )
 
     sleep_then_pause(sp, device_id, clip_seconds)
 
@@ -1600,6 +1611,7 @@ def prepare_album_clip(
 
     return {
         "kind": "track_uri",
+        "album_uri": album.get("uri") or f"spotify:album:{album['id']}",
         "source_text": f"Album: {album['name']} - {album_artist}",
         "track_text": f"{format_track_name(track)} - {track_artist}",
         "track": track,
@@ -1884,6 +1896,48 @@ def wait_for_prepared_playback(
 
 
 
+def album_context_for_catalog_track(
+    sp: spotipy.Spotify,
+    track: dict,
+    provided_album_uri: str | None = None,
+) -> str | None:
+    """Find the correct album context for a catalog track, without guessing.
+
+    The prepared album metadata normally supplies this URI with zero extra API
+    calls. For playlist direct-track recovery with old cached metadata, look up
+    the album once via Spotify's single-track endpoint. Local tracks do not
+    have a playable album context and must use playlist-position playback.
+    """
+    uri = str(track.get("uri") or "")
+    if not uri.startswith("spotify:track:"):
+        return None
+    album = track.get("album") if isinstance(track.get("album"), dict) else {}
+    candidates = (provided_album_uri, album.get("uri"))
+    for candidate in candidates:
+        candidate = str(candidate or "")
+        if re.fullmatch(r"spotify:album:[A-Za-z0-9]+", candidate):
+            return candidate
+    album_id = str(album.get("id") or "")
+    if re.fullmatch(r"[A-Za-z0-9]{20,24}", album_id):
+        return f"spotify:album:{album_id}"
+
+    # Only on old/incomplete playlist-track metadata; never an extra request
+    # for normal album playback, because its album context is already known.
+    try:
+        details = sp.track(uri)
+        remote_album = details.get("album") if isinstance(details, dict) else None
+        if isinstance(remote_album, dict):
+            candidate = str(remote_album.get("uri") or "")
+            if re.fullmatch(r"spotify:album:[A-Za-z0-9]+", candidate):
+                return candidate
+            album_id = str(remote_album.get("id") or "")
+            if re.fullmatch(r"[A-Za-z0-9]{20,24}", album_id):
+                return f"spotify:album:{album_id}"
+    except Exception as error:
+        print(f"NOTE: Could not obtain album context for {uri}: {error}")
+    return None
+
+
 def start_prepared_clip(
     sp: spotipy.Spotify,
     device_id: str,
@@ -1908,10 +1962,29 @@ def start_prepared_clip(
 
     if prepared["kind"] == "track_uri":
         track = prepared["track"]
-        playback_kwargs = {
-            "uris": [track["uri"]],
-            "position_ms": position_ms,
-        }
+        album_uri = album_context_for_catalog_track(
+            sp, track, prepared.get("album_uri"),
+        )
+        if album_uri:
+            # Spotify's Connect clients can return HTTP 204 but remain paused
+            # when given a bare {"uris":[track]} play request. Starting the
+            # same song through its album context avoids that observed issue.
+            playback_kwargs = {
+                "context_uri": album_uri,
+                "offset": {"uri": track["uri"]},
+                "position_ms": position_ms,
+            }
+        else:
+            # Keep support for old/cached tracks with no discoverable album.
+            playback_kwargs = {
+                "uris": [track["uri"]],
+                "position_ms": position_ms,
+            }
+            print(
+                "WARNING: Spotify album context unavailable; using the direct "
+                f"track URI for {track.get('uri') or 'unknown track'}. "
+                "Some Spotify Connect clients may not execute this request."
+            )
         is_local = False
 
     elif prepared["kind"] == "playlist_context":
@@ -2301,6 +2374,7 @@ def prepare_album_track_clip(
 
     return {
         "kind": "track_uri",
+        "album_uri": album.get("uri") or (f"spotify:album:{album['id']}" if album.get("id") else None),
         "source_text": f"Album: {album.get('name', 'Unknown album')} - {album_artist}",
         "track_text": f"{format_track_name(track)} - {track_artist}",
         "track": track,
