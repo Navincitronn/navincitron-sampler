@@ -1837,7 +1837,8 @@ def playback_matches_prepared(playback: dict | None, prepared: dict) -> bool:
 
     # Direct album tracks and most playlist tracks have a stable Spotify URI.
     if expected_uri and current_uri:
-        return current_uri == expected_uri
+        linked_from = current_item.get("linked_from") if isinstance(current_item.get("linked_from"), dict) else {}
+        return expected_uri in {current_uri, str(linked_from.get("uri") or "")}
 
     if prepared.get("kind") == "playlist_context":
         expected_context_uri = f"spotify:playlist:{prepared.get('playlist_id')}"
@@ -1968,6 +1969,57 @@ def start_prepared_clip(
     save_sampler_state(prepared, position_ms)
     return position_ms
 
+
+
+def diagnose_requested_spotify_playback(
+    sp: spotipy.Spotify,
+    prepared: dict,
+    requested_device_id: str | None,
+) -> None:
+    """Read-only post-start diagnostic for normal Sampler mode.
+
+    A successful HTTP play response is not evidence the Connect client is
+    actually playing. Status can also lag, so this function NEVER sends a
+    second playback command and NEVER decides to skip the requested clip.
+    """
+    def playback_description(playback: dict | None) -> str:
+        if not isinstance(playback, dict):
+            return "Spotify returned no playback state"
+        device = playback.get("device") if isinstance(playback.get("device"), dict) else {}
+        item = playback.get("item") if isinstance(playback.get("item"), dict) else {}
+        context = playback.get("context") if isinstance(playback.get("context"), dict) else {}
+        return (
+            f"is_playing={playback.get('is_playing')!r}, "
+            f"device={device.get('name') or 'unknown'} ({device.get('id') or 'unknown'}), "
+            f"track={item.get('uri') or 'unknown'}, "
+            f"context={context.get('uri') or 'unknown'}"
+        )
+
+    expected = str(((prepared.get("track") or {}).get("uri")) or "")
+    last_state = "status unavailable"
+    # Web API state lags on some Connect clients; allow a short observation
+    # window, but do not replay or declare a valid item unplayable.
+    for delay in (0.6, 0.6, 0.6):
+        time.sleep(delay)
+        try:
+            playback = sp.current_playback()
+        except Exception as error:
+            last_state = f"status request failed: {type(error).__name__}: {error}"
+            continue
+        last_state = playback_description(playback)
+        actual_device = (
+            playback.get("device") if isinstance(playback, dict) and isinstance(playback.get("device"), dict) else {}
+        ).get("id")
+        device_matches = not (requested_device_id and actual_device and actual_device != requested_device_id)
+        if device_matches and playback_matches_prepared(playback, prepared):
+            return
+    print(
+        "WARNING: Spotify accepted the play request but did not confirm the "
+        "requested playback during the observation window. "
+        f"Expected track={expected or 'unknown'}, device={requested_device_id or 'automatic'}; "
+        f"last Spotify report: {last_state}. "
+        "No replay or automatic skip was attempted."
+    )
 
 
 def read_sampler_control(control_file: str | None) -> dict:
@@ -2793,13 +2845,19 @@ def main() -> None:
                     local_seek_delay_seconds=args.local_seek_delay_seconds,
                 )
 
+                diagnose_requested_spotify_playback(
+                    sp=sp,
+                    prepared=prepared,
+                    requested_device_id=ACTIVE_DEVICE_ID_OVERRIDE or device_id,
+                )
+
                 original_index = start_offset + play_index + 1
                 position_seconds = position_ms // 1000
 
                 print(
                     f"[{original_index}/{len(all_lines)}] "
                     f"{prepared['source_text']} | "
-                    f"Track: {prepared['track_text']} | "
+                    f"Requested Track: {prepared['track_text']} | "
                     f"Start: {position_seconds}s"
                 )
 
