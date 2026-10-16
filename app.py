@@ -9004,6 +9004,26 @@ def songguesser_build_playlist_candidates(
     return candidates
 
 
+# Limit recovery attempts to avoid a cascade of Spotify play commands if
+# Connect is temporarily unavailable or its status API is lagging.
+SONGGUESSER_FILE_SPARE_COUNT = 7
+SONGGUESSER_FILE_MAX_RECOVERIES_PER_ROUND = 2
+
+
+def songguesser_failure_allows_file_recovery(error: Exception) -> bool:
+    """Recover from a track-specific failure, not authentication/device outages."""
+    message = str(error).lower()
+    blocked = (
+        "rate limit", "too many requests", "429", "401", "unauthorized",
+        "invalid access token", "no spotify devices", "device is no longer available",
+        "manually selected spotify device", "stop the regular sampler",
+        "permission denied",
+    )
+    if any(phrase in message for phrase in blocked):
+        return False
+    return True
+
+
 def songguesser_build_candidates_from_file(
     sp: Any, cache: dict[str, Any], albums_file: Path, excluded_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
@@ -9016,16 +9036,21 @@ def songguesser_build_candidates_from_file(
     used_by_source: dict[str, set[str]] = {}
     candidates: list[dict[str, Any]] = []
     reserved_keys = set(excluded_keys or set())
+    # A five-song game should not be abandoned just because one of the many
+    # Spotify sources in a text file contains a track that cannot be started.
+    # Keep spare, distinct candidates; they are NOT played or marked as heard
+    # unless they are needed to replace a failed round.
+    target_count = SONGGUESSER_SONG_COUNT + SONGGUESSER_FILE_SPARE_COUNT
 
     # Multiple passes allow a short file to contribute more than one unique song
     # from the same album/playlist while still preventing repeats from that source.
-    for _pass_index in range(max(1, SONGGUESSER_SONG_COUNT)):
+    for _pass_index in range(max(1, target_count)):
         shuffled_lines = lines[:]
         random.shuffle(shuffled_lines)
         progress_before = len(candidates)
 
         for line in shuffled_lines:
-            remaining = SONGGUESSER_SONG_COUNT - len(candidates)
+            remaining = target_count - len(candidates)
             if remaining <= 0:
                 break
 
@@ -9041,7 +9066,7 @@ def songguesser_build_candidates_from_file(
             except Exception as error:
                 append_log(f"[songguesser warning: skipped source {line!r}: {error}]")
 
-        if len(candidates) >= SONGGUESSER_SONG_COUNT:
+        if len(candidates) >= target_count:
             break
         if len(candidates) == progress_before:
             break
@@ -9053,7 +9078,7 @@ def songguesser_build_candidates_from_file(
             "Choose more sources or refresh shuffle.html to reset the no-repeat history."
         )
 
-    return candidates[:SONGGUESSER_SONG_COUNT]
+    return candidates[:target_count]
 
 
 def songguesser_build_candidates_from_single_link(
@@ -9203,7 +9228,8 @@ def songguesser_confirm_playlist_playback(
             continue
 
         # An exact match is safe even when Spotify omits playlist context.
-        if expected_uri and uri == expected_uri:
+        linked_from = item.get("linked_from") if isinstance(item.get("linked_from"), dict) else {}
+        if expected_uri and expected_uri in {uri, str(linked_from.get("uri") or "")}:
             return playback
 
         context = playback.get("context") if isinstance(playback.get("context"), dict) else {}
@@ -9261,13 +9287,20 @@ def songguesser_confirm_album_playback(
         if not playback:
             continue
         item = playback.get("item") if isinstance(playback.get("item"), dict) else {}
-        if playback.get("is_playing") and str(item.get("uri") or "") == expected_uri:
+        linked_from = item.get("linked_from") if isinstance(item.get("linked_from"), dict) else {}
+        if playback.get("is_playing") and expected_uri in {
+            str(item.get("uri") or ""), str(linked_from.get("uri") or ""),
+        }:
             return playback
         last_observed = (
             f"status={'playing' if playback.get('is_playing') else 'paused'}, "
             f"track={str(item.get('uri') or 'unknown')}"
         )
-    append_log(f"[songguesser warning: album start not confirmed; {last_observed or 'no Spotify status'}]")
+    append_log(
+        "[songguesser warning: album start not confirmed; "
+        f"expected={expected_uri}; observed={last_observed or 'no Spotify status'}; "
+        f"source={prepared.get('source_text') or 'unknown'}]"
+    )
     raise RuntimeError(
         "Spotify accepted Songguesser's playback command but never confirmed "
         "that the selected album track began playing. No round was started. "
@@ -9275,7 +9308,7 @@ def songguesser_confirm_album_playback(
     )
 
 
-def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
+def songguesser_start_current_once(game: dict[str, Any]) -> dict[str, Any]:
     configure_sampler_tools()
 
     queue = game.get("queue") or []
@@ -9453,6 +9486,47 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
     return songguesser_public_payload(game, candidate, position_ms)
 
 
+def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
+    """Start a round, substituting unused sources for *file-mode* failures.
+
+    Single-link Songguesser remains untouched: users intentionally selected
+    one source and should receive an actionable error for that specific link.
+    A file can contain hundreds of unrelated valid albums/playlists; an
+    unplayable individual track should not terminate an entire five-song game.
+    """
+    if game.get("source_mode") != "file":
+        return songguesser_start_current_once(game)
+
+    failures = 0
+    while True:
+        try:
+            return songguesser_start_current_once(game)
+        except Exception as error:
+            reserves = game.get("spare_queue")
+            index = int(game.get("current_index", 0))
+            queue = game.get("queue") or []
+            if (
+                failures >= SONGGUESSER_FILE_MAX_RECOVERIES_PER_ROUND
+                or not isinstance(reserves, list) or not reserves
+                or index >= len(queue)
+                or not songguesser_failure_allows_file_recovery(error)
+            ):
+                raise
+
+            failed_prepared = (queue[index] or {}).get("prepared") or {}
+            replacement = reserves.pop(0)
+            append_log(
+                "[songguesser: text-file source failed; "
+                f"replacing {failed_prepared.get('source_text') or 'unknown source'} "
+                f"with another unused source ({failures + 1}/"
+                f"{SONGGUESSER_FILE_MAX_RECOVERIES_PER_ROUND}): {error}]"
+            )
+            # A failed candidate was never completed or graded. Keep its
+            # original place in the five-round sequence and replace in situ.
+            queue[index] = replacement
+            failures += 1
+
+
 def get_current_songguesser_game() -> dict[str, Any] | None:
     game_id = session.get("songguesser_game_id")
     if not game_id:
@@ -9520,13 +9594,16 @@ def songguesser_start():
         except Exception as error:
             return jsonify({"ok": False, "error": str(error)}), 400
 
-        songguesser_enrich_queue_answers(sp, queue, hints)
-
         random.shuffle(queue)
+        # Enrich only the five primary candidates. Spare tracks get enriched
+        # when they actually start, avoiding unnecessary Spotify Search calls.
+        songguesser_enrich_queue_answers(sp, queue[:SONGGUESSER_SONG_COUNT], hints)
+
         game_id = secrets.token_urlsafe(16)
         game = {
             "id": game_id,
             "queue": queue[:SONGGUESSER_SONG_COUNT],
+            "spare_queue": queue[SONGGUESSER_SONG_COUNT:] if source_mode == "file" else [],
             "current_index": 0,
             "hints": hints,
             "source_mode": source_mode,
