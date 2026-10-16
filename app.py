@@ -8482,17 +8482,52 @@ def songguesser_grid_release_year_index(
 
 
 def songguesser_grid_year(artist: Any, album: Any, album_artist: Any = None) -> str:
-    """Prefer original grid.txt year; leave Spotify untouched if no safe match."""
-    album_key = songguesser_grid_normalize_album(album)
-    if not album_key:
+    """Original release year from grid.txt, with reissue-title-safe fallback.
+
+    Try the full normalized title before removing a trailing parenthetical.
+    This lets meaningful album parentheses match exactly, but allows Spotify
+    titles such as 'Dust Bowl Ballads (Original Album Plus Bonus Tracks)' and
+    'Dust Bowl Ballads (2000)' to resolve to the original grid entry.
+    Only accept a variant when its artist + album pair is present in grid.txt.
+    """
+    album_text = str(album or "").strip()
+    if not album_text:
         return ""
     try:
         stat = GRID_FILE.stat()
         by_pair, unique_titles = songguesser_grid_release_year_index(
             str(GRID_FILE), stat.st_mtime_ns, stat.st_size,
         )
-    except (OSError, UnicodeError):
+    except (OSError, UnicodeError) as error:
+        append_log(f"[songguesser year hint: could not read {GRID_FILE.name}: {error}; using Spotify year]")
         return ""
+
+    # Album names can carry distributor-added edition labels with no words like
+    # 'Remastered': '(Original Album)', '(2000)', '(Bonus Tracks)', etc.
+    # Never match a truncated title alone against a different artist.
+    variants = []
+    def add_variant(value: str) -> None:
+        key = songguesser_grid_normalize_album(value)
+        if key and key not in variants:
+            variants.append(key)
+
+    add_variant(album_text)
+    remaining = album_text
+    for _ in range(3):
+        stripped = re.sub(r"\s*[\[(][^\]()\[\]]+[\])]\s*$", "", remaining).strip()
+        if not stripped or stripped == remaining:
+            break
+        add_variant(stripped)
+        remaining = stripped
+
+    # Also support unbracketed common Spotify edition suffixes.
+    stripped = re.sub(
+        r"\s*[-–—:]\s*(?:original\s+album|bonus\s+tracks?|\d{4}\s+" 
+        r"(?:remaster(?:ed)?|edition|mix)|reissue|deluxe|expanded)\b.*$",
+        "", album_text, flags=re.IGNORECASE,
+    ).strip()
+    if stripped != album_text:
+        add_variant(stripped)
 
     names: list[str] = []
     if isinstance(album_artist, str):
@@ -8504,7 +8539,6 @@ def songguesser_grid_year(artist: Any, album: Any, album_artist: Any = None) -> 
         )
     if artist:
         names.append(str(artist))
-        # Songguesser's formatted track artist may contain multiple performers.
         names.extend(re.split(r",\s*|\s+feat(?:uring)?\.?\s+", str(artist), flags=re.IGNORECASE))
 
     has_artist = False
@@ -8513,11 +8547,14 @@ def songguesser_grid_year(artist: Any, album: Any, album_artist: Any = None) -> 
         if not artist_key or artist_key in {"unknownartist", "variousartists"}:
             continue
         has_artist = True
-        match = by_pair.get((artist_key, album_key))
-        if match:
-            return match
+        for album_key in variants:
+            year = by_pair.get((artist_key, album_key))
+            if year:
+                return year
 
-    return unique_titles.get(album_key, "") if not has_artist else ""
+    # If Spotify omitted artist identity, only use a unique exact title. Never
+    # accept a shortened title without artist evidence (too ambiguous).
+    return unique_titles.get(variants[0], "") if not has_artist else ""
 
 
 def songguesser_apply_grid_release_year(answer: dict[str, Any], prepared: dict[str, Any]) -> None:
@@ -8989,6 +9026,9 @@ def songguesser_answer_with_saved_cover(answer: dict[str, Any]) -> dict[str, Any
 
 def songguesser_public_payload(game: dict[str, Any], candidate: dict[str, Any], position_ms: int) -> dict[str, Any]:
     answer = candidate.get("answer") or {}
+    # The hint must reflect the ACTUAL reconciled track, not an earlier
+    # Spotify-search reissue date or a previous playlist candidate.
+    songguesser_apply_grid_release_year(answer, candidate.get("prepared") or {})
     public_answer = songguesser_answer_with_saved_cover(answer)
     hints_enabled = game.get("hints") or {}
     release_year = answer.get("releaseYear") or ""
@@ -9110,6 +9150,43 @@ def songguesser_confirm_playlist_playback(
     )
 
 
+def songguesser_confirm_album_playback(
+    sp: Any,
+    prepared: dict[str, Any],
+    timeout_seconds: float = 7.5,
+) -> dict[str, Any]:
+    """Wait for the requested Spotify track to actually play.
+
+    Spotify Connect may acknowledge start_playback() while the player remains
+    paused. The regular sampler intentionally tolerates this; Songguesser must
+    not start a *graded* round with no verified playing song. Poll only: sending
+    start_playback() again could audibly restart a successfully playing clip.
+    """
+    expected_uri = str((prepared.get("track") or {}).get("uri") or "")
+    if not expected_uri.startswith("spotify:track:"):
+        raise RuntimeError("Songguesser cannot identify the requested album track.")
+    deadline = time.monotonic() + timeout_seconds
+    last_observed = ""
+    while time.monotonic() < deadline:
+        time.sleep(0.35)
+        playback = songguesser_current_spotify_playback(sp)
+        if not playback:
+            continue
+        item = playback.get("item") if isinstance(playback.get("item"), dict) else {}
+        if playback.get("is_playing") and str(item.get("uri") or "") == expected_uri:
+            return playback
+        last_observed = (
+            f"status={'playing' if playback.get('is_playing') else 'paused'}, "
+            f"track={str(item.get('uri') or 'unknown')}"
+        )
+    append_log(f"[songguesser warning: album start not confirmed; {last_observed or 'no Spotify status'}]")
+    raise RuntimeError(
+        "Spotify accepted Songguesser's playback command but never confirmed "
+        "that the selected album track began playing. No round was started. "
+        "Check that Spotify Connect is active on the intended device, then retry."
+    )
+
+
 def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
     configure_sampler_tools()
 
@@ -9151,6 +9228,12 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
         local_seek_delay_seconds=SONGGUESSER_LOCAL_SEEK_DELAY_SECONDS,
         verify_playback=False,
     )
+
+    # Album-link items use direct track URIs. Confirm that Spotify actually
+    # starts the track before revealing a timed/graded round. Unlike the old
+    # verifier, this never restarts an already-audible segment.
+    if not is_playlist:
+        songguesser_confirm_album_playback(sp, prepared)
 
     used_exact_uri_fallback = False
     if is_playlist:
@@ -9368,6 +9451,11 @@ def songguesser_start():
         except Exception as error:
             songguesser_games.pop(game_id, None)
             session.pop("songguesser_game_id", None)
+            # start_prepared_clip publishes requested metadata as soon as
+            # Spotify accepts the command. When the subsequent confirmation
+            # fails, remove that provisional state so the UI never claims a
+            # song is playing which Spotify has not confirmed.
+            STATE_FILE.unlink(missing_ok=True)
             return jsonify({"ok": False, "error": str(error)}), 500
 
 
@@ -9396,6 +9484,7 @@ def songguesser_next():
     try:
         return jsonify(songguesser_start_current(game))
     except Exception as error:
+        STATE_FILE.unlink(missing_ok=True)
         return jsonify({"ok": False, "error": str(error)}), 500
 
 
@@ -9426,6 +9515,11 @@ def songguesser_play():
 
 @app.route("/api/songguesser/stop", methods=["POST"])
 def songguesser_stop():
+    # A user may toggle from Sampler to Songguesser before clicking Stop.
+    # Legacy clients call this endpoint according to the checkbox state; do
+    # not leave the regular sampler running invisibly.
+    if process_is_running():
+        return stop_sampler()
     game = get_current_songguesser_game()
     if game is not None:
         songguesser_games.pop(game.get("id"), None)
@@ -9678,9 +9772,15 @@ def stop_sampler():
                 append_log(f"[warning: could not terminate sampler.py cleanly: {error}]")
 
         write_sampler_control("stop", paused=False)
-        pause_spotify()
+        # A completed or terminated child must never block a new Songguesser
+        # round. poll() is the authoritative check; clear the dead reference.
+        if sampler_process is not None and sampler_process.poll() is not None:
+            sampler_process = None
+        running = process_is_running()
 
-        return jsonify({"ok": True, "running": process_is_running(), "wasRunning": was_running})
+    # Do not hold the process lock during a potentially slow Spotify API pause.
+    pause_spotify()
+    return jsonify({"ok": True, "running": running, "wasRunning": was_running})
 
 
 
