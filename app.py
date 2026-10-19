@@ -8585,7 +8585,7 @@ def songguesser_grid_normalize_album(value: Any) -> str:
     # recognizable reissue / edition suffixes are removed.
     edition = (
         r"remaster(?:ed|ing)?|deluxe|expanded|anniversary|edition|"
-        r"reissue|re-release|re release|bonus|stereo|mono|(?:19|20)\d{2}\s+mix"
+        r"reissue|re-release|re release|bonus|stereo|mono|sampler|(?:19|20)\d{2}\s+mix"
     )
     previous = None
     while title != previous:
@@ -9053,12 +9053,24 @@ def songguesser_grid_year(artist: Any, album: Any, album_artist: Any = None) -> 
             variants.append(key)
 
     add_variant(album_text)
+    # Spotify sometimes reverses the two exact subtitle clauses of a release.
+    # Example: "More Blood, More Tracks: The Bootleg Series, Vol. 14
+    # (Sampler)" vs. Grid "The Bootleg Series Vol. 14: More Blood,
+    # More Tracks". Match only the *entire* reversed title, never its
+    # fragments (particularly not "Blood On The Tracks").
+    def add_reversed_clauses(value: str) -> None:
+        clauses = value.split(":", 1)
+        if len(clauses) == 2 and all(part.strip() for part in clauses):
+            add_variant(clauses[1].strip() + ": " + clauses[0].strip())
+
+    add_reversed_clauses(album_text)
     remaining = album_text
     for _ in range(3):
         stripped = re.sub(r"\s*[\[(][^\]()\[\]]+[\])]\s*$", "", remaining).strip()
         if not stripped or stripped == remaining:
             break
         add_variant(stripped)
+        add_reversed_clauses(stripped)
         remaining = stripped
 
     # Preserve artist/album identity while dropping release-specific suffixes.
@@ -9222,6 +9234,89 @@ def songguesser_track_answer(prepared: dict[str, Any]) -> dict[str, Any]:
     return answer
 
 
+def songguesser_tracklist_entry(track: dict[str, Any], position: int) -> dict[str, Any]:
+    """A display-only row preserving an album/playlist's original order."""
+    configure_sampler_tools()
+    track = track if isinstance(track, dict) else {}
+    album = track.get("album") if isinstance(track.get("album"), dict) else {}
+    uri = str(track.get("uri") or "")
+    local_parts = sampler_tools.parse_local_uri_parts(uri) if uri.startswith("spotify:local:") else {}
+    return {
+        "position": int(position),
+        "name": sampler_tools.format_track_name(track),
+        "artist": sampler_tools.format_track_artist(track),
+        "uri": uri,
+        "album": album.get("name") or local_parts.get("album") or "",
+        "albumId": str(album.get("id") or ""),
+        "isLocal": bool(track.get("is_local") or uri.startswith("spotify:local:")),
+    }
+
+
+def songguesser_public_tracklist(game: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    """File playlists show the entire playlist; single-link playlists only
+    show the songs from the current song's album *within* that playlist.
+    Album links show the whole album in both input modes.
+    """
+    source_rows = candidate.get("source_tracklist") or []
+    prepared = candidate.get("prepared") or {}
+    active_track = prepared.get("track") or {}
+    active_album = active_track.get("album") if isinstance(active_track.get("album"), dict) else {}
+    active_uri = str(active_track.get("uri") or "")
+    answer = candidate.get("answer") or {}
+    chosen_name = str(answer.get("song") or "")
+    chosen_artist = str(answer.get("artist") or "")
+    active_album_name = str(active_album.get("name") or answer.get("album") or "")
+    active_album_id = str(active_album.get("id") or "")
+    rows = source_rows
+    if candidate.get("source_kind") == "playlist" and game.get("source_mode") == "playlist":
+        # Single Spotify playlist URL: show only matching album entries,
+        # keeping their original playlist positions and order.
+        album_key = songguesser_grid_normalize_album(active_album_name)
+        rows = [row for row in source_rows if (
+            bool(active_album_id and row.get("albumId") and row["albumId"] == active_album_id)
+            or bool(album_key and songguesser_grid_normalize_album(row.get("album")) == album_key
+                    and not (active_album_id and row.get("albumId") and row["albumId"] != active_album_id))
+        )]
+    output = []
+    marked = False
+    selected_position = prepared.get("playlist_position") if candidate.get("source_kind") == "playlist" else None
+    for row in rows:
+        # Match exact URI first. A local file has a spotify:local URI.
+        uri_match = bool(active_uri and row.get("uri") == active_uri)
+        name_match = (songguesser_grid_normalize_album(row.get("name")) ==
+                      songguesser_grid_normalize_album(chosen_name))
+        artist_match = (songguesser_grid_normalize_artist(row.get("artist")) ==
+                        songguesser_grid_normalize_artist(chosen_artist))
+        eligible = uri_match or (name_match and artist_match and bool(chosen_name))
+        position_match = (selected_position is not None and row.get("position", 0) - 1 == selected_position)
+        selected = not marked and eligible and (selected_position is None or position_match)
+        if selected:
+            marked = True
+        output.append({
+            "position": row.get("position"), "name": row.get("name"),
+            "artist": row.get("artist"), "isLocal": row.get("isLocal", False),
+            "current": selected,
+        })
+    # Spotify may have skipped an unavailable position in a playlist or
+    # market-relinked the track. Resolve the first matching row by identity.
+    if not marked:
+        for row, public in zip(rows, output):
+            if (active_uri and row.get("uri") == active_uri) or (
+                songguesser_grid_normalize_album(row.get("name")) == songguesser_grid_normalize_album(chosen_name)
+                and songguesser_grid_normalize_artist(row.get("artist")) == songguesser_grid_normalize_artist(chosen_artist)
+                and bool(chosen_name)
+            ):
+                public["current"] = True
+                break
+    return {
+        "kind": candidate.get("source_kind") or "album",
+        "scope": ("album_in_playlist" if candidate.get("source_kind") == "playlist"
+                  and game.get("source_mode") == "playlist" else "full_source"),
+        "rows": output,
+        "available": bool(output) and not candidate.get("source_tracklist_unavailable"),
+    }
+
+
 def songguesser_candidate_from_album_track(album: dict[str, Any], track: dict[str, Any]) -> dict[str, Any]:
     configure_sampler_tools()
 
@@ -9235,7 +9330,7 @@ def songguesser_candidate_from_album_track(album: dict[str, Any], track: dict[st
     prepared["release_date"] = album.get("release_date")
     prepared["grid_album_artist"] = album.get("artists") or []
 
-    return {"prepared": prepared, "answer": songguesser_track_answer(prepared)}
+    return {"prepared": prepared, "answer": songguesser_track_answer(prepared), "source_kind": "album"}
 
 
 def songguesser_candidate_from_playlist_item(
@@ -9264,7 +9359,7 @@ def songguesser_candidate_from_playlist_item(
     item_album = item_track.get("album") if isinstance(item_track.get("album"), dict) else {}
     prepared["grid_album_artist"] = item_album.get("artists") or []
 
-    return {"prepared": prepared, "answer": songguesser_track_answer(prepared)}
+    return {"prepared": prepared, "answer": songguesser_track_answer(prepared), "source_kind": "playlist"}
 
 
 
@@ -9430,7 +9525,12 @@ def songguesser_build_album_candidates(
         used_keys.add(track_key)
         if excluded_keys is not None:
             excluded_keys.update(identity_keys)
-        candidates.append(songguesser_candidate_from_album_track(album, track))
+        candidate = songguesser_candidate_from_album_track(album, track)
+        candidate["source_tracklist"] = [
+            songguesser_tracklist_entry(album_track, index)
+            for index, album_track in enumerate(tracks, start=1)
+        ]
+        candidates.append(candidate)
         if len(candidates) >= maximum:
             break
 
@@ -9474,14 +9574,19 @@ def songguesser_build_playlist_candidates(
         used_keys.add(item_key)
         if excluded_keys is not None:
             excluded_keys.update(identity_keys)
-        candidates.append(
-            songguesser_candidate_from_playlist_item(
-                playlist_bundle=playlist_bundle,
-                item=item,
-                cache=cache,
-                use_lastfm_local_cover=use_lastfm_local_cover,
-            )
+        candidate = songguesser_candidate_from_playlist_item(
+            playlist_bundle=playlist_bundle,
+            item=item,
+            cache=cache,
+            use_lastfm_local_cover=use_lastfm_local_cover,
         )
+        candidate["source_tracklist_unavailable"] = bool(playlist_bundle.get("public_items_inaccessible"))
+        candidate["source_tracklist"] = [
+            songguesser_tracklist_entry(playlist_item.get("track") or {},
+                                        int(playlist_item.get("playlist_position", 0)) + 1)
+            for playlist_item in (playlist_bundle.get("items") or [])
+        ] if not candidate["source_tracklist_unavailable"] else []
+        candidates.append(candidate)
         if len(candidates) >= maximum:
             break
 
@@ -9624,6 +9729,7 @@ def songguesser_public_payload(game: dict[str, Any], candidate: dict[str, Any], 
         "startedAt": now,
         "endsAt": now + SONGGUESSER_CLIP_SECONDS,
         "answer": public_answer,
+        "tracklist": songguesser_public_tracklist(game, candidate),
         "hints": hints,
         "paused": bool(game.get("paused")),
     }
