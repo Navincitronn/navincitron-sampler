@@ -1210,30 +1210,32 @@ def get_device_id(
     ACTIVE_DEVICE_ID_OVERRIDE = None
     if not devices:
         raise RuntimeError(
-            "No Spotify devices found. Open Spotify on your computer/phone/browser, "
-            "start any song briefly, then run the script again."
+            "No Spotify Connect devices were reported for this account. "
+            "Open Spotify on a device, refresh the device picker, and try again; "
+            "the device does not need to be playing a song."
         )
 
     if preferred_device_name:
         for device in devices:
-            if preferred_device_name.lower() in device["name"].lower():
-                sp.transfer_playback(device_id=device["id"], force_play=True)
-                time.sleep(1)
+            if preferred_device_name.lower() in str(device.get("name") or "").lower():
+                if device.get("is_restricted"):
+                    raise RuntimeError("The requested Spotify Connect device is restricted.")
+                # Device selection must not resume or transfer existing music.
                 return device["id"]
 
-        available = ", ".join(device["name"] for device in devices)
+        available = ", ".join(str(device.get("name") or "Unnamed device") for device in devices)
         raise RuntimeError(
             f'Device "{preferred_device_name}" not found. Available devices: {available}'
         )
 
-    for device in devices:
-        if device.get("is_active"):
-            return device["id"]
-
-    first_device = devices[0]
-    sp.transfer_playback(device_id=first_device["id"], force_play=True)
-    time.sleep(1)
-    return first_device["id"]
+    # is_active identifies Spotify's currently targeted Connect device, NOT
+    # whether music is playing. An idle, discoverable device can receive a
+    # start_playback command directly, without a preliminary force_play transfer.
+    unrestricted = [device for device in devices if device.get("id") and not device.get("is_restricted")]
+    if not unrestricted:
+        raise RuntimeError("Spotify reported devices, but all are restricted from playback control.")
+    selected = next((device for device in unrestricted if device.get("is_active")), unrestricted[0])
+    return selected["id"]
 
 
 def assumed_duration_ms(
