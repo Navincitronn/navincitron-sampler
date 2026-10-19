@@ -8533,7 +8533,7 @@ def songguesser_grid_normalize_album(value: Any) -> str:
 def songguesser_grid_release_year_index(
     path: str, modified_ns: int, file_size: int,
 ) -> tuple[dict[tuple[str, str], str], dict[str, str]]:
-    """Parse backend grid.txt once per version; conflicting titles remain unmatched."""
+    """Index Grid titles and explicit AKA names; reject ambiguous titles."""
     by_artist_album: dict[tuple[str, str], str] = {}
     by_album: dict[str, tuple[str, str] | None] = {}
 
@@ -8549,17 +8549,31 @@ def songguesser_grid_release_year_index(
         if not artist_key or not album_key:
             continue
 
-        key = (artist_key, album_key)
-        if key not in by_artist_album:
-            by_artist_album[key] = year
-        elif by_artist_album[key] != year:
-            by_artist_album[key] = ""  # Do not guess among conflicting dates.
+        # Square-bracketed AKA labels in the Grid (for example, "The Beatles
+        # [The White Album]") are part of the display title, but the underlying
+        # Spotify album may be named simply "The Beatles". Index that base as
+        # a second, artist-qualified identity; never change the displayed name.
+        album_keys = [album_key]
+        bracketed = re.fullmatch(r"(.+?)\s+\[([^\[\]]+)\]", title)
+        if bracketed:
+            base_title, alias_title = bracketed.groups()
+            for alternative in (base_title, alias_title):
+                alternative_key = songguesser_grid_normalize_album(alternative)
+                if alternative_key and alternative_key not in album_keys:
+                    album_keys.append(alternative_key)
 
-        current = by_album.get(album_key)
-        if album_key not in by_album:
-            by_album[album_key] = (artist_key, year)
-        elif current is not None and current != (artist_key, year):
-            by_album[album_key] = None  # Album name alone is ambiguous.
+        for key_album in album_keys:
+            key = (artist_key, key_album)
+            if key not in by_artist_album:
+                by_artist_album[key] = year
+            elif by_artist_album[key] != year:
+                by_artist_album[key] = ""  # Conflicting dates are ambiguous.
+
+            current = by_album.get(key_album)
+            if key_album not in by_album:
+                by_album[key_album] = (artist_key, year)
+            elif current is not None and current != (artist_key, year):
+                by_album[key_album] = None  # Different artist/year is ambiguous.
 
     # Only permit title-only matching when we have no usable artist identity.
     unique_titles = {
@@ -8576,7 +8590,8 @@ def songguesser_grid_year(artist: Any, album: Any, album_artist: Any = None) -> 
     This lets meaningful album parentheses match exactly, but allows Spotify
     titles such as 'Dust Bowl Ballads (Original Album Plus Bonus Tracks)' and
     'Dust Bowl Ballads (2000)' to resolve to the original grid entry.
-    Only accept a variant when its artist + album pair is present in grid.txt.
+    Prefer matching artist + album; accept unique, sufficiently distinctive
+    album titles when Spotify credits a different artist or edition name.
     """
     album_text = str(album or "").strip()
     if not album_text:
@@ -8640,8 +8655,16 @@ def songguesser_grid_year(artist: Any, album: Any, album_artist: Any = None) -> 
             if year:
                 return year
 
-    # If Spotify omitted artist identity, only use a unique exact title. Never
-    # accept a shortened title without artist evidence (too ambiguous).
+    # A uniquely indexed album can be identified even if Spotify lists a
+    # different credited artist (e.g., Jorge Ben Jor instead of Jorge Ben).
+    # Require a substantial title, and never use a title shared by several
+    # Grid entries with differing release identities/years. This also covers
+    # a self-titled album where the Grid supplies a bracketed common name.
+    for album_key in variants:
+        if len(album_key) >= 9 and unique_titles.get(album_key):
+            return unique_titles[album_key]
+
+    # Short titles use the pre-existing conservative, artistless fallback.
     return unique_titles.get(variants[0], "") if not has_artist else ""
 
 
