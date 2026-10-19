@@ -2663,6 +2663,20 @@ def lyrics_discogs_vinyl_tracklist():
                     continue
                 track_score = discogs_release_track_match_score(release, current_track_title)
                 score = track_score * 100.0
+                # Distinguish separate Bob Dylan (and other artists') releases
+                # containing the same song. For example Spotify's "Bootleg Series,
+                # Vol 5 ... Rolling Thunder Revue" identifies the Rolling Thunder
+                # Revue release by album name even though More Blood, More Tracks
+                # also contains "Simple Twist of Fate". Require a distinctive
+                # multiword release title wholly inside the Spotify album title.
+                context_title = normalize_lyrics_match_text(source_album)
+                release_title = normalize_lyrics_match_text(release.get("title") or album.get("title") or "")
+                if (
+                    len(release_title) >= 15
+                    and len(release_title.split()) >= 3
+                    and release_title in context_title
+                ):
+                    score += 35.0
                 if primary:
                     score += 15.0
                 if discogs_release_has_side_positions(release):
@@ -7642,6 +7656,61 @@ def read_lyrics_my_albums_text() -> tuple[str, str, str, list[str]]:
     return "", "none", "", warnings
 
 
+def lyrics_score_file_tracklist_blocks(text: str) -> dict[tuple[str, int], set[str]]:
+    """Index existing album sections, not their editable numeric score values."""
+    found: dict[tuple[str, int], set[str]] = {}
+    seen: dict[str, int] = {}
+    for block in re.split(r"\n\s*\n", str(text or "").replace("\r\n", "\n")):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+        header = re.fullmatch(r"(.+?):\s*(?:(?:-?\d+(?:\.\d+)?%)?)\s*", lines[0])
+        if not header:
+            continue
+        album_title = normalize_lyrics_match_text(header.group(1))
+        if not album_title:
+            continue
+        titles: set[str] = set()
+        for line in lines[1:]:
+            track = re.fullmatch(r"(.+?):\s*(?:-?\d+(?:\.\d+)?\**(?:\s+.*)?|-|—)?\s*", line)
+            if track:
+                track_title = normalize_lyrics_match_text(track.group(1))
+                if track_title:
+                    titles.add(track_title)
+        if not titles:
+            continue
+        occurrence = seen.get(album_title, 0)
+        seen[album_title] = occurrence + 1
+        found[(album_title, occurrence)] = titles
+    return found
+
+
+def assert_my_albums_tracklists_not_replaced(current_text: str, proposed_text: str) -> None:
+    """Refuse destructive same-heading, different-album tracklist replacement.
+
+    The Lyrics editor updates scores, not the identity of an album. A client-side
+    title collision once replaced the self-titled Bob Dylan album's 13 songs with
+    the 22-song Rolling Thunder Revue tracklist, preserving the old percentage.
+    Reject that mutation even if the browser is stale or has a matching bug.
+    """
+    existing = lyrics_score_file_tracklist_blocks(current_text)
+    proposed = lyrics_score_file_tracklist_blocks(proposed_text)
+    for key, original_titles in existing.items():
+        replacement_titles = proposed.get(key)
+        if replacement_titles is None:
+            continue
+        if min(len(original_titles), len(replacement_titles)) < 5:
+            continue
+        common = len(original_titles & replacement_titles)
+        if common < 3 or common / min(len(original_titles), len(replacement_titles)) < 0.40:
+            raise RuntimeError(
+                f"Refusing to replace the tracklist of existing album '{key[0]}': "
+                "the submitted tracks belong to a different release. "
+                "Restore or deliberately restructure albums directly in my_albums.txt "
+                "on GitHub instead of replacing them through the Lyrics score editor."
+            )
+
+
 def write_lyrics_my_albums_text(text: str, base_revision: str = "") -> tuple[str, str, list[str]]:
     """
     Save score text to GitHub first, then mirror that exact committed text to the
@@ -7661,10 +7730,17 @@ def write_lyrics_my_albums_text(text: str, base_revision: str = "") -> tuple[str
     normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     current_text, current_revision = read_lyrics_my_albums_from_github()
     requested_base = str(base_revision or "").strip()
-    if requested_base and current_revision and requested_base != current_revision:
+    if not requested_base or not current_revision:
+        raise RuntimeError(
+            "Cannot safely save scores without the current GitHub revision. "
+            "Refresh the Lyrics page before editing to avoid overwriting newer entries."
+        )
+    if requested_base != current_revision:
         raise RuntimeError(
             "my_albums.txt changed on GitHub after this page loaded. Refresh the page before saving so newer desktop/GitHub edits are not overwritten."
         )
+
+    assert_my_albums_tracklists_not_replaced(current_text, normalized)
 
     revision = current_revision
     if normalized != current_text:
@@ -7708,7 +7784,11 @@ def lyrics_my_albums():
             storage, revision, warnings = write_lyrics_my_albums_text(text, base_revision=base_revision)
         except RuntimeError as error:
             message = str(error)
-            status_code = 409 if "changed on GitHub after this page loaded" in message else 503
+            status_code = 409 if (
+                "changed on GitHub after this page loaded" in message
+                or "Refusing to replace the tracklist" in message
+                or "Cannot safely save scores" in message
+            ) else 503
             return jsonify({"ok": False, "error": message}), status_code
 
         response = jsonify({
