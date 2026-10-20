@@ -9748,6 +9748,11 @@ def songguesser_public_payload(game: dict[str, Any], candidate: dict[str, Any], 
         "releaseDecade": release_decade if hints_enabled.get("releaseDecade") and release_decade else None,
         "artist": answer.get("artist") if hints_enabled.get("artist") else None,
         "album": answer.get("album") if hints_enabled.get("album") else None,
+        "coverUrl": (
+            (candidate.get("prepared") or {}).get("playlist_cover_url")
+            if candidate.get("source_kind") == "playlist"
+            else None
+        ) or public_answer.get("coverUrl") if hints_enabled.get("albumCover") else None,
     }
 
     now = time.time()
@@ -10117,6 +10122,7 @@ def songguesser_start():
             "releaseDecade": form_bool(data.get("hintReleaseDecade"), False),
             "artist": form_bool(data.get("hintArtist"), False),
             "album": form_bool(data.get("hintAlbum"), False),
+            "albumCover": form_bool(data.get("hintAlbumCover"), False),
         }
 
         try:
