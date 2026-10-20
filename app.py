@@ -10070,7 +10070,29 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
     game["started_at"] = time.time()
     game["position_ms"] = position_ms
     game["paused"] = False
+    game["playback_retry_pending"] = False
     return songguesser_public_payload(game, candidate, position_ms)
+
+
+def songguesser_retryable_playback_error(game: dict[str, Any], error: Exception):
+    """Keep the same candidate/index after Spotify fails to start a round.
+
+    Never expose the answer or advance the game from this response. The client
+    must explicitly request a retry of exactly this numbered round.
+    """
+    game["playback_retry_pending"] = True
+    STATE_FILE.unlink(missing_ok=True)
+    current_index = int(game.get("current_index", 0))
+    append_log(
+        f"[songguesser round {current_index + 1} playback failed; awaiting user retry: {error}]"
+    )
+    return jsonify({
+        "ok": False,
+        "retryable": True,
+        "progress": current_index + 1,
+        "total": len(game.get("queue") or []),
+        "error": str(error),
+    }), 502
 
 
 def get_current_songguesser_game() -> dict[str, Any] | None:
@@ -10161,14 +10183,9 @@ def songguesser_start():
         try:
             return jsonify(songguesser_start_current(game))
         except Exception as error:
-            songguesser_games.pop(game_id, None)
-            session.pop("songguesser_game_id", None)
-            # start_prepared_clip publishes requested metadata as soon as
-            # Spotify accepts the command. When the subsequent confirmation
-            # fails, remove that provisional state so the UI never claims a
-            # song is playing which Spotify has not confirmed.
-            STATE_FILE.unlink(missing_ok=True)
-            return jsonify({"ok": False, "error": str(error)}), 500
+            # Preserve the exact queued first track. Destroying the game here
+            # prevented any retry without generating a different five-song queue.
+            return songguesser_retryable_playback_error(game, error)
 
 
 @app.route("/api/songguesser/next", methods=["POST"])
@@ -10176,6 +10193,10 @@ def songguesser_next():
     game = get_current_songguesser_game()
     if game is None:
         return jsonify({"ok": False, "error": "No active Songguesser game."}), 404
+    if game.get("playback_retry_pending"):
+        return songguesser_retryable_playback_error(
+            game, RuntimeError("This round is waiting for the Retry Round button.")
+        )
 
     game["current_index"] = int(game.get("current_index", 0)) + 1
     if game["current_index"] >= len(game.get("queue") or []):
@@ -10196,8 +10217,33 @@ def songguesser_next():
     try:
         return jsonify(songguesser_start_current(game))
     except Exception as error:
-        STATE_FILE.unlink(missing_ok=True)
-        return jsonify({"ok": False, "error": str(error)}), 500
+        return songguesser_retryable_playback_error(game, error)
+
+
+@app.route("/api/songguesser/retry", methods=["POST"])
+def songguesser_retry():
+    with sampler_lock:
+        game = get_current_songguesser_game()
+        if game is None:
+            return jsonify({"ok": False, "error": "No active Songguesser game."}), 404
+        if process_is_running():
+            return jsonify({"ok": False, "error": "Stop the regular sampler before retrying Songguesser."}), 409
+        if not game.get("playback_retry_pending"):
+            return jsonify({"ok": False, "error": "This round is not waiting for a playback retry."}), 409
+        data = request.get_json(silent=True) or {}
+        try:
+            requested_round = int(data.get("progress", 0))
+        except (ValueError, TypeError):
+            requested_round = 0
+        current_round = int(game.get("current_index", 0)) + 1
+        if requested_round != current_round:
+            return jsonify({"ok": False, "error": "The retry request does not match the pending round."}), 409
+        # Do not change current_index, shuffle the queue, or mark another song
+        # as heard. The regular start routine verifies actual Spotify playback.
+        try:
+            return jsonify(songguesser_start_current(game))
+        except Exception as error:
+            return songguesser_retryable_playback_error(game, error)
 
 
 @app.route("/api/songguesser/pause", methods=["POST"])
