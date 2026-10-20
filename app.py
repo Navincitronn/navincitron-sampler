@@ -3655,7 +3655,7 @@ def spotify_choose_playback_device():
         else:
             session.pop("spotify_playback_device_id", None)
             session.pop("spotify_playback_account_id", None)
-            device_name = "Automatic (available Spotify device)"
+            device_name = "Automatic (Spotify active device)"
         # Selection is routing only. Do not transfer playback or interrupt audio.
         return jsonify({"ok": True, "selectedDeviceId": selected, "name": device_name})
     except SpotifyLoginRequired as error:
@@ -9245,13 +9245,6 @@ def songguesser_tracklist_entry(track: dict[str, Any], position: int) -> dict[st
         "position": int(position),
         "name": sampler_tools.format_track_name(track),
         "artist": sampler_tools.format_track_artist(track),
-        # Album-artist metadata is preferable to track credits for compilation
-        # and featured-performer tracks. Preserve both for ID-less local files.
-        "albumArtists": [
-            str(artist.get("name") if isinstance(artist, dict) else artist)
-            for artist in (album.get("artists") or [])
-            if (artist.get("name") if isinstance(artist, dict) else artist)
-        ],
         "uri": uri,
         "album": album.get("name") or local_parts.get("album") or "",
         "albumId": str(album.get("id") or ""),
@@ -9276,39 +9269,14 @@ def songguesser_public_tracklist(game: dict[str, Any], candidate: dict[str, Any]
     active_album_id = str(active_album.get("id") or "")
     rows = source_rows
     if candidate.get("source_kind") == "playlist" and game.get("source_mode") == "playlist":
-        # A Spotify album ID is definitive. Album title alone is not: two
-        # unrelated artists often use identical album names in one playlist.
-        # For ID-less/local tracks require both the album title and artist.
+        # Single Spotify playlist URL: show only matching album entries,
+        # keeping their original playlist positions and order.
         album_key = songguesser_grid_normalize_album(active_album_name)
-
-        def artist_keys(values: Any) -> set[str]:
-            if isinstance(values, (str, dict)):
-                values = [values]
-            result = set()
-            for value in values or []:
-                name = value.get("name") if isinstance(value, dict) else value
-                key = songguesser_grid_normalize_artist(name)
-                if key and key not in {"unknownartist", "variousartists"}:
-                    result.add(key)
-            return result
-
-        chosen_artists = (
-            artist_keys(prepared.get("grid_album_artist"))
-            or artist_keys(active_album.get("artists"))
-            or artist_keys(active_track.get("artists"))
-            or artist_keys(chosen_artist)
-        )
-
-        def same_album(row: dict[str, Any]) -> bool:
-            row_album_id = str(row.get("albumId") or "")
-            if active_album_id and row_album_id:
-                return active_album_id == row_album_id
-            if not album_key or songguesser_grid_normalize_album(row.get("album")) != album_key:
-                return False
-            row_artists = artist_keys(row.get("albumArtists")) or artist_keys(row.get("artist"))
-            return bool(chosen_artists and row_artists and not chosen_artists.isdisjoint(row_artists))
-
-        rows = [row for row in source_rows if same_album(row)]
+        rows = [row for row in source_rows if (
+            bool(active_album_id and row.get("albumId") and row["albumId"] == active_album_id)
+            or bool(album_key and songguesser_grid_normalize_album(row.get("album")) == album_key
+                    and not (active_album_id and row.get("albumId") and row["albumId"] != active_album_id))
+        )]
     output = []
     marked = False
     selected_position = prepared.get("playlist_position") if candidate.get("source_kind") == "playlist" else None
@@ -9733,6 +9701,22 @@ def songguesser_answer_with_saved_cover(answer: dict[str, Any]) -> dict[str, Any
     return public_answer
 
 
+def songguesser_hint_cover_url(game: dict[str, Any], candidate: dict[str, Any], public_answer: dict[str, Any]) -> str | None:
+    prepared = candidate.get("prepared") or {}
+
+    if game.get("source_mode") == "file" and candidate.get("source_kind") == "playlist":
+        playlist_cover = str(prepared.get("playlist_cover_url") or "").strip()
+        if playlist_cover:
+            return playlist_cover
+
+    cover_url = str(
+        public_answer.get("coverUrl")
+        or public_answer.get("defaultCoverUrl")
+        or ""
+    ).strip()
+    return cover_url or None
+
+
 def songguesser_public_payload(game: dict[str, Any], candidate: dict[str, Any], position_ms: int) -> dict[str, Any]:
     answer = candidate.get("answer") or {}
     # The hint must reflect the ACTUAL reconciled track, not an earlier
@@ -9748,11 +9732,7 @@ def songguesser_public_payload(game: dict[str, Any], candidate: dict[str, Any], 
         "releaseDecade": release_decade if hints_enabled.get("releaseDecade") and release_decade else None,
         "artist": answer.get("artist") if hints_enabled.get("artist") else None,
         "album": answer.get("album") if hints_enabled.get("album") else None,
-        "coverUrl": (
-            (candidate.get("prepared") or {}).get("playlist_cover_url")
-            if candidate.get("source_kind") == "playlist"
-            else None
-        ) or public_answer.get("coverUrl") if hints_enabled.get("albumCover") else None,
+        "albumCover": songguesser_hint_cover_url(game, candidate, public_answer) if hints_enabled.get("albumCover") else None,
     }
 
     now = time.time()
