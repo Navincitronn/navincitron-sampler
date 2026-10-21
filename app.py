@@ -9796,7 +9796,7 @@ def songguesser_confirm_playlist_playback(
     prepared: dict[str, Any],
     previous_playback: dict[str, Any] | None,
     direct_track_uri: str = "",
-    timeout_seconds: float = 5.0,
+    timeout_seconds: float = 3.5,
 ) -> dict[str, Any]:
     """Confirm the *actual* Spotify track rather than trusting playlist offsets.
 
@@ -9872,10 +9872,27 @@ def songguesser_confirm_playlist_playback(
     )
 
 
+def songguesser_live_expected_track(sp: Any, prepared: dict[str, Any], device_id: str | None = None) -> dict[str, Any] | None:
+    """Only trust a currently playing exact/relinked catalog track, never device-list presence."""
+    expected = str((prepared.get("track") or {}).get("uri") or "")
+    if not expected.startswith("spotify:track:"):
+        return None
+    playback = songguesser_current_spotify_playback(sp)
+    if not playback or not playback.get("is_playing"):
+        return None
+    reported_device = playback.get("device") if isinstance(playback.get("device"), dict) else {}
+    if device_id and reported_device.get("id") and reported_device["id"] != device_id:
+        return None
+    item = playback.get("item") if isinstance(playback.get("item"), dict) else {}
+    linked = item.get("linked_from") if isinstance(item.get("linked_from"), dict) else {}
+    uris = {str(item.get("uri") or ""), str(linked.get("uri") or "")}
+    return playback if expected in uris else None
+
+
 def songguesser_confirm_album_playback(
     sp: Any,
     prepared: dict[str, Any],
-    timeout_seconds: float = 7.5,
+    timeout_seconds: float = 3.5,
 ) -> dict[str, Any]:
     """Wait for the requested Spotify track to actually play.
 
@@ -9929,7 +9946,7 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
         }
 
     sp = get_spotify_client()
-    selected_device_id = spotify_selected_device_id_for_account(sp)
+    selected_device_id = spotify_selected_device_id_for_account(sp, validate_presence=False)
     device_id = sampler_tools.get_device_id(sp, None, selected_device_id)
     if selected_device_id:
         append_log(f"[songguesser: using manually selected Spotify device {device_id}]")
@@ -9959,19 +9976,34 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
         f"uri={track_uri or 'unavailable'}; "
         f"device={device_id}]"
     )
-    position_ms = sampler_tools.start_prepared_clip(
-        sp=sp,
-        device_id=device_id,
-        prepared=playback_prepared,
-        local_seek_delay_seconds=SONGGUESSER_LOCAL_SEEK_DELAY_SECONDS,
-        verify_playback=False,
-    )
+    game["playback_uncertain"] = False
+    try:
+        position_ms = sampler_tools.start_prepared_clip(
+            sp=sp,
+            device_id=device_id,
+            prepared=playback_prepared,
+            local_seek_delay_seconds=SONGGUESSER_LOCAL_SEEK_DELAY_SECONDS,
+            verify_playback=False,
+        )
+    except Exception:
+        # A delayed 404 can occur after the iPhone accepted the actual command.
+        # Do not restart an already playing exact track on that evidence alone.
+        if not songguesser_live_expected_track(sp, prepared, device_id):
+            raise
+        position_ms = int(prepared.get("position_ms") or 0)
+        append_log("[songguesser: Spotify returned a playback error, but the requested track is confirmed playing; accepting the round]")
 
-    # Album-link items use direct track URIs. Confirm that Spotify actually
-    # starts the track before revealing a timed/graded round. Unlike the old
-    # verifier, this never restarts an already-audible segment.
+    # A Spotify status timeout is inconclusive: on backgrounded iPhones the
+    # requested clip may be audible while the Web API reports no current item.
+    # A *known* candidate can be guessed without automatic replay; the user
+    # retains a manual Retry button if the phone is actually silent.
+    observed = None
     if not is_playlist:
-        songguesser_confirm_album_playback(sp, prepared)
+        try:
+            observed = songguesser_confirm_album_playback(sp, prepared)
+        except RuntimeError as error:
+            game["playback_uncertain"] = True
+            append_log(f"[songguesser: playback status inconclusive for album, starting guessable round without a replay: {error}]")
 
     used_exact_uri_fallback = False
     if is_playlist:
@@ -9982,62 +10014,18 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
                 previous_playback=before,
             )
         except RuntimeError as first_error:
-            # Spotify can acknowledge a context start yet remain idle. A direct
-            # catalog-track start is a recovery *only*, not the default, and
-            # does not depend on playlist offsets to determine its identity.
             if track_uri.startswith("spotify:track:") and not prepared.get("is_local") and not prepared.get("blind_public_playlist"):
-                append_log("[songguesser: playlist context did not start; trying exact Spotify track URI]")
-                recovery = dict(prepared)
-                recovery["kind"] = "track_uri"
-                position_ms = sampler_tools.start_prepared_clip(
-                    sp=sp,
-                    device_id=device_id,
-                    prepared=recovery,
-                    local_seek_delay_seconds=SONGGUESSER_LOCAL_SEEK_DELAY_SECONDS,
-                    verify_playback=False,
-                )
-                used_exact_uri_fallback = True
-                try:
-                    observed = songguesser_confirm_playlist_playback(
-                        sp=sp,
-                        prepared=prepared,
-                        previous_playback=before,
-                        direct_track_uri=track_uri,
-                    )
-                except RuntimeError as second_error:
-                    raise RuntimeError(
-                        "Spotify did not start the selected Songguesser track using "
-                        "either playlist-context or direct-track playback. Make sure "
-                        "the intended Spotify Connect device is active and the track "
-                        "is playable on that device. No answer was graded."
-                    ) from second_error
+                # Do not send a second playback request merely because the
+                # asynchronously polled iPhone status is stale or missing.
+                game["playback_uncertain"] = True
+                append_log(f"[songguesser: playback status inconclusive for playlist, starting guessable round without a replay: {first_error}]")
             else:
-                # Local files and inaccessible public-playlist positions cannot
-                # safely be started by a regular track URI. Try reactivating
-                # the selected Connect device, then the playlist context again.
-                live = songguesser_current_spotify_playback(sp)
-                if live and live.get("is_playing"):
-                    raise first_error
-                append_log("[songguesser: no live playlist playback; reactivating Spotify Connect device]")
-                try:
-                    sp.transfer_playback(device_id=device_id, force_play=True)
-                    time.sleep(0.5)
-                except Exception as error:
-                    append_log(f"[songguesser warning: device reactivation unsuccessful: {error}]")
-                position_ms = sampler_tools.start_prepared_clip(
-                    sp=sp,
-                    device_id=device_id,
-                    prepared=playback_prepared,
-                    local_seek_delay_seconds=SONGGUESSER_LOCAL_SEEK_DELAY_SECONDS,
-                    verify_playback=False,
-                )
-                observed = songguesser_confirm_playlist_playback(
-                    sp=sp,
-                    prepared=prepared,
-                    previous_playback=before,
-                )
+                # A blind or local playlist item cannot be safely guessed
+                # without identifying which track the Connect player chose.
+                # Preserve the round for an explicit user retry.
+                raise first_error
 
-        if not used_exact_uri_fallback:
+        if observed is not None and not used_exact_uri_fallback:
             # Playlist-context playback may have skipped the selected position.
             # Adopt the actual track metadata, never the cached position's song.
             observed_item = observed["item"]
@@ -10071,7 +10059,8 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
     history = game.get("page_history")
     if isinstance(history, dict):
         actual_keys = songguesser_candidate_identity_keys(candidate)
-        if actual_keys and not actual_keys.isdisjoint(history["keys"]):
+        if (actual_keys and not actual_keys.isdisjoint(history["keys"])
+                and not game.get("retrying_uncertain_round")):
             try:
                 sp.pause_playback()
             except Exception:
@@ -10098,7 +10087,9 @@ def songguesser_start_current(game: dict[str, Any]) -> dict[str, Any]:
     game["position_ms"] = position_ms
     game["paused"] = False
     game["playback_retry_pending"] = False
-    return songguesser_public_payload(game, candidate, position_ms)
+    result = songguesser_public_payload(game, candidate, position_ms)
+    result["playbackUncertain"] = bool(game.get("playback_uncertain"))
+    return result
 
 
 def songguesser_retryable_playback_error(game: dict[str, Any], error: Exception):
@@ -10255,7 +10246,7 @@ def songguesser_retry():
             return jsonify({"ok": False, "error": "No active Songguesser game."}), 404
         if process_is_running():
             return jsonify({"ok": False, "error": "Stop the regular sampler before retrying Songguesser."}), 409
-        if not game.get("playback_retry_pending"):
+        if not game.get("playback_retry_pending") and not game.get("playback_uncertain"):
             return jsonify({"ok": False, "error": "This round is not waiting for a playback retry."}), 409
         data = request.get_json(silent=True) or {}
         try:
@@ -10265,12 +10256,33 @@ def songguesser_retry():
         current_round = int(game.get("current_index", 0)) + 1
         if requested_round != current_round:
             return jsonify({"ok": False, "error": "The retry request does not match the pending round."}), 409
-        # Do not change current_index, shuffle the queue, or mark another song
-        # as heard. The regular start routine verifies actual Spotify playback.
+        # Do not restart the clip if it is demonstrably already playing.
+        candidate = (game.get("queue") or [])[int(game.get("current_index", 0))]
+        was_guessable = bool(game.get("playback_uncertain") and not game.get("playback_retry_pending"))
         try:
+            sp = get_spotify_client()
+            selected_device = spotify_selected_device_id_for_account(sp, validate_presence=False)
+            if game.get("playback_uncertain") and songguesser_live_expected_track(sp, candidate["prepared"], selected_device):
+                game["playback_uncertain"] = False
+                game["playback_retry_pending"] = False
+                game["started_at"] = time.time()
+                result = songguesser_public_payload(game, candidate, int(game.get("position_ms") or 0))
+                result["playbackUncertain"] = False
+                append_log("[songguesser: the requested track was already playing, so Retry confirmed the round without restarting audio]")
+                return jsonify(result)
+            game["retrying_uncertain_round"] = bool(game.get("playback_uncertain"))
             return jsonify(songguesser_start_current(game))
         except Exception as error:
+            if was_guessable:
+                # A failed optional Retry must never close an already guessable
+                # provisional round, particularly when Spotify is still audible.
+                game["playback_uncertain"] = True
+                game["playback_retry_pending"] = False
+                append_log(f"[songguesser: optional retry failed; guesses remain enabled: {error}]")
+                return jsonify({"ok": False, "keepRoundOpen": True, "error": str(error)}), 502
             return songguesser_retryable_playback_error(game, error)
+        finally:
+            game.pop("retrying_uncertain_round", None)
 
 
 @app.route("/api/songguesser/pause", methods=["POST"])

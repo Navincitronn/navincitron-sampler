@@ -1188,24 +1188,18 @@ def get_device_id(
 ) -> str:
     global ACTIVE_DEVICE_ID_OVERRIDE, MANUALLY_SELECTED_DEVICE_ID
 
-    devices_response = sp.devices() or {}
-    devices = devices_response.get("devices", []) or []
-
     if preferred_device_id:
-        selected = next((device for device in devices if device.get("id") == preferred_device_id), None)
-        if not selected:
-            raise RuntimeError(
-                "The manually selected Spotify device is no longer available. "
-                "Refresh the device picker on shuffle.html and choose another player."
-            )
-        if selected.get("is_restricted"):
-            raise RuntimeError("The manually selected Spotify device cannot receive playback commands (restricted).")
+        # Spotify sometimes omits a backgrounded iPhone from /me/player/devices
+        # while an existing Connect session can still receive a play command.
+        # Trust this account's explicitly saved ID, try playback, and let the
+        # actual /play response determine whether it is still usable.
         MANUALLY_SELECTED_DEVICE_ID = preferred_device_id
         ACTIVE_DEVICE_ID_OVERRIDE = preferred_device_id
-        print(f"Using selected Spotify device: {selected.get('name') or 'Unnamed device'} ({preferred_device_id})")
-        # Do not call transfer_playback: it may interrupt the user's current song.
+        print(f"Using manually selected Spotify device ID: {preferred_device_id}")
         return preferred_device_id
 
+    devices_response = sp.devices() or {}
+    devices = devices_response.get("devices", []) or []
     MANUALLY_SELECTED_DEVICE_ID = None
     ACTIVE_DEVICE_ID_OVERRIDE = None
     if not devices:
