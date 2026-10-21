@@ -8585,7 +8585,8 @@ def songguesser_grid_normalize_album(value: Any) -> str:
     # recognizable reissue / edition suffixes are removed.
     edition = (
         r"remaster(?:ed|ing)?|deluxe|expanded|anniversary|edition|"
-        r"reissue|re-release|re release|bonus|stereo|mono|sampler|(?:19|20)\d{2}\s+mix"
+        r"reissue|re-release|re release|bonus|stereo|mono|sampler|"
+        r"ultimate\s+collection|(?:19|20)\d{2}\s+mix"
     )
     previous = None
     while title != previous:
@@ -8641,6 +8642,17 @@ def songguesser_index_grid_year_lines(lines: list[str]) -> tuple[dict[tuple[str,
         # Spotify album may be named simply "The Beatles". Index that base as
         # a second, artist-qualified identity; never change the displayed name.
         album_keys = [album_key]
+        # The Grid sometimes prefixes an album with the artist, such as
+        # 'John Lennon / Plastic Ono Band', where Spotify says 'Plastic Ono
+        # Band (The Ultimate Collection)'. Only derive an alias when the
+        # prefix is exactly the indexed artist, never for arbitrary slashes.
+        artist_prefixed = re.fullmatch(r"(.+?)\s*/\s*(.+)", title)
+        if artist_prefixed:
+            prefix, remainder = artist_prefixed.groups()
+            if songguesser_grid_normalize_artist(prefix) == artist_key:
+                alias_key = songguesser_grid_normalize_album(remainder)
+                if alias_key and alias_key not in album_keys:
+                    album_keys.append(alias_key)
         bracketed = re.fullmatch(r"(.+?)\s+\[([^\[\]]+)\]", title)
         if bracketed:
             base_title, alias_title = bracketed.groups()
@@ -9150,7 +9162,11 @@ def songguesser_apply_grid_release_year(answer: dict[str, Any], prepared: dict[s
     year = songguesser_grid_year(answer.get("artist"), answer.get("album"), album_artist)
     if year:
         answer["releaseYear"] = year
-        answer["releaseDecade"] = songguesser_release_decade_from_year(year)
+    # Release decade must ALWAYS follow the final corrected year, including
+    # when a cached answer or Spotify enrichment supplied the year.
+    answer["releaseDecade"] = songguesser_release_decade_from_year(
+        str(answer.get("releaseYear") or "")
+    )
 
 
 def songguesser_track_identity_keys(track: dict[str, Any], fallback: str = "") -> set[str]:
@@ -9277,37 +9293,48 @@ def songguesser_public_tracklist(game: dict[str, Any], candidate: dict[str, Any]
             or bool(album_key and songguesser_grid_normalize_album(row.get("album")) == album_key
                     and not (active_album_id and row.get("albumId") and row["albumId"] != active_album_id))
         )]
-    output = []
-    marked = False
+    # Track identity is Unicode-aware. The Grid normalizer intentionally
+    # strips non-ASCII text for album lookup, but using that for track titles
+    # makes distinct Japanese / Korean / Chinese titles all match as "".
+    def track_key(value: Any) -> str:
+        normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+        return "".join(char for char in normalized if char.isalnum())
+
+    chosen_title_key = track_key(chosen_name)
+    chosen_artist_key = track_key(chosen_artist)
+
+    def text_match(row: dict[str, Any]) -> bool:
+        return bool(
+            chosen_title_key and chosen_artist_key
+            and track_key(row.get("name")) == chosen_title_key
+            and track_key(row.get("artist")) == chosen_artist_key
+        )
+
     selected_position = prepared.get("playlist_position") if candidate.get("source_kind") == "playlist" else None
-    for row in rows:
-        # Match exact URI first. A local file has a spotify:local URI.
-        uri_match = bool(active_uri and row.get("uri") == active_uri)
-        name_match = (songguesser_grid_normalize_album(row.get("name")) ==
-                      songguesser_grid_normalize_album(chosen_name))
-        artist_match = (songguesser_grid_normalize_artist(row.get("artist")) ==
-                        songguesser_grid_normalize_artist(chosen_artist))
-        eligible = uri_match or (name_match and artist_match and bool(chosen_name))
-        position_match = (selected_position is not None and row.get("position", 0) - 1 == selected_position)
-        selected = not marked and eligible and (selected_position is None or position_match)
-        if selected:
-            marked = True
-        output.append({
-            "position": row.get("position"), "name": row.get("name"),
-            "artist": row.get("artist"), "isLocal": row.get("isLocal", False),
-            "current": selected,
-        })
-    # Spotify may have skipped an unavailable position in a playlist or
-    # market-relinked the track. Resolve the first matching row by identity.
-    if not marked:
-        for row, public in zip(rows, output):
-            if (active_uri and row.get("uri") == active_uri) or (
-                songguesser_grid_normalize_album(row.get("name")) == songguesser_grid_normalize_album(chosen_name)
-                and songguesser_grid_normalize_artist(row.get("artist")) == songguesser_grid_normalize_artist(chosen_artist)
-                and bool(chosen_name)
-            ):
-                public["current"] = True
-                break
+
+    def at_prepared_position(row: dict[str, Any]) -> bool:
+        if selected_position is None:
+            return False
+        try:
+            return int(row.get("position")) - 1 == int(selected_position)
+        except (ValueError, TypeError):
+            return False
+
+    # The actual Spotify URI is stronger than text, including local-file URIs.
+    # Prefer the original position only among URI-matching entries. If Spotify
+    # skipped that position, search the entire list for the actual track.
+    uri_matches = [i for i, row in enumerate(rows) if active_uri and row.get("uri") == active_uri]
+    name_matches = [i for i, row in enumerate(rows) if text_match(row)]
+    candidates = uri_matches if uri_matches else name_matches
+    matched_index = next((i for i in candidates if at_prepared_position(rows[i])), None)
+    if matched_index is None and candidates:
+        matched_index = candidates[0]
+
+    output = [{
+        "position": row.get("position"), "name": row.get("name"),
+        "artist": row.get("artist"), "isLocal": row.get("isLocal", False),
+        "current": index == matched_index,
+    } for index, row in enumerate(rows)]
     return {
         "kind": candidate.get("source_kind") or "album",
         "scope": ("album_in_playlist" if candidate.get("source_kind") == "playlist"
