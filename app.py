@@ -9264,6 +9264,20 @@ def songguesser_tracklist_entry(track: dict[str, Any], position: int) -> dict[st
         "uri": uri,
         "album": album.get("name") or local_parts.get("album") or "",
         "albumId": str(album.get("id") or ""),
+        # A title alone is not a reliable album identity. Spotify omits album
+        # IDs from some playlist/local-file entries, so retain album-artist
+        # metadata for the strict title-and-artist fallback below.
+        "albumArtist": (
+            (album["artists"][0].get("name", "") if isinstance(album["artists"][0], dict)
+             else str(album["artists"][0]))
+            if isinstance(album.get("artists"), list) and album["artists"]
+            else (
+                (track["artists"][0].get("name", "") if isinstance(track["artists"][0], dict)
+                 else str(track["artists"][0]))
+                if isinstance(track.get("artists"), list) and track["artists"]
+                else (local_parts.get("artist") or sampler_tools.format_track_artist(track))
+            )
+        ),
         "isLocal": bool(track.get("is_local") or uri.startswith("spotify:local:")),
     }
 
@@ -9285,14 +9299,46 @@ def songguesser_public_tracklist(game: dict[str, Any], candidate: dict[str, Any]
     active_album_id = str(active_album.get("id") or "")
     rows = source_rows
     if candidate.get("source_kind") == "playlist" and game.get("source_mode") == "playlist":
-        # Single Spotify playlist URL: show only matching album entries,
-        # keeping their original playlist positions and order.
+        # Two unrelated artists can have identically titled albums. An exact
+        # Spotify album ID wins when both IDs exist; if either is missing,
+        # require BOTH a matching album title and a matching album artist.
+        # Never fall back to the album title by itself.
+        def album_artist_key(value: Any) -> str:
+            # Keep international artist names rather than discarding non-ASCII.
+            normalized = unicodedata.normalize("NFKD", str(value or "")).casefold()
+            return "".join(character for character in normalized if character.isalnum())
+
+        active_album_artists = active_album.get("artists")
+        active_track_artists = active_track.get("artists")
+        if isinstance(active_album_artists, list) and active_album_artists:
+            primary_artist = active_album_artists[0]
+            active_artist_name = primary_artist.get("name", "") if isinstance(primary_artist, dict) else str(primary_artist)
+        elif isinstance(active_track_artists, list) and active_track_artists:
+            primary_artist = active_track_artists[0]
+            active_artist_name = primary_artist.get("name", "") if isinstance(primary_artist, dict) else str(primary_artist)
+        else:
+            active_artist_name = chosen_artist
         album_key = songguesser_grid_normalize_album(active_album_name)
-        rows = [row for row in source_rows if (
-            bool(active_album_id and row.get("albumId") and row["albumId"] == active_album_id)
-            or bool(album_key and songguesser_grid_normalize_album(row.get("album")) == album_key
-                    and not (active_album_id and row.get("albumId") and row["albumId"] != active_album_id))
-        )]
+        # Grid normalization strips non-Latin characters. Use a Unicode album
+        # identity when that normalizer cannot represent the original title.
+        def album_title_key(value: Any) -> str:
+            grid_key = songguesser_grid_normalize_album(value)
+            return grid_key or album_artist_key(value)
+
+        album_key = album_title_key(active_album_name)
+        artist_key = album_artist_key(active_artist_name)
+
+        def belongs_to_same_album(row: dict[str, Any]) -> bool:
+            row_album_id = str(row.get("albumId") or "")
+            if active_album_id and row_album_id:
+                return row_album_id == active_album_id
+            return bool(
+                album_key and artist_key
+                and album_title_key(row.get("album")) == album_key
+                and album_artist_key(row.get("albumArtist") or row.get("artist")) == artist_key
+            )
+
+        rows = [row for row in source_rows if belongs_to_same_album(row)]
     # Track identity is Unicode-aware. The Grid normalizer intentionally
     # strips non-ASCII text for album lookup, but using that for track titles
     # makes distinct Japanese / Korean / Chinese titles all match as "".
