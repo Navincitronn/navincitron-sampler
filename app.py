@@ -10462,7 +10462,10 @@ def start_sampler():
             else:
                 albums_file = uploaded_albums_file
 
-        random_start = form_bool(data.get("randomStart"), True)
+        # Every shuffle.html sampler mode uses randomized in-track clip offsets.
+        # Ignore older browser clients sending randomStart=false so single-link
+        # playback cannot silently revert to the start of each track.
+        random_start = True
 
         try:
             spotify_token_cache = write_sampler_token_cache()

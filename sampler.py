@@ -1250,14 +1250,26 @@ def calculate_position_ms(
     clip_seconds: int,
     random_start: bool,
 ) -> int:
-    if not random_start:
+    clip_duration_ms = clip_seconds * 1000
+    # A known-short track must never be sent to Spotify. Selection filters
+    # should already exclude it, but this protects every preparation path.
+    if duration_ms is not None and duration_ms < clip_duration_ms:
+        raise ValueError(
+            f"Track duration {duration_ms} ms is shorter than the "
+            f"requested {clip_duration_ms} ms clip."
+        )
+
+    if not random_start or duration_ms is None:
         return 0
 
-    if duration_ms is None:
-        return 0
-
-    max_start_ms = max(0, duration_ms - (clip_seconds * 1000) - 3000)
-    return random.randint(0, max_start_ms) if max_start_ms > 0 else 0
+    # The entire clip must fit. For a 120-second song and a 15-second
+    # clip, the latest allowed start is exactly 1:45 (105,000 ms).
+    max_start_ms = duration_ms - clip_duration_ms
+    if max_start_ms <= 0:
+        return 0  # Exact-fit clip: no nonzero start position is possible.
+    # Avoid choosing 0:00 when the duration allows a randomized offset.
+    minimum_start_ms = 1000 if max_start_ms >= 1000 else 1
+    return random.randint(minimum_start_ms, max_start_ms)
 
 
 def sleep_then_pause(sp: spotipy.Spotify, device_id: str, clip_seconds: int) -> None:
